@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { AppState, RequestLogEntry } from "../../types";
 import { RefreshIcon, TrashIcon } from "../icons";
 import { Select } from "../Select";
@@ -25,6 +25,8 @@ export function LogsScreen({ appState, isManagementBusy, onRefreshManagement, on
   const [query, setQuery] = useState("");
   const [provider, setProvider] = useState("all");
   const [refreshing, setRefreshing] = useState(false);
+  const [page, setPage] = useState(0);
+  const PAGE_SIZE = 20;
 
   async function handleRefresh() {
     if (refreshing) return;
@@ -60,6 +62,13 @@ export function LogsScreen({ appState, isManagementBusy, onRefreshManagement, on
   }, [requests, query, provider]);
 
   const stats = useMemo(() => computeStats(filteredRequests), [filteredRequests]);
+
+  const pageCount = Math.max(1, Math.ceil(filteredRequests.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pagedRequests = filteredRequests.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
+  useEffect(() => {
+    setPage(0);
+  }, [query, provider, tab]);
 
   const filteredProxy = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -137,18 +146,43 @@ export function LogsScreen({ appState, isManagementBusy, onRefreshManagement, on
           {filteredRequests.length === 0 ? (
             <p className="empty-copy">{t("logs.emptyRequests")}</p>
           ) : (
-            <div className="log-req-list">
-              <div className="log-req-row log-req-head">
-                <span className="log-req-time">{t("logs.colTime")}</span>
-                <span className="log-req-status">{t("logs.colStatus")}</span>
-                <div className="log-req-model">{t("logs.colModel")}</div>
-                <span className="log-req-duration">{t("logs.colDuration")}</span>
-                <span className="log-req-tokens">{t("logs.colTokens")}</span>
+            <>
+              <div className="log-req-list">
+                <div className="log-req-row log-req-head">
+                  <span className="log-req-time">{t("logs.colTime")}</span>
+                  <span className="log-req-status">{t("logs.colStatus")}</span>
+                  <div className="log-req-model">{t("logs.colModel")}</div>
+                  <span className="log-req-duration">{t("logs.colDuration")}</span>
+                  <span className="log-req-tokens">{t("logs.colTokens")}</span>
+                </div>
+                {pagedRequests.map((entry, index) => (
+                  <RequestRow key={`${safePage}-${index}`} entry={entry} />
+                ))}
               </div>
-              {filteredRequests.map((entry) => (
-                <RequestRow key={entry.id} entry={entry} />
-              ))}
-            </div>
+              {pageCount > 1 ? (
+                <div className="log-pagination">
+                  <button
+                    type="button"
+                    className="log-page-btn"
+                    disabled={safePage === 0}
+                    onClick={() => setPage(safePage - 1)}
+                  >
+                    {t("logs.prevPage", "上一页")}
+                  </button>
+                  <span className="log-page-info">
+                    {safePage + 1} / {pageCount}
+                  </span>
+                  <button
+                    type="button"
+                    className="log-page-btn"
+                    disabled={safePage >= pageCount - 1}
+                    onClick={() => setPage(safePage + 1)}
+                  >
+                    {t("logs.nextPage", "下一页")}
+                  </button>
+                </div>
+              ) : null}
+            </>
           )}
         </article>
       ) : (

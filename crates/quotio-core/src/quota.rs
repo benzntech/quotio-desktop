@@ -338,18 +338,32 @@ fn fetch_codex_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<A
 
     let usage = match fetch_codex_usage(agent, &auth.access_token, account_id.as_deref()) {
         Ok(usage) => Some(usage),
-        Err(FetchError::Unauthorized) => {
-            let refresh_token = auth.refresh_token.as_deref()?;
-            let new_token = refresh_codex_token(agent, refresh_token).ok()?;
-            fetch_codex_usage(agent, &new_token, account_id.as_deref()).ok()
-        }
+        Err(FetchError::Unauthorized) => auth
+            .refresh_token
+            .as_deref()
+            .and_then(|token| refresh_codex_token(agent, token).ok())
+            .and_then(|token| fetch_codex_usage(agent, &token, account_id.as_deref()).ok()),
         // Transient failure (proxy not ready yet on startup / slow / rate limit) —
         // wait briefly and retry once so a single hiccup doesn't drop the account.
         Err(FetchError::Other) => {
             std::thread::sleep(Duration::from_millis(400));
             fetch_codex_usage(agent, &auth.access_token, account_id.as_deref()).ok()
         }
-    }?;
+    };
+
+    let Some(usage) = usage else {
+        // Usage unavailable (token expired / network) — still list the account
+        // (no quota bars) so it stays visible and its health sparkline shows,
+        // instead of silently dropping the very accounts that are failing.
+        return Some(AccountQuota {
+            provider_id: "codex".to_string(),
+            account_label: label,
+            account_key: key,
+            is_forbidden: false,
+            status_message: codex_plan_status(&auth, None),
+            models: Vec::new(),
+        });
+    };
 
     let rate = usage.rate_limit.unwrap_or_default();
     let session_used = rate.primary_window.as_ref().and_then(|w| w.used_percent).unwrap_or(0);

@@ -1212,6 +1212,24 @@ pub fn run() {
             set_management_quota_switch_project,
             set_management_quota_switch_preview_model
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Release resources on every exit path (close dialog / tray / menu
+                // bar): stop a Quotio-started proxy + the tunnel, and terminate the
+                // adopted/external proxy by its port so it doesn't linger.
+                if let Some(state) = app_handle.try_state::<DesktopState>() {
+                    if let Ok(mut core) = state.core.lock() {
+                        core.shutdown();
+                    }
+                    if let Ok(mut tunnel) = state.tunnel.lock() {
+                        if let Some(mut child) = tunnel.child.take() {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                    }
+                }
+            }
+        });
 }

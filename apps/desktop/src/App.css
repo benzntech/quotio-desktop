@@ -2406,6 +2406,12 @@ h3 {
   height: 7px;
 }
 
+.quota-empty-note {
+  font-size: 12px;
+  color: var(--quotio-muted);
+  padding: 2px 0;
+}
+
 .quota-card {
   display: grid;
   gap: 12px;
@@ -3490,6 +3496,61 @@ h3 {
 .log-req-list {
   display: grid;
   gap: 1px;
+}
+
+/* Let the request/proxy list scroll inside the panel instead of the whole page,
+   so the page itself never grows a scrollbar. */
+.logs-page {
+  flex: 1;
+  min-height: 0;
+}
+.logs-page .logs-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.logs-page .log-req-list,
+.logs-page .log-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.logs-page .log-req-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--quotio-card);
+}
+
+.log-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 10px 0 2px;
+  flex: 0 0 auto;
+}
+.log-page-btn {
+  border: 1px solid var(--quotio-border);
+  border-radius: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--quotio-text);
+  background: var(--quotio-card);
+  cursor: pointer;
+}
+.log-page-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.log-page-info {
+  font-size: 12px;
+  color: var(--quotio-muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 48px;
+  text-align: center;
 }
 
 .log-req-row {

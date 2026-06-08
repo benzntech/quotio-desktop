@@ -115,6 +115,8 @@ const en: Record<string, string> = {
   "logs.searchRequests": "Search requests...",
   "logs.searchLogs": "Search logs...",
   "logs.emptyRequests": "No matching request records.",
+  "logs.prevPage": "Prev",
+  "logs.nextPage": "Next",
   "logs.emptyProxy": "No proxy logs. Refresh the management snapshot or adjust the search.",
   // Quota
   "quota.usage": "Usage",
@@ -122,6 +124,7 @@ const en: Record<string, string> = {
   "quota.left": "left",
   "quota.forbidden": "Exhausted",
   "quota.health": "Health",
+  "quota.fetchFailed": "Quota unavailable — health only",
   "quota.warmup": "WarmUP",
   "quota.useInIde": "Use in IDE",
   "quota.expires": "Expires",
@@ -399,6 +402,8 @@ const zh: Record<string, string> = {
   "logs.searchRequests": "搜索请求…",
   "logs.searchLogs": "搜索日志…",
   "logs.emptyRequests": "暂无匹配的请求记录。",
+  "logs.prevPage": "上一页",
+  "logs.nextPage": "下一页",
   "logs.emptyProxy": "暂无运行日志。刷新管理快照或调整搜索条件。",
   // Quota
   "quota.usage": "用量",
@@ -406,6 +411,7 @@ const zh: Record<string, string> = {
   "quota.left": "剩余",
   "quota.forbidden": "额度耗尽",
   "quota.health": "健康状态",
+  "quota.fetchFailed": "额度获取失败,仅显示健康状态",
   "quota.warmup": "预热中",
   "quota.useInIde": "IDE 使用中",
   "quota.expires": "到期",

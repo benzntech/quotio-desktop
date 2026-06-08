@@ -130,15 +130,20 @@ function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authF
         </div>
       ) : null}
 
-      <div className="quota-usage-head">
-        <span>{t("quota.usage")}</span>
-      </div>
-
-      <div className="quota-models">
-        {account.models.map((model) => (
-          <ModelQuotaRow key={model.model} model={model} />
-        ))}
-      </div>
+      {account.models.length > 0 ? (
+        <>
+          <div className="quota-usage-head">
+            <span>{t("quota.usage")}</span>
+          </div>
+          <div className="quota-models">
+            {account.models.map((model) => (
+              <ModelQuotaRow key={model.model} model={model} />
+            ))}
+          </div>
+        </>
+      ) : (
+        <p className="quota-empty-note">{t("quota.fetchFailed", "额度获取失败,仅显示健康状态")}</p>
+      )}
     </article>
   );
 }

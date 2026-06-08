@@ -182,6 +182,13 @@ impl AppCore {
         Ok(self.app_state())
     }
 
+    /// Release the proxy on app exit: stop a Quotio-started child + fallback
+    /// bridge, and terminate an adopted/external proxy by its port, so closing
+    /// the app doesn't leave the proxy API running in the background.
+    pub fn shutdown(&mut self) {
+        self.proxy.shutdown(&self.settings);
+    }
+
     pub fn restart_proxy(&mut self) -> Result<AppState, ProxyCoreError> {
         self.proxy.stop(&self.settings)?;
         thread::sleep(Duration::from_millis(250));
@@ -1398,6 +1405,19 @@ impl ProxyLifecycle {
         Ok(())
     }
 
+    fn shutdown(&mut self, settings: &AppSettings) {
+        if let Some(mut bridge) = self.bridge.take() {
+            bridge.stop();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Also terminate an adopted/external proxy by its listening port, so
+        // closing the app doesn't leave the proxy API running in the background.
+        kill_process_on_port(settings.proxy_port);
+    }
+
     fn refresh(&mut self, settings: &AppSettings) {
         let Some(child) = self.child.as_mut() else {
             // We don't own a child process, but the proxy may still be running —
@@ -1904,6 +1924,45 @@ fn kill_process_by_name(name: &str) {
     #[cfg(not(windows))]
     {
         let _ = std::process::Command::new("pkill").args(["-f", name]).output();
+    }
+}
+
+/// Terminate whatever process is listening on `port`. Used on shutdown to stop
+/// an adopted/external proxy reliably regardless of its binary name.
+fn kill_process_on_port(port: u16) {
+    #[cfg(windows)]
+    {
+        let needle = format!(":{}", port);
+        let Ok(output) = std::process::Command::new("netstat").args(["-ano"]).output() else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut pids = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            if line.contains("LISTENING") && line.contains(&needle) {
+                if let Some(pid) = line.split_whitespace().last() {
+                    if !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()) && pid != "0" {
+                        pids.insert(pid.to_string());
+                    }
+                }
+            }
+        }
+        for pid in pids {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid])
+                .output();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(output) = std::process::Command::new("lsof")
+            .args(["-ti", &format!("tcp:{}", port)])
+            .output()
+        {
+            for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+                let _ = std::process::Command::new("kill").args(["-9", pid]).output();
+            }
+        }
     }
 }
 
