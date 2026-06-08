@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "../lib/tauri";
+import { matchAuthFile } from "../lib/format";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { listen } from "@tauri-apps/api/event";
 import type {
@@ -16,6 +17,30 @@ import type {
   ProxyCommand,
   SavedAgentConfiguration,
 } from "../types";
+
+// Auto-gating: accounts Quotio auto-disabled in the proxy when their quota ran
+// out, keyed by auth-file name → disable timestamp (ms). Persisted so re-enable
+// only targets accounts WE disabled, and survives restarts.
+const AUTO_GATE_KEY = "quotio.autoDisabled";
+// Blindly re-enable an auto-disabled account this long after disabling, so a
+// recovered account that's no longer quota-visible gets re-probed.
+const REENABLE_AFTER_MS = 20 * 60 * 1000;
+
+function loadAutoDisabled(): Record<string, number> {
+  try {
+    return JSON.parse(localStorage.getItem(AUTO_GATE_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAutoDisabled(map: Record<string, number>): void {
+  try {
+    localStorage.setItem(AUTO_GATE_KEY, JSON.stringify(map));
+  } catch {
+    /* storage unavailable */
+  }
+}
 
 export function useAppState() {
   const [appState, setAppState] = useState<AppState | null>(null);
@@ -113,11 +138,83 @@ export function useAppState() {
       const state = await invoke<AppState>("refresh_quotas");
       setAppState(state);
       void notifyLowQuotas(state);
+      await reconcileAccountGating();
       setError(null);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setIsQuotaBusy(false);
+    }
+  }
+
+  // Auto-disable exhausted accounts in the proxy and re-enable recovered ones,
+  // driven by each quota refresh (manual button + the 5-min background poll).
+  // Only the main window manages gating, to avoid double-firing from the menu bar.
+  async function reconcileAccountGating() {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    if (isMenuBarView) return;
+    // Pull the proxy's real auth-file state (accurate `disabled` flag + email);
+    // refresh_quotas alone doesn't refresh the management snapshot.
+    let state: AppState;
+    try {
+      state = await invoke<AppState>("refresh_management_state");
+      setAppState(state);
+    } catch {
+      return; // management/proxy unreachable — can't gate safely
+    }
+    const authFiles = state.management.auth_files ?? [];
+    if (authFiles.length === 0) return; // need the proxy's auth-files to act
+    const auto = loadAutoDisabled();
+    const now = Date.now();
+    let changed = false;
+
+    // Disable freshly-exhausted accounts; re-enable ones whose quota recovered
+    // (and that we disabled) while they are still quota-visible.
+    for (const quota of state.quotas) {
+      const file = matchAuthFile(quota, authFiles);
+      if (!file) continue;
+      if (quota.is_forbidden && !file.disabled) {
+        try {
+          await invoke("set_management_auth_file_disabled", { name: file.name, disabled: true });
+          auto[file.name] = now;
+          changed = true;
+        } catch {
+          /* proxy unreachable — retry next refresh */
+        }
+      } else if (!quota.is_forbidden && file.disabled && auto[file.name] != null) {
+        try {
+          await invoke("set_management_auth_file_disabled", { name: file.name, disabled: false });
+          delete auto[file.name];
+          changed = true;
+        } catch {
+          /* skip */
+        }
+      }
+    }
+
+    // Fallback: re-enable accounts auto-disabled >20 min ago, so a recovered one
+    // that is no longer quota-visible gets re-probed (and re-disabled if still out).
+    for (const [name, disabledAt] of Object.entries(auto)) {
+      if (now - disabledAt < REENABLE_AFTER_MS) continue;
+      const file = authFiles.find((entry) => entry.name === name);
+      if (file?.disabled) {
+        try {
+          await invoke("set_management_auth_file_disabled", { name, disabled: false });
+          changed = true;
+        } catch {
+          /* skip */
+        }
+      }
+      delete auto[name];
+    }
+
+    saveAutoDisabled(auto);
+    if (changed) {
+      try {
+        setAppState(await invoke<AppState>("refresh_management_state"));
+      } catch {
+        /* ignore */
+      }
     }
   }
 

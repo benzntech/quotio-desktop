@@ -3,8 +3,9 @@ import "./App.css";
 import { invoke } from "./lib/tauri";
 import { I18nProvider, resolveLocale, useT } from "./i18n";
 import { useAppState } from "./state/useAppState";
-import { quotaTone, parsePlan, planTier } from "./lib/format";
-import type { AccountQuota } from "./types";
+import { quotaTone, parsePlan, planTier, matchAuthFile } from "./lib/format";
+import { HealthDots } from "./components/HealthDots";
+import type { AccountQuota, AuthFile } from "./types";
 
 const PROVIDER_LABELS: Record<string, string> = {
   codex: "Codex",
@@ -97,6 +98,7 @@ function MenuBarBody({ app }: { app: ReturnType<typeof useAppState> }) {
   const appState = app.appState!;
   const proxy = appState.proxy;
   const quotas = appState.quotas;
+  const authFiles = appState.auth_files ?? [];
   const providerIds = useMemo(
     () => [...new Set([...SUPPORTED_PROVIDERS, ...quotas.map((q) => q.provider_id)])],
     [quotas],
@@ -194,7 +196,7 @@ function MenuBarBody({ app }: { app: ReturnType<typeof useAppState> }) {
         ) : (
           <>
             {visibleAccounts.map((account) => (
-              <MenuBarAccount key={account.account_key} account={account} />
+              <MenuBarAccount key={account.account_key} account={account} authFiles={authFiles} />
             ))}
             {hiddenCount > 0 ? (
               <button className="menubar-more" type="button" disabled={acting} onClick={() => runOnce("show_main_window")}>
@@ -223,9 +225,10 @@ function MenuBarBody({ app }: { app: ReturnType<typeof useAppState> }) {
   );
 }
 
-function MenuBarAccount({ account }: { account: AccountQuota }) {
+function MenuBarAccount({ account, authFiles }: { account: AccountQuota; authFiles: AuthFile[] }) {
   const plan = parsePlan(account.status_message);
   const tier = plan ? planTier(plan) : null;
+  const recent = matchAuthFile(account, authFiles)?.recent_requests ?? [];
   return (
     <div className="menubar-account">
       <div className="menubar-account-head">
@@ -247,6 +250,7 @@ function MenuBarAccount({ account }: { account: AccountQuota }) {
           </div>
         );
       })}
+      {recent.length > 0 ? <HealthDots recent={recent} compact /> : null}
     </div>
   );
 }

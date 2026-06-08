@@ -316,6 +316,17 @@ pub struct ProviderSummary {
     pub enabled: bool,
 }
 
+/// One 10-minute bucket of an account's recent request outcomes, surfaced by the
+/// proxy's `/auth-files` response (drives the per-account health sparkline).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecentRequestBucket {
+    pub time: String,
+    #[serde(default)]
+    pub success: u64,
+    #[serde(default)]
+    pub failed: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthFile {
     pub id: String,
@@ -336,6 +347,12 @@ pub struct AuthFile {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub last_refresh: Option<String>,
+    #[serde(default)]
+    pub success: Option<u64>,
+    #[serde(default)]
+    pub failed: Option<u64>,
+    #[serde(default)]
+    pub recent_requests: Option<Vec<RecentRequestBucket>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1575,6 +1592,9 @@ mod tests {
                 created_at: None,
                 updated_at: None,
                 last_refresh: None,
+                success: None,
+                failed: None,
+                recent_requests: None,
             }],
             usage: Some(UsageStats {
                 usage: Some(UsageData {

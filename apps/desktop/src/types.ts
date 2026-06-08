@@ -99,6 +99,12 @@ export type ProviderSummary = {
   enabled: boolean;
 };
 
+export type RecentRequestBucket = {
+  time: string;
+  success: number;
+  failed: number;
+};
+
 export type AuthFile = {
   id: string;
   name: string;
@@ -119,6 +125,9 @@ export type AuthFile = {
   updated_at?: string | null;
   last_refresh?: string | null;
   active_in_ide?: boolean | null;
+  success?: number | null;
+  failed?: number | null;
+  recent_requests?: RecentRequestBucket[] | null;
 };
 
 export type ManagementUsageData = {

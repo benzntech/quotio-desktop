@@ -2294,7 +2294,116 @@ h3 {
 
 .quota-accounts {
   display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
   gap: 12px;
+  align-items: start;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.42);
+  backdrop-filter: blur(2px);
+}
+
+.close-dialog {
+  width: 360px;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+  border-radius: 14px;
+  background: var(--quotio-card-solid);
+  border: 1px solid var(--quotio-border);
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.28);
+}
+
+.close-dialog-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--quotio-text);
+}
+
+.close-dialog-desc {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--quotio-muted);
+}
+
+.close-dialog-remember {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--quotio-text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.close-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.quota-health {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.quota-health-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--quotio-muted);
+}
+
+.quota-health-counts {
+  font-variant-numeric: tabular-nums;
+}
+
+.health-dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.health-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgba(148, 163, 184, 0.28);
+}
+
+.health-dot--good {
+  background: #34c759;
+}
+
+.health-dot--warn {
+  background: #f59e0b;
+}
+
+.health-dot--bad {
+  background: #ef4444;
+}
+
+.health-dots--sm {
+  gap: 3px;
+  margin-top: 2px;
+}
+
+.health-dots--sm .health-dot {
+  width: 7px;
+  height: 7px;
 }
 
 .quota-card {

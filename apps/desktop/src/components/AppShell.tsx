@@ -110,14 +110,43 @@ async function windowAction(action: "close" | "minimize" | "maximize") {
 
 export function AppShell(props: AppShellProps) {
   const [activeSection, setActiveSection] = useState<AppSection>("dashboard");
+  const [closeDialog, setCloseDialog] = useState(false);
+  const [rememberClose, setRememberClose] = useState(false);
   const t = useT();
+
+  // Closing prompts whether to quit or hide to the tray, unless a remembered
+  // choice exists (saved after ticking "记住我的选择").
+  async function requestClose() {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let saved: string | null = null;
+    try {
+      saved = localStorage.getItem("quotio.closeAction");
+    } catch {
+      /* storage unavailable */
+    }
+    if (saved === "quit") return windowAction("close");
+    if (saved === "tray") return windowAction("minimize");
+    setCloseDialog(true);
+  }
+
+  function chooseClose(choice: "quit" | "tray") {
+    if (rememberClose) {
+      try {
+        localStorage.setItem("quotio.closeAction", choice);
+      } catch {
+        /* storage unavailable */
+      }
+    }
+    setCloseDialog(false);
+    void windowAction(choice === "quit" ? "close" : "minimize");
+  }
 
   return (
     <main className="app-shell">
       <aside className="sidebar">
         <div className="sidebar-titlebar">
           <div className="window-controls">
-            <button type="button" className="win-dot win-dot--close" onClick={() => windowAction("close")} aria-label="关闭" title="关闭">
+            <button type="button" className="win-dot win-dot--close" onClick={() => void requestClose()} aria-label="关闭" title="关闭">
               <span className="win-dot-glyph">✕</span>
             </button>
             <button type="button" className="win-dot win-dot--min" onClick={() => windowAction("minimize")} aria-label="最小化" title="最小化">
@@ -154,6 +183,30 @@ export function AppShell(props: AppShellProps) {
       </aside>
 
       <section className="content">{renderSection(activeSection, props)}</section>
+
+      {closeDialog ? (
+        <div className="modal-overlay" onClick={() => setCloseDialog(false)}>
+          <div className="close-dialog" onClick={(event) => event.stopPropagation()}>
+            <strong className="close-dialog-title">{t("close.title", "关闭 Quotio")}</strong>
+            <p className="close-dialog-desc">{t("close.desc", "退出程序,还是最小化到托盘继续后台运行?")}</p>
+            <label className="close-dialog-remember">
+              <input type="checkbox" checked={rememberClose} onChange={(event) => setRememberClose(event.target.checked)} />
+              <span>{t("close.remember", "记住我的选择")}</span>
+            </label>
+            <div className="close-dialog-actions">
+              <button type="button" className="ghost-action" onClick={() => setCloseDialog(false)}>
+                {t("close.cancel", "取消")}
+              </button>
+              <button type="button" className="secondary-action" onClick={() => chooseClose("tray")}>
+                {t("close.tray", "最小化到托盘")}
+              </button>
+              <button type="button" className="danger-action" onClick={() => chooseClose("quit")}>
+                {t("close.quit", "退出程序")}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }

@@ -1,7 +1,8 @@
 import { useState } from "react";
-import type { AccountQuota, AppState, ProviderSummary, QuotaModelUsage } from "../../types";
-import { maskEmail, quotaTone, parsePlan, planTier } from "../../lib/format";
+import type { AccountQuota, AppState, AuthFile, ProviderSummary, QuotaModelUsage } from "../../types";
+import { maskEmail, quotaTone, parsePlan, planTier, matchAuthFile } from "../../lib/format";
 import { RefreshIcon } from "../icons";
+import { HealthDots } from "../HealthDots";
 import { useT } from "../../i18n";
 
 type QuotaScreenProps = {
@@ -24,6 +25,7 @@ type QuotaGroup = {
 export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas }: QuotaScreenProps) {
   const t = useT();
   const groups = buildGroups(appState.quotas, appState.providers);
+  const authFiles = appState.auth_files ?? [];
   const [activeId, setActiveId] = useState<string | null>(null);
   const active = groups.find((group) => group.id === activeId) ?? groups[0] ?? null;
 
@@ -73,7 +75,7 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas }: QuotaScr
 
           <div className="quota-accounts">
             {active?.accounts.map((account) => (
-              <AccountQuotaCard key={account.account_key} account={account} />
+              <AccountQuotaCard key={account.account_key} account={account} authFiles={authFiles} />
             ))}
           </div>
         </>
@@ -82,7 +84,7 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas }: QuotaScr
   );
 }
 
-function AccountQuotaCard({ account }: { account: AccountQuota }) {
+function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authFiles: AuthFile[] }) {
   const t = useT();
   // The Codex fetcher encodes the subscription tier + expiry into status_message
   // as "plan: <tier> | until: <YYYY-MM-DD>"; surface them as a badge + date.
@@ -95,6 +97,8 @@ function AccountQuotaCard({ account }: { account: AccountQuota }) {
     tier && tier !== "plus"
       ? `quota-type-pill quota-plan-pill quota-plan-pill--${tier}`
       : "quota-type-pill quota-plan-pill";
+  const file = matchAuthFile(account, authFiles);
+  const recent = file?.recent_requests ?? [];
   return (
     <article className="panel quota-card">
       <div className="quota-card-head">
@@ -115,6 +119,16 @@ function AccountQuotaCard({ account }: { account: AccountQuota }) {
           {account.in_use ? <span className="quota-pill quota-pill--blue">{t("quota.useInIde")}</span> : null}
         </div>
       </div>
+
+      {recent.length > 0 ? (
+        <div className="quota-health">
+          <div className="quota-health-head">
+            <span>{t("quota.health", "健康状态")}</span>
+            <span className="quota-health-counts">✓{file?.success ?? 0} · ✗{file?.failed ?? 0}</span>
+          </div>
+          <HealthDots recent={recent} />
+        </div>
+      ) : null}
 
       <div className="quota-usage-head">
         <span>{t("quota.usage")}</span>

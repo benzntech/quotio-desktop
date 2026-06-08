@@ -884,6 +884,9 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
             created_at: None,
             updated_at: None,
             last_refresh: None,
+            success: None,
+            failed: None,
+            recent_requests: None,
         });
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));

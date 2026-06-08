@@ -1,4 +1,5 @@
 // Small shared display helpers.
+import type { AccountQuota, AuthFile } from "../types";
 
 const HIDE_SENSITIVE_KEY = "quotio.hideSensitive";
 
@@ -73,4 +74,39 @@ export function planTier(plan: string): PlanTier {
   if (/business|enterprise|edu/.test(value)) return "business";
   if (/free/.test(value)) return "free";
   return "plus";
+}
+
+// Match a quota account to a proxy auth-file (same provider, then email, then
+// exact filename stem). Provider-scoping avoids cross-provider email collisions
+// (e.g. the same email on Codex + Trae). Shared by gating and the health view.
+export function matchAuthFile(quota: AccountQuota, authFiles: AuthFile[]): AuthFile | null {
+  const provider = quota.provider_id.trim().toLowerCase();
+  const candidates = authFiles.filter((file) => {
+    const fp = (file.provider ?? "").trim().toLowerCase();
+    return fp === provider || fp.includes(provider) || provider.includes(fp);
+  });
+  if (candidates.length === 0) return null;
+
+  const email = quota.account_label?.trim().toLowerCase();
+  if (email && email.includes("@")) {
+    const byEmail = candidates.find((file) => (file.email ?? "").trim().toLowerCase() === email);
+    if (byEmail) return byEmail;
+  }
+  const key = quota.account_key?.trim().toLowerCase();
+  if (key) {
+    const prefixed = `${provider}-${key}`;
+    const byKey = candidates.find((file) => {
+      const stem = file.name.toLowerCase().replace(/\.json$/, "");
+      return stem === key || stem === prefixed;
+    });
+    if (byKey) return byKey;
+  }
+  return null;
+}
+
+// Tone for one recent-request health bucket: green (all ok), amber (mixed),
+// red (all failed), gray (idle / no traffic).
+export function healthTone(bucket: { success: number; failed: number }): "good" | "warn" | "bad" | "idle" {
+  if (bucket.failed > 0) return bucket.success > 0 ? "warn" : "bad";
+  return bucket.success > 0 ? "good" : "idle";
 }
