@@ -6,7 +6,14 @@ const HIDE_SENSITIVE_KEY = "quotio.hideSensitive";
 // Whether sensitive values (emails, account names) should be masked in the UI.
 // Controlled by the Settings > Privacy toggle, persisted in localStorage and
 // defaulting to ON.
-export function isHideSensitiveEnabled(): boolean {
+//
+// maskEmail() is called once per row (80+ accounts) on every poll tick, so the
+// localStorage read is cached: synchronous localStorage access in render adds up.
+// The cache is invalidated on local toggle (setHideSensitiveEnabled) and on the
+// cross-window `storage` event.
+let hideSensitiveCache: boolean | null = null;
+
+function readHideSensitive(): boolean {
   try {
     return localStorage.getItem(HIDE_SENSITIVE_KEY) !== "false";
   } catch {
@@ -14,7 +21,19 @@ export function isHideSensitiveEnabled(): boolean {
   }
 }
 
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key === HIDE_SENSITIVE_KEY) hideSensitiveCache = null;
+  });
+}
+
+export function isHideSensitiveEnabled(): boolean {
+  if (hideSensitiveCache === null) hideSensitiveCache = readHideSensitive();
+  return hideSensitiveCache;
+}
+
 export function setHideSensitiveEnabled(enabled: boolean): void {
+  hideSensitiveCache = enabled;
   try {
     localStorage.setItem(HIDE_SENSITIVE_KEY, enabled ? "true" : "false");
   } catch {
@@ -47,6 +66,34 @@ export function maskEmail(value: string): string {
   const visible = local.slice(0, MASK_VISIBLE_PREFIX);
   const maskedLocal = local.length > MASK_VISIBLE_PREFIX ? `${visible}${"•".repeat(3)}` : visible;
   return `${maskedLocal}@${"•".repeat(5)}${tld}`;
+}
+
+// Force en-US compact units (K/M/B/T) so token/request counts read as "473.2M"
+// rather than the locale's 万/亿 grouping. Shared by the dashboard KPI cards and
+// the account summary table.
+export function formatCompactNumber(value: number): string {
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(
+    Number.isFinite(value) ? value : 0,
+  );
+}
+
+// Format an estimated cost in USD, or "--" when unavailable (no prices set).
+export function formatCost(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "--";
+  return `$${value.toFixed(value !== 0 && Math.abs(value) < 1 ? 4 : 2)}`;
+}
+
+// Short relative time ("3分钟前" / "刚刚") from a unix-ms timestamp; falls back
+// to "--" for missing/zero values.
+export function formatRelativeTime(ms: number): string {
+  if (!ms || ms <= 0) return "--";
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时前`;
+  const days = Math.floor(diff / 86_400_000);
+  if (days < 30) return `${days}天前`;
+  return new Date(ms).toLocaleDateString();
 }
 
 // Tone for a "remaining quota" percentage, matching the mock's color coding.

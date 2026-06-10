@@ -1,72 +1,95 @@
-import { useEffect, useState } from "react";
-import { buildDashboardModel } from "../../state/dashboardModel";
-import type { AppState, AuthFile } from "../../types";
-import { KpiCard } from "./KpiCard";
-import { ProviderSummaryPanel } from "./ProviderSummaryPanel";
-import { CheckIcon, CopyIcon, RefreshIcon } from "../icons";
+import { useState } from "react";
+import type { AppState } from "../../types";
+import { UsageFilterBar } from "./UsageFilterBar";
+import { UsageKpiGrid } from "./UsageKpiGrid";
+import { AccountSummaryPanel } from "./AccountSummaryPanel";
+import { ModelPricesDialog } from "./ModelPricesDialog";
+import { useUsageDashboard } from "../../state/usageDashboard";
+import { CheckIcon, CopyIcon } from "../icons";
 import { useT } from "../../i18n";
-import { invoke } from "../../lib/tauri";
 
 type DashboardScreenProps = {
   appState: AppState;
-  onRefreshState: () => void;
-  onRefreshQuotas: () => void;
-  onRefreshManagement: () => void;
 };
 
-export function DashboardScreen({
-  appState,
-  onRefreshState,
-  onRefreshQuotas,
-  onRefreshManagement,
-}: DashboardScreenProps) {
+export function DashboardScreen({ appState }: DashboardScreenProps) {
   const t = useT();
-  const [localAccounts, setLocalAccounts] = useState<AuthFile[]>([]);
-  const [spinning, setSpinning] = useState(false);
-  const reloadLocalAccounts = () => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
-    void invoke<AuthFile[]>("list_local_accounts").then(setLocalAccounts).catch(() => {});
-  };
-  useEffect(() => {
-    reloadLocalAccounts();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appState.management.auth_files]);
-  const model = buildDashboardModel(appState, t, localAccounts);
+  const dash = useUsageDashboard();
+  const [pricesOpen, setPricesOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const endpoint = `${appState.proxy.endpoint.replace(/\/+$/, "")}/v1`;
 
-  function handleRefresh() {
-    setSpinning(true);
-    onRefreshState();
-    onRefreshQuotas();
-    onRefreshManagement();
-    reloadLocalAccounts();
-    window.setTimeout(() => setSpinning(false), 1200);
-  }
+  // Single refresh lives in the filter bar (next to auto-refresh), matching the
+  // reference layout — it re-queries the stats + filter options and shows one
+  // loading card, kept up briefly so it's visible. Only this explicit click
+  // shows the card; the silent auto-refresh / filter changes don't.
+  const refreshAll = () => {
+    setRefreshing(true);
+    void Promise.all([dash.refresh(), dash.refreshOptions()]).finally(() =>
+      window.setTimeout(() => setRefreshing(false), 600),
+    );
+  };
 
   return (
-    <section className="dashboard-content">
+    <section className="dashboard-content dashboard-content--fixed">
+      {/* Title bar is a FIXED header above the scroll body — content never
+          slides under it, so there's no masking band and no per-frame sticky
+          repaint (smoother scrolling). The window stays draggable via the bar. */}
       <header className="page-topbar" data-tauri-drag-region>
         <h1>{t("nav.dashboard")}</h1>
-        <button
-          className={spinning ? "icon-button icon-button--spinning" : "icon-button"}
-          type="button"
-          onClick={handleRefresh}
-          title="刷新状态"
-          aria-label="刷新状态"
-        >
-          <RefreshIcon />
-        </button>
       </header>
 
-      <section className="kpi-grid">
-        {model.kpis.map((kpi) => (
-          <KpiCard key={kpi.title} kpi={kpi} />
-        ))}
-      </section>
+      <div className="dashboard-scroll">
+        <UsageFilterBar
+          range={dash.range}
+          onRangeChange={dash.setRange}
+          customStart={dash.customStart}
+          onCustomStartChange={dash.setCustomStart}
+          customEnd={dash.customEnd}
+          onCustomEndChange={dash.setCustomEnd}
+          filters={dash.filters}
+          onFiltersChange={dash.setFilters}
+          options={dash.options}
+          autoRefreshSec={dash.autoRefreshSec}
+          onAutoRefreshChange={dash.setAutoRefreshSec}
+          onRefresh={refreshAll}
+          loading={dash.loading || refreshing}
+          hasActiveFilters={dash.hasActiveFilters}
+          onReset={dash.resetFilters}
+        />
 
-      <ProviderSummaryPanel model={model} />
+        <UsageKpiGrid stats={dash.stats} />
 
-      <EndpointCard endpoint={endpoint} />
+        <AccountSummaryPanel
+          rows={dash.summary}
+          loading={dash.loading}
+          onRefresh={() => void dash.refresh()}
+          onPickAccount={(account) => dash.setFilters({ ...dash.filters, account })}
+          onManagePrices={() => setPricesOpen(true)}
+        />
+
+        <EndpointCard endpoint={endpoint} />
+      </div>
+
+      {refreshing ? (
+        <div className="closing-overlay">
+          <div className="loading-card">
+            <div className="boot-bar" aria-hidden="true">
+              <span />
+            </div>
+            <p>{t("common.refreshing", "正在刷新…")}</p>
+          </div>
+        </div>
+      ) : null}
+
+      {pricesOpen ? (
+        <ModelPricesDialog
+          prices={dash.prices}
+          knownModels={dash.options.models}
+          onSave={dash.saveModelPrices}
+          onClose={() => setPricesOpen(false)}
+        />
+      ) : null}
     </section>
   );
 }
@@ -92,11 +115,10 @@ function EndpointCard({ endpoint }: { endpoint: string }) {
       </div>
       <div className="endpoint-row">
         <code className="endpoint-url">{endpoint}</code>
-        <button className="icon-button" type="button" onClick={copy} title="复制地址" aria-label="复制地址">
+        <button className="icon-button" type="button" onClick={copy} title={t("common.copy")} aria-label={t("common.copy")}>
           {copied ? <CheckIcon /> : <CopyIcon />}
         </button>
       </div>
     </article>
   );
 }
-

@@ -11,9 +11,10 @@ use quotio_types::{
     ManagementSnapshot, MaxRetryIntervalResponse, OAuthStatusResponse, OAuthUrlResponse,
     ProxyUrlResponse, RemoteProxyConfig, RequestLogEntry, RequestLogResponse, RequestRetryResponse,
     RoutingStrategyResponse, StringValueRequest, SwitchPreviewModelResponse, SwitchProjectResponse,
-    UsageStats,
+    UsageEvent, UsageStats,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct ManagementApiClient {
@@ -369,6 +370,31 @@ impl ManagementApiClient {
         Ok(records.into_iter().map(UsageRecord::into_request_log).collect())
     }
 
+    /// Drain up to `count` records from the usage queue as full `UsageEvent`s,
+    /// keeping every field (tokens breakdown, auth identity, status) plus a
+    /// redacted raw JSON snapshot, for persistence in the usage store. Like
+    /// `fetch_request_logs`, this is a DESTRUCTIVE read — records are removed
+    /// from the queue, so callers must persist what they get.
+    pub async fn fetch_usage_events(
+        &self,
+        count: u32,
+    ) -> Result<Vec<UsageEvent>, ManagementApiError> {
+        let values: Vec<serde_json::Value> =
+            match self.get_json(&format!("/usage-queue?count={}", count)) {
+                Ok(values) => values,
+                Err(ManagementApiError::Status(400 | 404)) => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+            };
+        let mut events = Vec::with_capacity(values.len());
+        for value in values {
+            let raw = redact_raw(&value);
+            if let Ok(record) = serde_json::from_value::<UsageRecord>(value) {
+                events.push(record.into_usage_event(raw));
+            }
+        }
+        Ok(events)
+    }
+
     pub async fn get_request_retry(&self) -> Result<u16, ManagementApiError> {
         let response: RequestRetryResponse = self.get_json("/request-retry")?;
         Ok(response.request_retry)
@@ -567,14 +593,38 @@ struct UsageRecord {
     reasoning_effort: Option<String>,
     #[serde(default, alias = "account", alias = "email")]
     source: Option<String>,
+    #[serde(default)]
+    auth_type: Option<String>,
+    #[serde(default)]
+    auth_index: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    fail: Option<UsageFail>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct UsageTokens {
     #[serde(default, alias = "input_tokens")]
     input: Option<u64>,
     #[serde(default, alias = "output_tokens")]
     output: Option<u64>,
+    #[serde(default, alias = "reasoning_tokens")]
+    reasoning: Option<u64>,
+    #[serde(default, alias = "cached_tokens")]
+    cached: Option<u64>,
+    #[serde(default, alias = "cache_creation_tokens")]
+    cache_creation: Option<u64>,
+    #[serde(default, alias = "cache_read_tokens")]
+    cache_read: Option<u64>,
+    #[serde(default, alias = "total_tokens")]
+    total: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UsageFail {
+    #[serde(default)]
+    status_code: Option<u16>,
 }
 
 impl UsageRecord {
@@ -603,6 +653,156 @@ impl UsageRecord {
             account: self.source.filter(|value| !value.trim().is_empty()),
         }
     }
+
+    /// Build a full `UsageEvent` for persistence, capturing the token breakdown,
+    /// auth identity, real status code and a stable dedup hash.
+    fn into_usage_event(self, raw_json: Option<String>) -> UsageEvent {
+        let failed = self.failed.unwrap_or(false);
+        let tokens = self.tokens.clone().unwrap_or_default();
+        let timestamp_ms = usage_timestamp_ms(&self.timestamp);
+        let timestamp = format_usage_timestamp(self.timestamp.clone());
+        let (method, path) = split_endpoint(self.endpoint.as_deref());
+        let model = self
+            .model
+            .clone()
+            .or_else(|| self.alias.clone())
+            .unwrap_or_default();
+        let input = tokens.input.unwrap_or(0);
+        let output = tokens.output.unwrap_or(0);
+        let reasoning = tokens.reasoning.unwrap_or(0);
+        let total = tokens.total.unwrap_or(input + output);
+        let status_code = self
+            .fail
+            .as_ref()
+            .and_then(|fail| fail.status_code)
+            .or(Some(if failed { 500 } else { 200 }));
+        let api_key_hash = self
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty() && *key != "[redacted]")
+            .map(sha256_hex);
+        let event_hash = compute_event_hash(&self, timestamp_ms, &model, total);
+        UsageEvent {
+            event_hash,
+            request_id: self.request_id.clone().filter(|value| !value.is_empty()),
+            timestamp_ms,
+            timestamp,
+            provider: self.provider.clone(),
+            requested_model: self.alias.clone(),
+            resolved_model: self.model.clone(),
+            model,
+            endpoint: self.endpoint.clone(),
+            method,
+            path,
+            auth_type: self.auth_type.clone(),
+            auth_index: self.auth_index.clone(),
+            source: self
+                .source
+                .clone()
+                .filter(|value| !value.trim().is_empty()),
+            api_key_hash,
+            input_tokens: input,
+            output_tokens: output,
+            reasoning_tokens: reasoning,
+            cached_tokens: tokens.cached.unwrap_or(0),
+            cache_creation_tokens: tokens.cache_creation.unwrap_or(0),
+            cache_read_tokens: tokens.cache_read.unwrap_or(0),
+            total_tokens: total,
+            latency_ms: self.latency_ms.unwrap_or(0),
+            failed,
+            status_code,
+            reasoning_effort: self.reasoning_effort.clone(),
+            raw_json,
+        }
+    }
+}
+
+/// Parse the usage `timestamp` (RFC3339 string or unix number) to unix ms,
+/// falling back to now when absent/unparseable.
+fn usage_timestamp_ms(value: &Option<serde_json::Value>) -> i64 {
+    match value {
+        Some(serde_json::Value::Number(number)) => number
+            .as_i64()
+            .map(normalize_epoch)
+            .or_else(|| number.as_f64().map(|float| normalize_epoch(float as i64)))
+            .unwrap_or_else(now_ms_i64),
+        Some(serde_json::Value::String(text)) => chrono::DateTime::parse_from_rfc3339(text)
+            .map(|dt| dt.timestamp_millis())
+            .ok()
+            .or_else(|| text.parse::<i64>().ok().map(normalize_epoch))
+            .unwrap_or_else(now_ms_i64),
+        _ => now_ms_i64(),
+    }
+}
+
+/// Coerce a unix value (seconds or milliseconds) to milliseconds.
+fn normalize_epoch(value: i64) -> i64 {
+    if value >= 1_000_000_000_000 {
+        value
+    } else if value >= 1_000_000_000 {
+        value * 1000
+    } else {
+        value
+    }
+}
+
+fn now_ms_i64() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Split an `endpoint` like "POST /v1/responses" into (method, path).
+fn split_endpoint(endpoint: Option<&str>) -> (Option<String>, Option<String>) {
+    match endpoint.map(str::trim) {
+        Some(value) if value.is_empty() => (None, None),
+        Some(value) => {
+            if let Some((method, path)) = value.split_once(' ') {
+                (Some(method.to_string()), Some(path.trim().to_string()))
+            } else if value.starts_with('/') {
+                (None, Some(value.to_string()))
+            } else {
+                (Some(value.to_string()), None)
+            }
+        }
+        None => (None, None),
+    }
+}
+
+/// Stable SHA-256 over the event's identifying fields, used as the dedup key.
+fn compute_event_hash(record: &UsageRecord, timestamp_ms: i64, model: &str, total: u64) -> String {
+    let key = format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        record.request_id.as_deref().unwrap_or(""),
+        timestamp_ms,
+        model,
+        record.endpoint.as_deref().unwrap_or(""),
+        record.latency_ms.unwrap_or(0),
+        record.source.as_deref().unwrap_or(""),
+        total,
+    );
+    sha256_hex(&key)
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Serialize the raw queue event for storage, redacting the caller key and
+/// dropping the bulky `response_headers` blob.
+fn redact_raw(value: &serde_json::Value) -> Option<String> {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        if object.contains_key("api_key") {
+            object.insert(
+                "api_key".to_string(),
+                serde_json::Value::String("[redacted]".to_string()),
+            );
+        }
+        object.remove("response_headers");
+    }
+    serde_json::to_string(&value).ok()
 }
 
 /// Map Antigravity model aliases to upstream model ids for warmup requests.

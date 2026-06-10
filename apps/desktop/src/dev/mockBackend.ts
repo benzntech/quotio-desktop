@@ -8,7 +8,9 @@
 // Tauri runtime is absent, and is never used inside the real app.
 
 import type {
+  AccountAuthHealth,
   AccountQuota,
+  AccountSummaryRow,
   AgentStatus,
   AppState,
   AuthFile,
@@ -16,6 +18,8 @@ import type {
   ProviderSummary,
   QuotaModelUsage,
   RequestLogEntry,
+  UsageAggregate,
+  UsageFilterOptions,
 } from "../types";
 
 type ProviderFlags = {
@@ -424,8 +428,107 @@ function stateWithSettings(settings: AppState["settings"]): AppState {
   };
 }
 
+function mockUsageAggregate(): UsageAggregate {
+  const input = requestLogs.reduce((sum, log) => sum + (log.input_tokens ?? 0), 0);
+  const output = requestLogs.reduce((sum, log) => sum + (log.output_tokens ?? 0), 0);
+  const total = input + output;
+  const success = requestLogs.filter((log) => (log.status_code ?? 0) < 400).length;
+  // cached (cache-read) tokens are a subset of input, so keep hit-rate <= 100%.
+  const cached = Math.round(input * 0.55);
+  return {
+    total_requests: requestLogs.length,
+    success_requests: success,
+    failed_requests: requestLogs.length - success,
+    success_rate: requestLogs.length ? (success / requestLogs.length) * 100 : 0,
+    account_count: 4,
+    total_tokens: total,
+    input_tokens: input,
+    output_tokens: output,
+    reasoning_tokens: 1280,
+    cached_tokens: cached,
+    cache_creation_tokens: 0,
+    cache_read_tokens: 0,
+    input_token_ratio: total ? (input / total) * 100 : 0,
+    output_token_ratio: total ? (output / total) * 100 : 0,
+    cache_hit_rate: input ? (cached / input) * 100 : 0,
+    avg_latency_ms: 12000,
+    estimated_cost: null,
+    prices_configured: false,
+  };
+}
+
+function mockAccountSummary(): AccountSummaryRow[] {
+  const base = Date.UTC(2026, 5, 6, 10, 0, 0);
+  return authFiles.slice(0, 5).map((file, index) => {
+    const total = 40 - index * 7;
+    const failed = index;
+    return {
+      account: file.email ?? file.name,
+      provider: file.provider,
+      total_requests: total,
+      success_requests: total - failed,
+      failed_requests: failed,
+      success_rate: total ? ((total - failed) / total) * 100 : 0,
+      total_tokens: 120000 - index * 18000,
+      input_tokens: 90000 - index * 12000,
+      output_tokens: 30000 - index * 6000,
+      estimated_cost: null,
+      last_request_ms: base - index * 600000,
+      last_request: new Date(base - index * 600000).toISOString(),
+    };
+  });
+}
+
+function mockAuthHealth(): AccountAuthHealth[] {
+  const h = (
+    account: string,
+    auth: number,
+    rate: number,
+    server: number,
+    ok: number,
+    last: number,
+  ): AccountAuthHealth => ({
+    account,
+    recent_total: auth + rate + server + ok,
+    auth_failures: auth,
+    rate_limited: rate,
+    server_errors: server,
+    successes: ok,
+    last_status_code: last,
+    recommend_reauth: ok === 0 && auth >= 2 && auth >= rate + server,
+  });
+  return [
+    h("aurora@gmail.com", 0, 0, 0, 12, 200), // healthy
+    h("borealis@gmail.com", 0, 6, 1, 8, 429), // rate limited
+    h("cosmos@gmail.com", 0, 0, 7, 9, 500), // failing (server)
+    h("delta@gmail.com", 4, 0, 1, 0, 401), // genuine auth failure → re-auth
+    h("echo@gmail.com", 0, 1, 2, 10, 200), // partial
+  ];
+}
+
+function mockFilterOptions(): UsageFilterOptions {
+  return {
+    accounts: authFiles.map((file) => file.email ?? file.name),
+    providers: ["antigravity", "codex", "copilot", "kiro"],
+    models: ["gemini-3-pro", "gemini-3-flash-preview", "gpt-5.5", "claude-opus-4-5"],
+    channels: ["oauth", "api_key"],
+    api_keys: [{ hash: "mock-key-hash", alias: null }],
+  };
+}
+
 export async function mockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   switch (command) {
+    case "query_usage_stats":
+      return mockUsageAggregate() as unknown as T;
+    case "query_account_summary":
+      return mockAccountSummary() as unknown as T;
+    case "list_usage_filter_options":
+      return mockFilterOptions() as unknown as T;
+    case "query_account_auth_health":
+      return mockAuthHealth() as unknown as T;
+    case "get_model_prices":
+    case "set_model_prices":
+      return [] as unknown as T;
     case "save_settings": {
       const settings = args?.settings as AppState["settings"] | undefined;
       if (settings) {

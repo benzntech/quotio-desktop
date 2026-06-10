@@ -4,6 +4,7 @@ import { matchAuthFile } from "../lib/format";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  AccountQuota,
   AgentBackupFile,
   AgentConfigurationRequest,
   AgentConfigurationResult,
@@ -42,6 +43,20 @@ function saveAutoDisabled(map: Record<string, number>): void {
   }
 }
 
+// Replace the matching account (by provider + key) or append it, so streamed
+// "quota-account" events update the quota list in place as they arrive.
+function upsertQuota(quotas: AccountQuota[], account: AccountQuota): AccountQuota[] {
+  const index = quotas.findIndex(
+    (item) => item.provider_id === account.provider_id && item.account_key === account.account_key,
+  );
+  if (index >= 0) {
+    const next = quotas.slice();
+    next[index] = account;
+    return next;
+  }
+  return [...quotas, account];
+}
+
 export function useAppState() {
   const [appState, setAppState] = useState<AppState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -59,6 +74,9 @@ export function useAppState() {
   const [credentialStatus, setCredentialStatus] = useState<CredentialStatus | null>(null);
   const [proxyUrlDraft, setProxyUrlDraft] = useState("");
   const [isQuotaBusy, setIsQuotaBusy] = useState(false);
+  // Non-blocking floating toast during a user-triggered quota refresh: counts
+  // accounts as they stream in. Null = hidden (incl. the silent background poll).
+  const [quotaToast, setQuotaToast] = useState<{ loaded: number } | null>(null);
   const lowQuotaNotified = useRef<Set<string>>(new Set());
   const proxyDraftSeeded = useRef(false);
   const isMenuBarView =
@@ -85,20 +103,23 @@ export function useAppState() {
     };
   }, []);
 
-  // Background poll: drain the proxy's request-log queue (60s retention window)
-  // while the local proxy runs, so the Logs "Requests" tab fills without manual
-  // refresh. Only active in the real Tauri app (skipped in the browser mock).
+  // Background poll: refresh the management snapshot every 15s while the local
+  // proxy runs, so BOTH the Logs "Requests" tab AND each account's health (✓/✗
+  // counts + dots) stay current without a manual refresh. refresh_management_state
+  // is a superset of drain_request_logs — it pulls /auth-files health and drains
+  // the log queue — which fixes health lagging the logs (logs were 15s-fresh but
+  // health only refreshed on the 5-min quota poll). Only in the real Tauri app.
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     if (isMenuBarView) return;
-    // Drain every 15s regardless of the app-tracked proxy status. The command
-    // no-ops when the proxy is unreachable, and this also covers a proxy that is
+    // Poll every 15s regardless of the app-tracked proxy status. It throws (caught
+    // below) when the proxy is unreachable, and this also covers a proxy that is
     // running but was not started by (or was orphaned from) this app session.
     const interval = window.setInterval(() => {
-      invoke<AppState>("drain_request_logs")
+      invoke<AppState>("refresh_management_state")
         .then(setAppState)
         .catch(() => {});
-    }, 15000);
+    }, 30000);
     return () => window.clearInterval(interval);
   }, []);
 
@@ -132,8 +153,43 @@ export function useAppState() {
     }
   }
 
-  async function refreshQuotas() {
+  async function refreshQuotas(manual = false) {
     setIsQuotaBusy(true);
+    // Floating toast only for user-triggered refreshes; the background poll
+    // passes no `manual`, so it stays silent.
+    if (manual) setQuotaToast({ loaded: 0 });
+    // Stream accounts in as the backend fetches them ("quota-account" per
+    // account), so they appear one-by-one and one unreachable account never
+    // blocks the rest. Register before the invoke so no early account is missed;
+    // the invoke still returns the full list at the end as a sync.
+    let unlisten: (() => void) | undefined;
+    if ("__TAURI_INTERNALS__" in window) {
+      // Coalesce the per-account stream into at most one state update per frame.
+      // 80 accounts would otherwise fire 80 setAppState → 80 full-tree re-renders.
+      let pending: AccountQuota[] = [];
+      let rafId: number | null = null;
+      const flush = () => {
+        rafId = null;
+        if (pending.length === 0) return;
+        const batch = pending;
+        pending = [];
+        setAppState((prev) => {
+          if (!prev) return prev;
+          let quotas = prev.quotas;
+          for (const account of batch) quotas = upsertQuota(quotas, account);
+          return { ...prev, quotas };
+        });
+        setQuotaToast((toast) => (toast ? { loaded: toast.loaded + batch.length } : toast));
+      };
+      const tauriUnlisten = await listen<AccountQuota>("quota-account", (event) => {
+        pending.push(event.payload);
+        if (rafId === null) rafId = window.requestAnimationFrame(flush);
+      });
+      unlisten = () => {
+        if (rafId !== null) window.cancelAnimationFrame(rafId);
+        tauriUnlisten();
+      };
+    }
     try {
       const state = await invoke<AppState>("refresh_quotas");
       setAppState(state);
@@ -143,6 +199,8 @@ export function useAppState() {
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
+      unlisten?.();
+      if (manual) setQuotaToast(null);
       setIsQuotaBusy(false);
     }
   }
@@ -601,6 +659,7 @@ export function useAppState() {
     isProxyBusy,
     isManagementBusy,
     isQuotaBusy,
+    quotaToast,
     setProxyUrlDraft,
     refreshState,
     refreshQuotas,

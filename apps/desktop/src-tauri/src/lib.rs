@@ -2,9 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use quotio_core::{management::ManagementApiClient, AppCore};
 use quotio_types::{
-    AgentBackupFile, AgentConfigurationRequest, AgentConfigurationResult, AppSettings, AppState,
-    AuthFile, AvailableModel, CredentialStatus, FallbackConfigAction, ManagementSnapshot,
-    OAuthStatusResponse, OAuthUrlResponse, PlatformInfo, SavedAgentConfiguration,
+    AccountAuthHealth, AccountSummaryRow, AgentBackupFile, AgentConfigurationRequest,
+    AgentConfigurationResult, AppSettings, AppState, AuthFile, AvailableModel, CredentialStatus,
+    FallbackConfigAction, ManagementSnapshot, ModelPrice, OAuthStatusResponse, OAuthUrlResponse,
+    PlatformInfo, SavedAgentConfiguration, UsageFilterOptions, UsageQuery, UsageAggregate,
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -540,26 +541,22 @@ fn check_proxy_health(state: State<'_, DesktopState>) -> Result<AppState, String
 #[tauri::command]
 async fn refresh_management_state(state: State<'_, DesktopState>) -> Result<AppState, String> {
     let client = management_client(&state, "无法刷新管理接口状态")?;
+    // Keep usage telemetry on so the queue fills; draining it is the background
+    // collector's job (the single consumer that persists to the usage store).
     let _ = client.set_usage_statistics_enabled(true).await;
     let snapshot = client
         .refresh_snapshot()
         .await
         .map_err(|error| error.to_string())?;
-    let request_logs = client.fetch_request_logs(200).await.unwrap_or_default();
-    {
-        let mut core = state
-            .core
-            .lock()
-            .map_err(|_| "无法回写请求日志".to_string())?;
-        core.ingest_request_logs(request_logs);
-    }
     apply_management_snapshot(&state, snapshot, "无法回写管理接口状态")
 }
 
 #[tauri::command]
 async fn drain_request_logs(state: State<'_, DesktopState>) -> Result<AppState, String> {
-    // Lightweight background poll: drain the proxy usage queue (60s retention)
-    // into the request-log buffer. No-op when management isn't reachable.
+    // Manual queue drain: pull the proxy usage queue (destructive, 60s retention)
+    // and persist events to the usage store. Safe alongside the background
+    // collector — both write to the same deduplicated store. No-op when
+    // management isn't reachable.
     let Ok(client) = management_client(&state, "") else {
         let mut core = state
             .core
@@ -568,13 +565,90 @@ async fn drain_request_logs(state: State<'_, DesktopState>) -> Result<AppState, 
         return Ok(core.app_state());
     };
     let _ = client.set_usage_statistics_enabled(true).await;
-    let request_logs = client.fetch_request_logs(200).await.unwrap_or_default();
+    let events = client.fetch_usage_events(2000).await.unwrap_or_default();
+    let store = {
+        let core = state
+            .core
+            .lock()
+            .map_err(|_| "无法读取状态".to_string())?;
+        core.usage_store()
+    };
+    if !events.is_empty() {
+        store.insert_events(&events);
+    }
     let mut core = state
         .core
         .lock()
-        .map_err(|_| "无法回写请求日志".to_string())?;
-    core.ingest_request_logs(request_logs);
+        .map_err(|_| "无法读取状态".to_string())?;
     Ok(core.app_state())
+}
+
+#[tauri::command]
+fn query_usage_stats(
+    query: UsageQuery,
+    state: State<'_, DesktopState>,
+) -> Result<UsageAggregate, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法读取用量统计".to_string())?;
+    Ok(core.query_usage_stats(&query))
+}
+
+#[tauri::command]
+fn query_account_summary(
+    query: UsageQuery,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<AccountSummaryRow>, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法读取账号汇总".to_string())?;
+    Ok(core.query_account_summary(&query))
+}
+
+#[tauri::command]
+fn list_usage_filter_options(
+    state: State<'_, DesktopState>,
+) -> Result<UsageFilterOptions, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法读取筛选项".to_string())?;
+    Ok(core.usage_filter_options())
+}
+
+#[tauri::command]
+fn query_account_auth_health(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<AccountAuthHealth>, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法读取账号健康".to_string())?;
+    Ok(core.account_auth_health())
+}
+
+#[tauri::command]
+fn get_model_prices(state: State<'_, DesktopState>) -> Result<Vec<ModelPrice>, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法读取模型单价".to_string())?;
+    Ok(core.model_prices())
+}
+
+#[tauri::command]
+fn set_model_prices(
+    prices: Vec<ModelPrice>,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<ModelPrice>, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法保存模型单价".to_string())?;
+    core.set_model_prices(&prices);
+    Ok(core.model_prices())
 }
 
 fn provider_short(id: &str) -> &str {
@@ -685,8 +759,14 @@ async fn refresh_quotas(app: AppHandle, state: State<'_, DesktopState>) -> Resul
             .map_err(|_| "无法访问代理核心".to_string())?;
         core.proxy_upstream_url()
     };
+    // Stream each account to the UI (event "quota-account") the moment it is
+    // fetched, so accounts appear one-by-one and one unreachable account never
+    // blocks the rest. The full list is still returned at the end as a sync.
+    let app_emit = app.clone();
     let quotas = tauri::async_runtime::spawn_blocking(move || {
-        quotio_core::quota::fetch_all_quotas(proxy_url.as_deref())
+        quotio_core::quota::fetch_all_quotas_streaming(proxy_url.as_deref(), &move |account| {
+            let _ = app_emit.emit("quota-account", account);
+        })
     })
     .await
     .map_err(|error| format!("额度刷新任务异常：{}", error))?;
@@ -948,6 +1028,14 @@ async fn poll_management_oauth(
         .map_err(|error| error.to_string())
 }
 
+/// Manually complete an OAuth login by replaying the pasted callback URL
+/// (http://localhost:1455/auth/callback?code=...&state=...) to the proxy's local
+/// listener from the native side, bypassing any browser/system proxy on loopback.
+#[tauri::command]
+fn submit_oauth_callback(url: String) -> Result<(), String> {
+    quotio_core::submit_oauth_callback(&url)
+}
+
 #[tauri::command]
 async fn import_management_vertex_service_account(
     json: String,
@@ -1068,6 +1156,47 @@ fn toggle_menubar(app: &AppHandle) {
     }
 }
 
+/// Poll interval for the background usage collector (ms). Comfortably under the
+/// proxy's default 60s queue retention so events are not lost at desktop volume.
+const USAGE_COLLECTOR_POLL_MS: u64 = 1500;
+
+/// Spawn the single background consumer of the proxy's destructive `/usage-queue`.
+/// It drains events at high frequency and persists them to the usage store, so
+/// the dashboard can aggregate history across arbitrary time ranges. Runs for
+/// the life of the process; iterations are cheap no-ops while the proxy is down.
+fn spawn_usage_collector(app: AppHandle) {
+    std::thread::spawn(move || {
+        // Let the proxy / management endpoint come up before the first drain.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let mut tick: u64 = 0;
+        loop {
+            let prepared = app.try_state::<DesktopState>().and_then(|state| {
+                let mut core = state.core.lock().ok()?;
+                let client = core.management_client().ok()?;
+                Some((client, core.usage_store()))
+            });
+            if let Some((client, store)) = prepared {
+                // Re-assert usage telemetry every ~30s so the queue keeps filling
+                // even when nothing else refreshes the management snapshot.
+                if tick % 20 == 0 {
+                    let _ =
+                        tauri::async_runtime::block_on(client.set_usage_statistics_enabled(true));
+                }
+                let events = tauri::async_runtime::block_on(client.fetch_usage_events(2000))
+                    .unwrap_or_default();
+                if !events.is_empty() {
+                    let inserted = store.insert_events(&events);
+                    if inserted > 0 {
+                        let _ = app.emit("usage-updated", inserted);
+                    }
+                }
+            }
+            tick = tick.wrapping_add(1);
+            std::thread::sleep(std::time::Duration::from_millis(USAGE_COLLECTOR_POLL_MS));
+        }
+    });
+}
+
 pub fn run() {
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default();
@@ -1138,6 +1267,8 @@ pub fn run() {
             }
             tray_builder.build(app)?;
 
+            spawn_usage_collector(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1166,6 +1297,12 @@ pub fn run() {
             check_proxy_health,
             refresh_management_state,
             drain_request_logs,
+            query_usage_stats,
+            query_account_summary,
+            list_usage_filter_options,
+            query_account_auth_health,
+            get_model_prices,
+            set_model_prices,
             tunnel_status,
             download_cloudflared,
             start_tunnel,
@@ -1206,6 +1343,7 @@ pub fn run() {
             delete_all_management_auth_files,
             start_management_oauth,
             poll_management_oauth,
+            submit_oauth_callback,
             import_management_vertex_service_account,
             set_management_max_retry_interval,
             set_management_logging_to_file,

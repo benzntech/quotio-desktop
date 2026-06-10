@@ -1,0 +1,227 @@
+// Dashboard usage-stats state: owns the time range, filters, search and
+// auto-refresh, and fetches aggregated KPIs + the account summary from the
+// SQLite-backed usage store via the Tauri commands. Also subscribes to the
+// collector's `usage-updated` event for near-real-time refreshes.
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { invoke } from "../lib/tauri";
+import type {
+  AccountSummaryRow,
+  ModelPrice,
+  UsageAggregate,
+  UsageFilterOptions,
+  UsageQuery,
+  UsageStatusFilter,
+} from "../types";
+
+export type TimeRangeKey = "today" | "7d" | "14d" | "30d" | "all" | "custom";
+
+export type UsageFilters = {
+  provider: string;
+  model: string;
+  account: string;
+  channel: string;
+  apiKeyHash: string;
+  status: UsageStatusFilter;
+  search: string;
+};
+
+export const EMPTY_FILTERS: UsageFilters = {
+  provider: "",
+  model: "",
+  account: "",
+  channel: "",
+  apiKeyHash: "",
+  status: "all",
+  search: "",
+};
+
+const EMPTY_OPTIONS: UsageFilterOptions = {
+  accounts: [],
+  providers: [],
+  models: [],
+  channels: [],
+  api_keys: [],
+};
+
+const DAY_MS = 86_400_000;
+
+/// Compute the [start, end] unix-ms bounds for a range preset. "today" is
+/// local-midnight aware; rolling windows are relative to now; custom parses the
+/// two datetime-local inputs.
+export function rangeBounds(
+  range: TimeRangeKey,
+  customStart?: string,
+  customEnd?: string,
+): { start: number | null; end: number | null } {
+  const now = Date.now();
+  switch (range) {
+    case "today": {
+      const start = new Date();
+      start.setHours(0, 0, 0, 0);
+      return { start: start.getTime(), end: null };
+    }
+    case "7d":
+      return { start: now - 7 * DAY_MS, end: null };
+    case "14d":
+      return { start: now - 14 * DAY_MS, end: null };
+    case "30d":
+      return { start: now - 30 * DAY_MS, end: null };
+    case "all":
+      return { start: null, end: null };
+    case "custom":
+      return {
+        start: customStart ? new Date(customStart).getTime() : null,
+        end: customEnd ? new Date(customEnd).getTime() : null,
+      };
+  }
+}
+
+export function useUsageDashboard() {
+  const [range, setRange] = useState<TimeRangeKey>("today");
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
+  const [filters, setFilters] = useState<UsageFilters>(EMPTY_FILTERS);
+  const [autoRefreshSec, setAutoRefreshSec] = useState(10);
+
+  const [stats, setStats] = useState<UsageAggregate | null>(null);
+  const [summary, setSummary] = useState<AccountSummaryRow[]>([]);
+  const [options, setOptions] = useState<UsageFilterOptions>(EMPTY_OPTIONS);
+  const [prices, setPrices] = useState<ModelPrice[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const query = useMemo<UsageQuery>(() => {
+    const { start, end } = rangeBounds(range, customStart, customEnd);
+    return {
+      start_ms: start,
+      end_ms: end,
+      provider: filters.provider || null,
+      model: filters.model || null,
+      account: filters.account || null,
+      api_key_hash: filters.apiKeyHash || null,
+      channel: filters.channel || null,
+      status: filters.status,
+      search: filters.search.trim() || null,
+    };
+  }, [range, customStart, customEnd, filters]);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [nextStats, nextSummary] = await Promise.all([
+        invoke<UsageAggregate>("query_usage_stats", { query }),
+        invoke<AccountSummaryRow[]>("query_account_summary", { query }),
+      ]);
+      setStats(nextStats);
+      setSummary(nextSummary);
+    } catch {
+      /* leave previous data on a transient failure */
+    } finally {
+      setLoading(false);
+    }
+  }, [query]);
+
+  const refreshOptions = useCallback(async () => {
+    try {
+      const [nextOptions, nextPrices] = await Promise.all([
+        invoke<UsageFilterOptions>("list_usage_filter_options"),
+        invoke<ModelPrice[]>("get_model_prices"),
+      ]);
+      setOptions(nextOptions);
+      setPrices(nextPrices);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  // Re-query whenever the effective query (range/filters/search) changes.
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    void refreshOptions();
+  }, [refreshOptions]);
+
+  // Periodic auto-refresh (0 = off).
+  useEffect(() => {
+    if (autoRefreshSec <= 0) return;
+    const id = window.setInterval(() => void refresh(), autoRefreshSec * 1000);
+    return () => window.clearInterval(id);
+  }, [autoRefreshSec, refresh]);
+
+  // Near-real-time: the background collector emits "usage-updated" when it
+  // persists new events. Debounce a burst of inserts into one refresh (Tauri).
+  // Only the (cheap, indexed) stats/summary queries run here — the filter
+  // options (DISTINCT scans) change slowly, so they refresh on mount / manual
+  // refresh only, not on every 1.5s data tick.
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    let timer: number | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen("usage-updated", () => {
+          if (timer !== null) return;
+          timer = window.setTimeout(() => {
+            timer = null;
+            void refresh();
+          }, 800);
+        }),
+      )
+      .then((fn) => {
+        unlisten = fn;
+      });
+    return () => {
+      if (unlisten) unlisten();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [refresh]);
+
+  const saveModelPrices = useCallback(
+    async (next: ModelPrice[]) => {
+      const saved = await invoke<ModelPrice[]>("set_model_prices", { prices: next });
+      setPrices(saved);
+      void refresh();
+      return saved;
+    },
+    [refresh],
+  );
+
+  const resetFilters = useCallback(() => setFilters(EMPTY_FILTERS), []);
+
+  const hasActiveFilters = useMemo(
+    () =>
+      filters.provider !== "" ||
+      filters.model !== "" ||
+      filters.account !== "" ||
+      filters.channel !== "" ||
+      filters.apiKeyHash !== "" ||
+      filters.status !== "all" ||
+      filters.search.trim() !== "",
+    [filters],
+  );
+
+  return {
+    range,
+    setRange,
+    customStart,
+    setCustomStart,
+    customEnd,
+    setCustomEnd,
+    filters,
+    setFilters,
+    resetFilters,
+    hasActiveFilters,
+    autoRefreshSec,
+    setAutoRefreshSec,
+    stats,
+    summary,
+    options,
+    prices,
+    loading,
+    refresh,
+    refreshOptions,
+    saveModelPrices,
+  };
+}

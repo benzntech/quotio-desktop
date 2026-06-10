@@ -504,6 +504,185 @@ pub struct RequestStats {
     pub average_duration_ms: u64,
 }
 
+// === Usage statistics (persisted request-level events; modeled on cpa-manager) ===
+
+/// Success/failure filter for usage queries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageStatusFilter {
+    All,
+    Success,
+    Failed,
+}
+
+impl Default for UsageStatusFilter {
+    fn default() -> Self {
+        UsageStatusFilter::All
+    }
+}
+
+/// One persisted request-level usage event (a row in `usage_events`). Drained
+/// from the proxy's destructive usage queue and written to SQLite so the
+/// dashboard can aggregate history across arbitrary time ranges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageEvent {
+    /// Stable SHA-256 over the event's identifying fields; UNIQUE in SQLite so a
+    /// record re-seen across drains is ignored rather than double-counted.
+    pub event_hash: String,
+    pub request_id: Option<String>,
+    pub timestamp_ms: i64,
+    pub timestamp: String,
+    pub provider: Option<String>,
+    pub model: String,
+    pub requested_model: Option<String>,
+    pub resolved_model: Option<String>,
+    pub endpoint: Option<String>,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub auth_type: Option<String>,
+    pub auth_index: Option<String>,
+    /// Account label/email the proxy routed this request through.
+    pub source: Option<String>,
+    /// SHA-256 of the caller API key (the raw key is never persisted).
+    pub api_key_hash: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cached_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+    pub latency_ms: u64,
+    pub failed: bool,
+    pub status_code: Option<u16>,
+    pub reasoning_effort: Option<String>,
+    pub raw_json: Option<String>,
+}
+
+/// Filter + time-range input for usage aggregation queries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageQuery {
+    /// Inclusive lower bound (unix ms). `None` = no lower bound.
+    #[serde(default)]
+    pub start_ms: Option<i64>,
+    /// Inclusive upper bound (unix ms). `None` = no upper bound.
+    #[serde(default)]
+    pub end_ms: Option<i64>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Account label / source email.
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub api_key_hash: Option<String>,
+    /// Routing channel — mapped to the event `auth_type` (oauth / api_key / …).
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub status: Option<UsageStatusFilter>,
+    /// Free-text search across account / model / provider / endpoint / key fields.
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
+/// Aggregated KPI totals for the dashboard cards.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageAggregate {
+    pub total_requests: u64,
+    pub success_requests: u64,
+    pub failed_requests: u64,
+    /// Success percentage, 0–100.
+    pub success_rate: f64,
+    /// Distinct accounts (sources) seen in range.
+    pub account_count: u64,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cached_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    /// input / total tokens, 0–100.
+    pub input_token_ratio: f64,
+    /// output / total tokens, 0–100.
+    pub output_token_ratio: f64,
+    /// cached / input tokens, 0–100.
+    pub cache_hit_rate: f64,
+    pub avg_latency_ms: f64,
+    /// `None` when no model prices are configured (cost unavailable).
+    pub estimated_cost: Option<f64>,
+    pub prices_configured: bool,
+}
+
+/// One row in the account summary table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccountSummaryRow {
+    pub account: String,
+    pub provider: Option<String>,
+    pub total_requests: u64,
+    pub success_requests: u64,
+    pub failed_requests: u64,
+    pub success_rate: f64,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub estimated_cost: Option<f64>,
+    pub last_request_ms: i64,
+    pub last_request: String,
+}
+
+/// A caller API-key option for the filter dropdown.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApiKeyOption {
+    pub hash: String,
+    pub alias: Option<String>,
+}
+
+/// Distinct filter values for the dashboard dropdowns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageFilterOptions {
+    pub accounts: Vec<String>,
+    pub providers: Vec<String>,
+    pub models: Vec<String>,
+    pub channels: Vec<String>,
+    pub api_keys: Vec<ApiKeyOption>,
+}
+
+/// A per-1M-token price for a model, used for cost estimation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelPrice {
+    pub model: String,
+    pub prompt_per_1m: f64,
+    pub completion_per_1m: f64,
+    #[serde(default)]
+    pub cache_per_1m: f64,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Real-status-code health for one account, over its most recent requests.
+/// Used to tell a genuine auth failure (401/403) apart from rate-limit / server
+/// errors, so a re-auth hint only fires on actual auth problems.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccountAuthHealth {
+    /// Account label / source email (matches `AuthFile.email`).
+    pub account: String,
+    pub recent_total: u64,
+    /// Failures with HTTP 401/403 — genuine auth failures.
+    pub auth_failures: u64,
+    /// Failures with HTTP 429 — rate limiting, not auth.
+    pub rate_limited: u64,
+    /// Other failures (5xx / unknown) — transient/upstream, not auth.
+    pub server_errors: u64,
+    pub successes: u64,
+    pub last_status_code: Option<u16>,
+    /// True only when the recent window is auth-failing with no successes — the
+    /// single signal that should drive a "re-authorize" suggestion.
+    pub recommend_reauth: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentConfigType {

@@ -67,7 +67,7 @@ export default function MenuBarPanel() {
     void app.refreshQuotas();
     const stateInterval = window.setInterval(() => {
       void app.refreshState();
-    }, 10000);
+    }, 20000);
     // Re-probe the real quotas every 10 minutes while the panel is open.
     const quotaInterval = window.setInterval(() => {
       void app.refreshQuotas();

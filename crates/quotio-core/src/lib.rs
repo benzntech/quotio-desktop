@@ -5,6 +5,7 @@ pub mod management;
 pub mod proxy_download;
 pub mod quota;
 pub mod tunnel;
+pub mod usage_store;
 
 use std::{
     fs,
@@ -12,21 +13,24 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use management::{ManagementApiClient, ManagementApiError};
 use quotio_types::{
-    default_available_models, default_providers, mask_secret, AccountQuota, AuthFile, AgentBackupFile,
+    default_available_models, default_providers, mask_secret, AccountAuthHealth, AccountQuota,
+    AccountSummaryRow, AuthFile, AgentBackupFile,
     AgentConfigurationRequest, AgentConfigurationResult, ApiKeyEntry, AppSettings, AppState,
     AvailableModel, ConnectionMode, CredentialStatus, FallbackConfigAction, FallbackConfiguration,
     FallbackEntry, FallbackEntryMoveDirection, FallbackRouteState, FallbackRuntimeState,
-    ManagementSnapshot, MigrationPhase, PlatformInfo, ProxyHealthState,
-    ProxyPlatformResourceStatus, ProxyResourceStatus, ProxyState, ProxyStatusKind, RequestLogEntry,
-    RequestStats,
-    RoutingStrategy, SavedAgentConfiguration, VirtualModel,
+    ManagementSnapshot, MigrationPhase, ModelPrice, PlatformInfo, ProxyHealthState,
+    ProxyPlatformResourceStatus, ProxyResourceStatus, ProxyState, ProxyStatusKind, RequestStats,
+    RoutingStrategy, SavedAgentConfiguration, UsageAggregate, UsageFilterOptions, UsageQuery,
+    VirtualModel,
 };
+use usage_store::UsageStore;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -83,7 +87,9 @@ pub struct AppCore {
     fallback: FallbackConfiguration,
     fallback_runtime: FallbackRuntimeState,
     quotas: Vec<AccountQuota>,
-    request_logs: Vec<RequestLogEntry>,
+    /// Persistent request-level usage history (SQLite). Shared with the
+    /// background collector that drains the proxy's usage queue.
+    usage_store: Arc<UsageStore>,
     credential_error: Option<String>,
 }
 
@@ -111,7 +117,7 @@ impl Default for AppCore {
             fallback: read_fallback_configuration().unwrap_or_default(),
             fallback_runtime: FallbackRuntimeState::default(),
             quotas: Vec::new(),
-            request_logs: Vec::new(),
+            usage_store: open_usage_store(),
             credential_error,
         }
     }
@@ -258,22 +264,49 @@ impl AppCore {
     pub async fn refresh_management_snapshot(&mut self) -> Result<AppState, ManagementCoreError> {
         let client = self.management_client()?;
         // Enable per-request telemetry so the usage queue fills (idempotent).
+        // Draining the queue is owned by the background collector — the single
+        // consumer that persists events to the usage store — so this snapshot
+        // refresh no longer competes for the destructive `/usage-queue` read.
         let _ = client.set_usage_statistics_enabled(true).await;
         let snapshot = client.refresh_snapshot().await?;
-        let request_logs = client.fetch_request_logs(200).await.unwrap_or_default();
-        self.ingest_request_logs(request_logs);
         Ok(self.apply_management_snapshot(snapshot))
     }
 
-    /// Accumulate freshly-drained request records (newest first), capped.
-    pub fn ingest_request_logs(&mut self, mut records: Vec<RequestLogEntry>) {
-        if records.is_empty() {
-            return;
-        }
-        records.reverse();
-        records.append(&mut self.request_logs);
-        records.truncate(500);
-        self.request_logs = records;
+    /// Shared handle to the persistent usage store, for the background collector
+    /// that drains the proxy's (destructive) usage queue and persists events.
+    pub fn usage_store(&self) -> Arc<UsageStore> {
+        self.usage_store.clone()
+    }
+
+    /// Aggregated KPI totals for the dashboard, over a filtered time range.
+    pub fn query_usage_stats(&self, query: &UsageQuery) -> UsageAggregate {
+        self.usage_store.query_stats(query)
+    }
+
+    /// Per-account rollup for the dashboard summary table.
+    pub fn query_account_summary(&self, query: &UsageQuery) -> Vec<AccountSummaryRow> {
+        self.usage_store.account_summary(query)
+    }
+
+    /// Distinct filter values for the dashboard dropdowns.
+    pub fn usage_filter_options(&self) -> UsageFilterOptions {
+        self.usage_store.filter_options()
+    }
+
+    /// Per-account auth health (genuine 401/403 vs rate-limit/server errors),
+    /// so the accounts panel only suggests re-auth on real auth failures.
+    pub fn account_auth_health(&self) -> Vec<AccountAuthHealth> {
+        self.usage_store.account_auth_health(20)
+    }
+
+    /// Configured model prices for cost estimation.
+    pub fn model_prices(&self) -> Vec<ModelPrice> {
+        self.usage_store.model_prices()
+    }
+
+    /// Replace the configured model prices.
+    pub fn set_model_prices(&self, prices: &[ModelPrice]) {
+        self.usage_store.set_model_prices(prices);
     }
 
     pub fn apply_management_snapshot(&mut self, snapshot: ManagementSnapshot) -> AppState {
@@ -319,11 +352,52 @@ impl AppCore {
         if !base.to_ascii_lowercase().ends_with(".json") {
             return Err("仅支持 .json 账号文件".to_string());
         }
-        serde_json::from_str::<serde_json::Value>(content)
+        let parsed = serde_json::from_str::<serde_json::Value>(content)
             .map_err(|_| "文件内容不是有效的 JSON".to_string())?;
         let dir = quotio_platform::proxy_auth_dir();
         std::fs::create_dir_all(&dir).map_err(|error| format!("创建 auth 目录失败：{}", error))?;
-        std::fs::write(dir.join(base), content)
+        let target = dir.join(base);
+
+        // De-duplicate by account identity: if this account (same email, and
+        // same provider when both declare one) already exists under a different
+        // filename, remove the stale file(s) first so re-importing updates the
+        // account in place instead of creating a duplicate in the routing pool.
+        if let Some(new_email) = credential_email(&parsed) {
+            let new_provider = credential_provider(&parsed);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path == target {
+                        continue; // this is the file we're about to overwrite
+                    }
+                    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    let lower = name.to_ascii_lowercase();
+                    if !lower.ends_with(".json") || lower.starts_with("glm-keys") {
+                        continue;
+                    }
+                    let Some(existing) = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    else {
+                        continue;
+                    };
+                    let same_email = credential_email(&existing)
+                        .map(|email| email.eq_ignore_ascii_case(&new_email))
+                        .unwrap_or(false);
+                    let same_provider = match (&new_provider, credential_provider(&existing)) {
+                        (Some(left), Some(right)) => left.eq_ignore_ascii_case(&right),
+                        _ => true,
+                    };
+                    if same_email && same_provider {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+
+        std::fs::write(&target, content)
             .map_err(|error| format!("写入账号文件失败：{}", error))?;
         Ok(self.app_state())
     }
@@ -451,7 +525,7 @@ impl AppCore {
             management,
             auth_files,
             quotas: self.quotas.clone(),
-            logs: self.request_logs.clone(),
+            logs: self.usage_store.recent_events(500),
             agents: agents::detect_agents(),
             api_keys: api_key_entries(&get_api_keys()),
             request_stats: request_stats_from_management(&self.management_snapshot),
@@ -475,6 +549,19 @@ fn load_or_create_local_api_key() -> String {
             let _ = quotio_platform::set_credential(quotio_platform::LOCAL_API_KEY_ACCOUNT, &key);
             key
         }
+    }
+}
+
+fn usage_db_path() -> PathBuf {
+    quotio_platform::app_config_dir().join("usage.sqlite")
+}
+
+/// Open the on-disk usage store, falling back to an in-memory store (stats won't
+/// persist across restarts) if the file can't be opened.
+fn open_usage_store() -> Arc<UsageStore> {
+    match UsageStore::open(&usage_db_path()) {
+        Ok(store) => Arc::new(store),
+        Err(_) => Arc::new(UsageStore::open_in_memory()),
     }
 }
 
@@ -835,6 +922,27 @@ fn fallback_port(proxy_port: u16) -> u16 {
 /// List CLIProxyAPI account files in the local auth dir as AuthFile entries, so
 /// the Providers page can show existing accounts even when the proxy isn't
 /// connected (the proxy's /auth-files is empty then).
+/// Extract the account email from a parsed CLIProxyAPI credential JSON.
+fn credential_email(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("email")
+        .and_then(|email| email.as_str())
+        .map(str::to_string)
+        .filter(|email| !email.is_empty())
+}
+
+/// Extract the provider/type declared inside a credential JSON (reads the file's
+/// own `type`/`provider` field, ignoring the filename so renamed files still
+/// compare correctly).
+fn credential_provider(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("type")
+        .or_else(|| value.get("provider"))
+        .and_then(|kind| kind.as_str())
+        .map(str::to_string)
+        .filter(|kind| !kind.is_empty())
+}
+
 pub fn list_local_accounts() -> Vec<AuthFile> {
     let dir = quotio_platform::proxy_auth_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1220,6 +1328,39 @@ impl ProxyLifecycle {
 
         self.write_config(settings)
             .map_err(|error| io_error("无法写入代理配置", error))?;
+
+        // Pre-flight: if proxy_port is already taken, only reclaim it when the
+        // holder is OUR own orphaned proxy. A foreign process is never killed —
+        // surface a clear, actionable conflict so the user can change the port.
+        if let Some((_pid, holder)) = port_listener(settings.proxy_port) {
+            let proxy_bin = managed_binary
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("CLIProxyAPI");
+            let is_own = holder.eq_ignore_ascii_case(proxy_bin)
+                || holder.to_ascii_lowercase().contains("cliproxyapi");
+            if is_own {
+                // Orphaned proxy from a previous session — reclaim the port.
+                kill_process_on_port(settings.proxy_port);
+                thread::sleep(Duration::from_millis(400));
+            } else {
+                let message = format!(
+                    "端口 {} 已被『{}』占用，无法启动代理。请在设置中改用其它端口，或关闭占用该端口的程序后重试。",
+                    settings.proxy_port, holder
+                );
+                self.state = state_for_paths(
+                    settings,
+                    &self.paths,
+                    ProxyStatusKind::Crashed,
+                    None,
+                    None,
+                    self.crash_count,
+                    ProxyHealthState::unhealthy(now_unix_seconds(), &message),
+                    message.clone(),
+                );
+                return Err(ProxyCoreError::StartupFailed(message));
+            }
+        }
 
         let mut command = Command::new(&managed_binary);
         command
@@ -1917,8 +2058,10 @@ fn kill_process_by_name(name: &str) {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/IM", name])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: don't flash a console
             .output();
     }
     #[cfg(not(windows))]
@@ -1927,13 +2070,66 @@ fn kill_process_by_name(name: &str) {
     }
 }
 
-/// Terminate whatever process is listening on `port`. Used on shutdown to stop
-/// an adopted/external proxy reliably regardless of its binary name.
+/// Best-effort process image name for a PID on Windows (e.g. "CLIProxyAPI.exe").
+#[cfg(windows)]
+fn process_name_for_pid(pid: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // CSV row: "Image.exe","PID",... → the first quoted field is the image name.
+    text.split('"')
+        .nth(1)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty() && !name.contains("INFO"))
+}
+
+/// Best-effort (pid, image name) of whatever is LISTENING on `port`, so callers
+/// can tell our own orphaned proxy apart from a foreign process.
+#[cfg(windows)]
+fn port_listener(port: u16) -> Option<(String, String)> {
+    use std::os::windows::process::CommandExt;
+    let needle = format!(":{}", port);
+    let output = std::process::Command::new("netstat")
+        .args(["-ano"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let pid = text.lines().find_map(|line| {
+        if line.contains("LISTENING") && line.contains(&needle) {
+            line.split_whitespace()
+                .last()
+                .filter(|pid| pid.chars().all(|c| c.is_ascii_digit()) && *pid != "0")
+                .map(str::to_string)
+        } else {
+            None
+        }
+    })?;
+    let name = process_name_for_pid(&pid).unwrap_or_else(|| "未知程序".to_string());
+    Some((pid, name))
+}
+
+#[cfg(not(windows))]
+fn port_listener(_port: u16) -> Option<(String, String)> {
+    None
+}
+
+/// Terminate the proxy listening on `port` — ONLY when it is our own CLIProxyAPI
+/// binary, never a foreign process that merely shares the port.
 fn kill_process_on_port(port: u16) {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let needle = format!(":{}", port);
-        let Ok(output) = std::process::Command::new("netstat").args(["-ano"]).output() else {
+        let Ok(output) = std::process::Command::new("netstat")
+            .args(["-ano"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: no console flash
+            .output()
+        else {
             return;
         };
         let text = String::from_utf8_lossy(&output.stdout);
@@ -1948,8 +2144,16 @@ fn kill_process_on_port(port: u16) {
             }
         }
         for pid in pids {
+            // Never kill a foreign process that merely shares the port.
+            let is_ours = process_name_for_pid(&pid)
+                .map(|name| name.to_ascii_lowercase().contains("cliproxyapi"))
+                .unwrap_or(false);
+            if !is_ours {
+                continue;
+            }
             let _ = std::process::Command::new("taskkill")
                 .args(["/F", "/PID", &pid])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
                 .output();
         }
     }
@@ -1964,6 +2168,67 @@ fn kill_process_on_port(port: u16) {
             }
         }
     }
+}
+
+/// Complete an OAuth login by replaying the browser's callback request to the
+/// proxy's *local* callback listener (e.g. `http://localhost:1455/auth/callback
+/// ?code=...&state=...`). The browser's own redirect can be swallowed by a
+/// system proxy (e.g. Karing) on loopback; issuing the GET from here connects
+/// straight to the loopback listener, bypassing any proxy, so CLIProxyAPI
+/// receives the `code` and performs the token exchange itself.
+pub fn submit_oauth_callback(url: &str) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| "回调地址需以 http:// 开头".to_string())?;
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = authority.rsplit_once(':').unwrap_or((authority, "80"));
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Err(format!(
+            "出于安全考虑只允许本地回调地址（localhost/127.0.0.1），收到：{}",
+            host
+        ));
+    }
+    let port: u16 = port.parse().map_err(|_| "回调地址端口无效".to_string())?;
+    let addrs: Vec<_> = format!("{}:{}", host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("解析回调地址失败：{}", error))?
+        .collect();
+    // Try every resolved address: "localhost" often resolves to IPv6 ::1 first
+    // on Windows while the callback listener only binds IPv4 127.0.0.1, so a
+    // single ::1 attempt would be refused (os error 10061).
+    let mut stream = None;
+    let mut last_err = "无可用地址".to_string();
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, Duration::from_secs(5)) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(error) => last_err = format!("{}", error),
+        }
+    }
+    let mut stream =
+        stream.ok_or_else(|| format!("连接本地回调失败（{}:{}）：{}", host, port, last_err))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nAccept: */*\r\n\r\n",
+        path, host, port
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("发送回调请求失败：{}", error))?;
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response); // best-effort; listener may close early
+    Ok(())
 }
 
 fn probe_management_endpoint(settings: &AppSettings, management_key: &str) -> Result<bool, String> {

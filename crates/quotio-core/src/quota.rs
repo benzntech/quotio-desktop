@@ -54,17 +54,50 @@ const GLM_QUOTA_URL: &str = "https://bigmodel.cn/api/monitor/usage/quota/limit";
 /// requests route through it (mirroring the macOS reference app), falling back
 /// to the OS proxy env vars when it is empty.
 pub fn fetch_all_quotas(proxy_url: Option<&str>) -> Vec<AccountQuota> {
+    fetch_all_quotas_streaming(proxy_url, &|_| {})
+}
+
+/// Like [`fetch_all_quotas`], but invokes `emit` for each account the moment it
+/// is fetched, so the UI can stream accounts in one-by-one instead of waiting
+/// for the whole batch — and one unreachable account never blocks the display.
+pub fn fetch_all_quotas_streaming(
+    proxy_url: Option<&str>,
+    emit: &(dyn Fn(&AccountQuota) + Sync),
+) -> Vec<AccountQuota> {
     let agent = build_agent(proxy_url);
     let mut quotas = Vec::new();
-    quotas.extend(fetch_codex_quotas(&agent));
-    quotas.extend(fetch_claude_quotas(&agent));
-    quotas.extend(fetch_copilot_quotas(&agent));
-    quotas.extend(fetch_antigravity_quotas(&agent));
-    quotas.extend(fetch_kiro_quotas(&agent));
-    quotas.extend(fetch_glm_quotas(&agent));
-    quotas.extend(fetch_trae_quotas(&agent));
-    quotas.extend(fetch_cursor_quotas(&agent));
-    quotas.extend(fetch_gemini_quotas(&agent));
+    // Multi-account providers fetch concurrently and stream each account.
+    quotas.extend(fetch_codex_quotas(&agent, emit));
+    quotas.extend(fetch_gemini_quotas(&agent, emit));
+    // Single / low-volume providers: fetch sequentially, then stream each.
+    for account in fetch_claude_quotas(&agent) {
+        emit(&account);
+        quotas.push(account);
+    }
+    for account in fetch_copilot_quotas(&agent) {
+        emit(&account);
+        quotas.push(account);
+    }
+    for account in fetch_antigravity_quotas(&agent) {
+        emit(&account);
+        quotas.push(account);
+    }
+    for account in fetch_kiro_quotas(&agent) {
+        emit(&account);
+        quotas.push(account);
+    }
+    for account in fetch_glm_quotas(&agent) {
+        emit(&account);
+        quotas.push(account);
+    }
+    for account in fetch_trae_quotas(&agent) {
+        emit(&account);
+        quotas.push(account);
+    }
+    for account in fetch_cursor_quotas(&agent) {
+        emit(&account);
+        quotas.push(account);
+    }
     quotas
 }
 
@@ -86,8 +119,8 @@ fn auth_dir() -> Option<PathBuf> {
 
 fn build_agent(proxy_url: Option<&str>) -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(20));
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(12));
     // Route through the user's HTTP proxy (clash/v2ray etc.) like the original
     // macOS app's proxied URLSession (ProxyConfigurationService) — provider
     // endpoints are otherwise unreachable in many regions. Prefer the upstream
@@ -225,28 +258,52 @@ fn model_usage(name: &str, remaining_percent: f64, reset_at: Option<String>) -> 
     }
 }
 
+/// Fetch a provider's accounts concurrently (bounded), so one slow or
+/// unreachable account never serializes the rest. The whole refresh is then
+/// bounded by the slowest account, not the sum — which is what made an
+/// unreachable proxy appear to hang for minutes with many accounts.
+fn fetch_parallel<F>(
+    agent: &ureq::Agent,
+    files: Vec<(PathBuf, String)>,
+    fetch_one: F,
+    emit: &(dyn Fn(&AccountQuota) + Sync),
+) -> Vec<AccountQuota>
+where
+    F: Fn(&ureq::Agent, &Path, &str) -> Option<AccountQuota> + Sync,
+{
+    const MAX_CONCURRENCY: usize = 10;
+    let mut out = Vec::new();
+    for chunk in files.chunks(MAX_CONCURRENCY) {
+        let results: Vec<Option<AccountQuota>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|(path, name)| {
+                    scope.spawn(|| {
+                        let quota = fetch_one(agent, path, name);
+                        if let Some(account) = &quota {
+                            emit(account); // stream each account to the UI the moment it lands
+                        }
+                        quota
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|handle| handle.join().unwrap_or(None)).collect()
+        });
+        out.extend(results.into_iter().flatten());
+    }
+    out
+}
+
 // ===================== Codex / OpenAI =====================
 
-fn fetch_codex_quotas(agent: &ureq::Agent) -> Vec<AccountQuota> {
-    let mut quotas = Vec::new();
-    for (path, name) in list_codex_auth_files() {
-        if let Some(quota) = fetch_codex_one(agent, &path, &name) {
-            quotas.push(quota);
-        }
-    }
-    quotas
+fn fetch_codex_quotas(agent: &ureq::Agent, emit: &(dyn Fn(&AccountQuota) + Sync)) -> Vec<AccountQuota> {
+    fetch_parallel(agent, list_codex_auth_files(), fetch_codex_one, emit)
 }
 
 // ===================== Gemini CLI =====================
 
-fn fetch_gemini_quotas(agent: &ureq::Agent) -> Vec<AccountQuota> {
-    let mut quotas = Vec::new();
-    for (path, name) in list_auth_files("gemini-") {
-        if let Some(quota) = fetch_gemini_one(agent, &path, &name) {
-            quotas.push(quota);
-        }
-    }
-    quotas
+fn fetch_gemini_quotas(agent: &ureq::Agent, emit: &(dyn Fn(&AccountQuota) + Sync)) -> Vec<AccountQuota> {
+    fetch_parallel(agent, list_auth_files("gemini-"), fetch_gemini_one, emit)
 }
 
 /// Direct (best-effort) Gemini CLI quota: reads access_token + project from the
@@ -336,18 +393,41 @@ fn fetch_codex_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<A
         .or_else(|| auth.id_token.as_deref().and_then(decode_jwt_email))
         .unwrap_or_else(|| key.clone());
 
-    let usage = match fetch_codex_usage(agent, &auth.access_token, account_id.as_deref()) {
+    // Proactively refresh an expired access token and write it back to the auth
+    // file (mirrors the macOS app), so both the quota fetch and the proxy use a
+    // fresh token instead of hitting 401.
+    let mut access_token = auth.access_token.clone();
+    if jwt_token_expired(&access_token) {
+        if let Some(refresh_token) = auth.refresh_token.as_deref() {
+            if let Ok(refreshed) = refresh_codex_token(agent, refresh_token) {
+                write_codex_access_token(path, &refreshed);
+                access_token = refreshed;
+            }
+        }
+    }
+
+    let mut auth_failed = false;
+    let usage = match fetch_codex_usage(agent, &access_token, account_id.as_deref()) {
         Ok(usage) => Some(usage),
-        Err(FetchError::Unauthorized) => auth
-            .refresh_token
-            .as_deref()
-            .and_then(|token| refresh_codex_token(agent, token).ok())
-            .and_then(|token| fetch_codex_usage(agent, &token, account_id.as_deref()).ok()),
+        Err(FetchError::Unauthorized) => {
+            let recovered = auth
+                .refresh_token
+                .as_deref()
+                .and_then(|token| refresh_codex_token(agent, token).ok())
+                .and_then(|refreshed| {
+                    write_codex_access_token(path, &refreshed);
+                    fetch_codex_usage(agent, &refreshed, account_id.as_deref()).ok()
+                });
+            // A 401 we couldn't recover (no/expired refresh token) means the
+            // account needs re-authorization — flag it for the Providers page.
+            auth_failed = recovered.is_none();
+            recovered
+        }
         // Transient failure (proxy not ready yet on startup / slow / rate limit) —
         // wait briefly and retry once so a single hiccup doesn't drop the account.
         Err(FetchError::Other) => {
             std::thread::sleep(Duration::from_millis(400));
-            fetch_codex_usage(agent, &auth.access_token, account_id.as_deref()).ok()
+            fetch_codex_usage(agent, &access_token, account_id.as_deref()).ok()
         }
     };
 
@@ -360,7 +440,11 @@ fn fetch_codex_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<A
             account_label: label,
             account_key: key,
             is_forbidden: false,
-            status_message: codex_plan_status(&auth, None),
+            status_message: if auth_failed {
+                Some("auth_failed".to_string())
+            } else {
+                codex_plan_status(&auth, None)
+            },
             models: Vec::new(),
         });
     };
@@ -371,11 +455,16 @@ fn fetch_codex_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<A
     let session_reset = rate.primary_window.as_ref().and_then(|w| w.reset_at);
     let weekly_reset = rate.secondary_window.as_ref().and_then(|w| w.reset_at);
 
+    // Codex serves requests from the Session (5h primary) window, so the account
+    // is only truly exhausted when THAT window is full. The API's top-level
+    // `limit_reached` also fires when just the Weekly (secondary) window maxes
+    // out — but such an account keeps working via the session window, so using
+    // it here would both mislabel the card AND auto-disable a usable account.
     Some(AccountQuota {
         provider_id: "codex".to_string(),
         account_label: label,
         account_key: key,
-        is_forbidden: rate.limit_reached.unwrap_or(false),
+        is_forbidden: session_used >= 100,
         status_message: codex_plan_status(&auth, usage.plan_type.as_deref()),
         models: vec![
             model_usage("Session", (100 - session_used.clamp(0, 100)) as f64, session_reset.and_then(format_reset_unix)),
@@ -418,6 +507,36 @@ fn refresh_codex_token(agent: &ureq::Agent, refresh_token: &str) -> Result<Strin
             .map(|parsed| parsed.access_token)
             .map_err(|_| FetchError::Other),
         Err(_) => Err(FetchError::Other),
+    }
+}
+
+/// Whether a JWT access token is expired (or within a 60s buffer of expiry).
+/// Returns false when the `exp` claim can't be read, so we don't refresh blindly.
+fn jwt_token_expired(token: &str) -> bool {
+    match decode_jwt_payload(token).and_then(|claims| claims.get("exp").and_then(|exp| exp.as_f64())) {
+        Some(exp) => exp < (now_unix() as f64) + 60.0,
+        None => false,
+    }
+}
+
+/// Atomically write a refreshed access token back into a Codex auth file,
+/// preserving every other field, so both the quota fetch and the proxy pick up
+/// the fresh token (mirrors the macOS app's updateAuthFile). Best-effort.
+fn write_codex_access_token(path: &Path, new_token: &str) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "access_token".to_string(),
+            serde_json::Value::String(new_token.to_string()),
+        );
+    }
+    if let Ok(serialized) = serde_json::to_vec_pretty(&value) {
+        let _ = quotio_platform::atomic_write(path, &serialized, true);
     }
 }
 

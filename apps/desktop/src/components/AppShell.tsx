@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useT } from "../i18n";
 import type {
   AgentBackupFile,
@@ -32,6 +32,8 @@ type AppShellProps = {
   isProxyBusy: boolean;
   isManagementBusy: boolean;
   isQuotaBusy: boolean;
+  quotaToast: { loaded: number } | null;
+  isRefreshing: boolean;
   proxyAction: string | null;
   managementAction: string | null;
   localAction: string | null;
@@ -108,11 +110,52 @@ async function windowAction(action: "close" | "minimize" | "maximize") {
   } else await win.toggleMaximize();
 }
 
+// Label for the global overlay shown while a proxy lifecycle action is in
+// flight, so the user gets feedback instead of clicking the button repeatedly.
+function proxyActionLabel(action: string | null): string | null {
+  switch (action) {
+    case "start_proxy":
+      return "正在启动代理…";
+    case "stop_proxy":
+      return "正在停止代理…";
+    case "restart_proxy":
+      return "正在重启代理…";
+    case "download_proxy_binary":
+      return "正在下载代理…";
+    default:
+      return null;
+  }
+}
+
 export function AppShell(props: AppShellProps) {
   const [activeSection, setActiveSection] = useState<AppSection>("dashboard");
   const [closeDialog, setCloseDialog] = useState(false);
   const [rememberClose, setRememberClose] = useState(false);
+  const [closing, setClosing] = useState(false);
+
+  // First time the user opens the Quota tab this session, kick off a fresh fetch
+  // (with the loading card) so they get current data on demand — not just the
+  // background snapshot from startup.
+  const quotaVisited = useRef(false);
+  useEffect(() => {
+    if (activeSection === "quota" && !quotaVisited.current) {
+      quotaVisited.current = true;
+      props.onRefreshQuotas();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSection]);
   const t = useT();
+
+  // Quitting runs a brief proxy/resource cleanup that can freeze the window, so
+  // paint a "closing" overlay first, then exit on the next frame so it shows.
+  function doQuit() {
+    setClosing(true);
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        void windowAction("close");
+      }),
+    );
+  }
 
   // Closing prompts whether to quit or hide to the tray, unless a remembered
   // choice exists (saved after ticking "记住我的选择").
@@ -124,7 +167,7 @@ export function AppShell(props: AppShellProps) {
     } catch {
       /* storage unavailable */
     }
-    if (saved === "quit") return windowAction("close");
+    if (saved === "quit") return doQuit();
     if (saved === "tray") return windowAction("minimize");
     setCloseDialog(true);
   }
@@ -138,7 +181,11 @@ export function AppShell(props: AppShellProps) {
       }
     }
     setCloseDialog(false);
-    void windowAction(choice === "quit" ? "close" : "minimize");
+    if (choice === "tray") {
+      void windowAction("minimize");
+    } else {
+      doQuit();
+    }
   }
 
   return (
@@ -182,7 +229,9 @@ export function AppShell(props: AppShellProps) {
         />
       </aside>
 
-      <section className="content">{renderSection(activeSection, props)}</section>
+      <section className={activeSection === "dashboard" ? "content content--dashboard" : "content"}>
+        {renderSection(activeSection, props)}
+      </section>
 
       {closeDialog ? (
         <div className="modal-overlay" onClick={() => setCloseDialog(false)}>
@@ -207,6 +256,48 @@ export function AppShell(props: AppShellProps) {
           </div>
         </div>
       ) : null}
+
+      {props.isRefreshing || props.isManagementBusy ? (
+        <div className="closing-overlay">
+          <div className="loading-card">
+            <div className="boot-bar" aria-hidden="true">
+              <span />
+            </div>
+            <p>正在刷新…</p>
+          </div>
+        </div>
+      ) : null}
+
+      {proxyActionLabel(props.proxyAction) ? (
+        <div className="closing-overlay">
+          <div className="loading-card">
+            <div className="boot-bar" aria-hidden="true">
+              <span />
+            </div>
+            <p>{proxyActionLabel(props.proxyAction)}</p>
+          </div>
+        </div>
+      ) : null}
+
+      {closing ? (
+        <div className="closing-overlay">
+          <div className="loading-card">
+            <div className="boot-bar" aria-hidden="true">
+            <span />
+          </div>
+            <p>{t("close.closing", "正在关闭…")}</p>
+          </div>
+        </div>
+      ) : null}
+
+      {props.quotaToast ? (
+        <div className="quota-toast">
+          <div className="boot-bar" aria-hidden="true">
+            <span />
+          </div>
+          <p>正在加载额度… {props.quotaToast.loaded}</p>
+        </div>
+      ) : null}
     </main>
   );
 }
@@ -220,6 +311,7 @@ function renderSection(section: AppSection, props: AppShellProps) {
           isManagementBusy={props.isManagementBusy}
           managementAction={props.managementAction}
           onRefreshManagement={() => props.onRunManagementStateAction("refresh_management_state")}
+          onRefreshQuotas={props.onRefreshQuotas}
           onRunManagementStateAction={props.onRunManagementStateAction}
           onStartOAuth={props.onStartOAuth}
           onPollOAuth={props.onPollOAuth}
@@ -314,14 +406,7 @@ function renderSection(section: AppSection, props: AppShellProps) {
       return <AboutScreen appState={props.appState} />;
     case "dashboard":
     default:
-      return (
-        <DashboardScreen
-          appState={props.appState}
-          onRefreshState={props.onRefreshState}
-          onRefreshQuotas={props.onRefreshQuotas}
-          onRefreshManagement={() => props.onRunManagementStateAction("refresh_management_state")}
-        />
-      );
+      return <DashboardScreen appState={props.appState} />;
   }
 }
 

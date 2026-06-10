@@ -4,11 +4,103 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + React + Typescript</title>
+    <title>Quotio</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        /* Transparent window: keep the corners see-through so the rounded
+           .pre-boot / .app-shell surface defines the shape. */
+        background: transparent;
+      }
+      #root {
+        height: 100%;
+      }
+      /* Static boot screen painted the instant the webview loads — before the JS
+         bundle parses and React mounts — so a transparent window shows the rounded
+         branded surface immediately instead of a black flash. React replaces it
+         with an identical-looking boot screen, so the handoff is seamless. */
+      .pre-boot {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        border-radius: 12px;
+        overflow: hidden;
+        background: #f5f5f7;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+      }
+      .pre-boot-logo {
+        width: 64px;
+        height: 64px;
+        border-radius: 18px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 30px;
+        font-weight: 800;
+        color: #fff;
+        background: linear-gradient(135deg, #0a84ff, #5e5ce6);
+        box-shadow: 0 12px 30px rgba(10, 132, 255, 0.35);
+      }
+      .pre-boot-title {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        color: #1d1d1f;
+      }
+      .pre-boot-bar {
+        position: relative;
+        width: 200px;
+        height: 4px;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.25);
+        overflow: hidden;
+      }
+      .pre-boot-bar span {
+        position: absolute;
+        top: 0;
+        left: -40%;
+        height: 100%;
+        width: 40%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #0a84ff, #5e5ce6);
+        animation: pre-boot-slide 1.1s infinite ease-in-out;
+      }
+      @keyframes pre-boot-slide {
+        0% {
+          left: -40%;
+        }
+        100% {
+          left: 100%;
+        }
+      }
+      @media (prefers-color-scheme: dark) {
+        .pre-boot {
+          background: #1c1c1e;
+        }
+        .pre-boot-title {
+          color: #f5f5f7;
+        }
+      }
+    </style>
   </head>
 
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="pre-boot">
+        <div class="pre-boot-logo">Q</div>
+        <p class="pre-boot-title">Quotio</p>
+        <div class="pre-boot-bar"><span></span></div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

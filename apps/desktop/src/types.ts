@@ -400,6 +400,95 @@ export type RequestLogEntry = {
   account?: string | null;
 };
 
+// === Usage statistics (persisted; mirrors quotio-types) ===
+
+export type UsageStatusFilter = "all" | "success" | "failed";
+
+// Filter + time-range input for the dashboard usage queries. snake_case to match
+// the Rust `UsageQuery` serde fields.
+export type UsageQuery = {
+  start_ms?: number | null;
+  end_ms?: number | null;
+  provider?: string | null;
+  model?: string | null;
+  account?: string | null;
+  api_key_hash?: string | null;
+  channel?: string | null;
+  status?: UsageStatusFilter | null;
+  search?: string | null;
+};
+
+export type UsageAggregate = {
+  total_requests: number;
+  success_requests: number;
+  failed_requests: number;
+  success_rate: number;
+  account_count: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cached_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  input_token_ratio: number;
+  output_token_ratio: number;
+  cache_hit_rate: number;
+  avg_latency_ms: number;
+  estimated_cost: number | null;
+  prices_configured: boolean;
+};
+
+export type AccountSummaryRow = {
+  account: string;
+  provider: string | null;
+  total_requests: number;
+  success_requests: number;
+  failed_requests: number;
+  success_rate: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost: number | null;
+  last_request_ms: number;
+  last_request: string;
+};
+
+export type ApiKeyOption = {
+  hash: string;
+  alias: string | null;
+};
+
+export type UsageFilterOptions = {
+  accounts: string[];
+  providers: string[];
+  models: string[];
+  channels: string[];
+  api_keys: ApiKeyOption[];
+};
+
+export type ModelPrice = {
+  model: string;
+  prompt_per_1m: number;
+  completion_per_1m: number;
+  cache_per_1m: number;
+  source: string | null;
+};
+
+// Real-status-code health per account (mirrors quotio-types AccountAuthHealth).
+// Distinguishes genuine auth failures (401/403) from rate-limit/server errors so
+// the accounts panel only suggests re-auth on real auth problems.
+export type AccountAuthHealth = {
+  account: string;
+  recent_total: number;
+  auth_failures: number;
+  rate_limited: number;
+  server_errors: number;
+  successes: number;
+  last_status_code: number | null;
+  recommend_reauth: boolean;
+};
+
 export type AppState = {
   migration_phase: string;
   platform: PlatformInfo;

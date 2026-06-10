@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { AccountQuota, AppState, AuthFile, ProviderSummary, QuotaModelUsage } from "../../types";
 import { maskEmail, quotaTone, parsePlan, planTier, matchAuthFile } from "../../lib/format";
 import { RefreshIcon } from "../icons";
@@ -24,17 +24,26 @@ type QuotaGroup = {
 
 export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas }: QuotaScreenProps) {
   const t = useT();
-  const groups = buildGroups(appState.quotas, appState.providers);
+  const groups = useMemo(() => buildGroups(appState.quotas, appState.providers), [appState.quotas, appState.providers]);
   const authFiles = appState.auth_files ?? [];
   const [activeId, setActiveId] = useState<string | null>(null);
   const active = groups.find((group) => group.id === activeId) ?? groups[0] ?? null;
+  // Heuristic proxy-unreachable hint: a refresh finished but every account came
+  // back blank (no quota, not exhausted, not auth-failed) — almost always the
+  // upstream proxy being wrong/down rather than a real per-account state.
+  const proxyUnreachable =
+    !isQuotaBusy &&
+    appState.quotas.length > 0 &&
+    appState.quotas.every(
+      (account) => account.models.length === 0 && !account.is_forbidden && account.status_message !== "auth_failed",
+    );
 
   return (
     <section className="section-page quota-page">
       <header className="page-topbar" data-tauri-drag-region>
         <h1>{t("nav.quota")}</h1>
         <button
-          className={isQuotaBusy ? "icon-button icon-button--spinning" : "icon-button"}
+          className="icon-button"
           type="button"
           onClick={onRefreshQuotas}
           disabled={isQuotaBusy}
@@ -44,6 +53,13 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas }: QuotaScr
           <RefreshIcon />
         </button>
       </header>
+
+      {proxyUnreachable ? (
+        <div className="state-banner state-banner--warn">
+          <strong>{t("quota.proxyUnreachable.title", "未获取到额度")}</strong>
+          <p>{t("quota.proxyUnreachable.desc", "代理可能不通——请检查「设置」里的代理地址,以及代理是否已启动。")}</p>
+        </div>
+      ) : null}
 
       {groups.length === 0 ? (
         <div className="state-banner state-banner--warn">
@@ -91,6 +107,9 @@ function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authF
   const statusMessage = account.status_message ?? "";
   const plan = parsePlan(statusMessage);
   const expiry = statusMessage.match(/until:\s*([^|]+)/i)?.[1]?.trim();
+  // Codex accounts whose 401 couldn't be refreshed are flagged "auth_failed" by
+  // the backend — mark them here too (matches the Providers list).
+  const authFailed = statusMessage === "auth_failed";
   // Each tier gets its own badge color; Plus is the base style.
   const tier = plan ? planTier(plan) : null;
   const planClass =
@@ -114,7 +133,14 @@ function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authF
               {t("quota.expires")} {expiry}
             </span>
           ) : null}
+          {authFailed ? <span className="quota-pill quota-pill--bad">{t("providers.stateNeedsReauth", "需重新授权")}</span> : null}
           {account.is_forbidden ? <span className="quota-pill quota-pill--bad">{t("quota.forbidden")}</span> : null}
+          {/* Weekly window maxed but the account still serves via the session
+              window — a soft heads-up, not the alarming "exhausted" pill. */}
+          {!account.is_forbidden &&
+          account.models.some((model) => /weekly/i.test(model.model) && model.remaining_percent <= 0) ? (
+            <span className="quota-pill quota-pill--warn">{t("quota.weeklyUsedUp", "本周已用尽")}</span>
+          ) : null}
           {account.warming_up ? <span className="quota-pill quota-pill--warn">{t("quota.warmup")}</span> : null}
           {account.in_use ? <span className="quota-pill quota-pill--blue">{t("quota.useInIde")}</span> : null}
         </div>
@@ -124,7 +150,10 @@ function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authF
         <div className="quota-health">
           <div className="quota-health-head">
             <span>{t("quota.health", "健康状态")}</span>
-            <span className="quota-health-counts">✓{file?.success ?? 0} · ✗{file?.failed ?? 0}</span>
+            <span className="quota-health-counts">
+              ✓{file?.success ?? 0} ·{" "}
+              <span className={(file?.failed ?? 0) > 0 ? "quota-health-fail" : undefined}>✗{file?.failed ?? 0}</span>
+            </span>
           </div>
           <HealthDots recent={recent} />
         </div>
@@ -142,7 +171,11 @@ function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authF
           </div>
         </>
       ) : (
-        <p className="quota-empty-note">{t("quota.fetchFailed", "额度获取失败,仅显示健康状态")}</p>
+        <p className="quota-empty-note">
+          {authFailed
+            ? t("quota.needsReauthNote", "需重新授权,请到服务商页重新登录")
+            : t("quota.fetchFailed", "额度获取失败,仅显示健康状态")}
+        </p>
       )}
     </article>
   );

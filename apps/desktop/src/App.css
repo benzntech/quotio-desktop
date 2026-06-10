@@ -13,6 +13,49 @@
   box-sizing: border-box;
 }
 
+/* ===== Slim, unified scrollbars (app-wide, WebView2/Chromium) ===== */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.5) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.45);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(100, 116, 139, 0.7);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+:root[data-theme="dark"] {
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+}
+
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.3);
+}
+
+:root[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(203, 213, 225, 0.5);
+}
+
 html,
 body,
 #root {
@@ -1836,7 +1879,7 @@ h3 {
 /* Sidebar: titlebar spacer, nav label, experimental badge */
 .sidebar-titlebar {
   flex: 0 0 auto;
-  height: 22px;
+  height: 30px;
 }
 
 .nav-label {
@@ -1984,11 +2027,33 @@ h3 {
 
 /* Page top bar (replaces dashboard hero) */
 .page-topbar {
+  /* Pinned so the draggable title bar (data-tauri-drag-region) stays reachable
+     while the page scrolls; the opaque bg keeps scrolled content from showing
+     through behind the title. */
+  position: sticky;
+  top: 0;
+  z-index: 20;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   min-height: 30px;
+  padding-bottom: 12px;
+  background: var(--quotio-bg);
+}
+
+/* The scroll container (.content) has a 22px top padding, so a sticky bar at
+   top:0 pins at the padding edge and leaves a strip above it uncovered, through
+   which scrolled content bleeds as a stripe. This extends the bar's opaque bg
+   upward to cover that strip (no layout impact). */
+.page-topbar::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 26px;
+  background: var(--quotio-bg);
 }
 
 .page-topbar h1 {
@@ -2353,6 +2418,118 @@ h3 {
   margin-top: 4px;
 }
 
+.closing-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Fully transparent mask — the UI behind is NOT dimmed; only the centered
+     card shows. Still intercepts clicks (prevents double-trigger). */
+  background: transparent;
+}
+.loading-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 22px 30px;
+  border-radius: 14px;
+  background: var(--quotio-card-solid);
+  border: 1px solid var(--quotio-border);
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.28);
+  color: var(--quotio-muted);
+  font-size: 13px;
+}
+.loading-card p {
+  margin: 0;
+}
+
+/* Friendly app-open screen: brand logo + name + indeterminate progress bar. */
+.boot-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+.boot-logo {
+  width: 64px;
+  height: 64px;
+  border-radius: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 30px;
+  font-weight: 800;
+  color: #fff;
+  background: linear-gradient(135deg, #0a84ff, #5e5ce6);
+  box-shadow: 0 12px 30px rgba(10, 132, 255, 0.35);
+}
+.boot-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--quotio-text);
+}
+.quota-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 1500;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 22px;
+  border-radius: 12px;
+  background: var(--quotio-card-solid);
+  border: 1px solid var(--quotio-border);
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2);
+  color: var(--quotio-muted);
+  font-size: 12.5px;
+}
+.quota-toast p {
+  margin: 0;
+}
+
+.boot-bar {
+  position: relative;
+  width: 200px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.25);
+  overflow: hidden;
+}
+.boot-bar span {
+  position: absolute;
+  top: 0;
+  left: -40%;
+  height: 100%;
+  width: 40%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #0a84ff, #5e5ce6);
+  animation: boot-bar-slide 1.1s infinite ease-in-out;
+}
+@keyframes boot-bar-slide {
+  0% {
+    left: -40%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+.boot-hint {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--quotio-muted);
+}
+.boot-hint--error {
+  color: #c0261d;
+  font-weight: 600;
+}
+
 .quota-health {
   display: flex;
   flex-direction: column;
@@ -2369,6 +2546,10 @@ h3 {
 
 .quota-health-counts {
   font-variant-numeric: tabular-nums;
+}
+.quota-health-fail {
+  color: #c0261d;
+  font-weight: 600;
 }
 
 .health-dots {
@@ -2785,6 +2966,35 @@ h3 {
 .account-row-status {
   color: var(--quotio-muted);
   font-size: 11px;
+}
+.account-row-status--good {
+  color: #16823a;
+}
+.account-row-status--warn {
+  color: #b45309;
+}
+.account-row-status--bad {
+  color: #c0261d;
+  font-weight: 600;
+}
+.account-row-status--muted {
+  color: var(--quotio-muted);
+}
+
+.account-reauth-btn {
+  border: 1px solid rgba(10, 132, 255, 0.4);
+  border-radius: 8px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--quotio-blue);
+  background: rgba(10, 132, 255, 0.08);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.account-reauth-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .account-row-actions {
@@ -3496,6 +3706,7 @@ h3 {
 .log-req-list {
   display: grid;
   gap: 1px;
+  align-content: start;
 }
 
 /* Let the request/proxy list scroll inside the panel instead of the whole page,
@@ -4048,13 +4259,13 @@ body,
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 24px;
+  min-height: 30px;
   padding-left: 14px;
 }
 
 .window-controls {
   display: flex;
-  gap: 8px;
+  gap: 10px;
 }
 
 /* The empty strip next to the traffic lights is the window drag handle. */
@@ -4367,20 +4578,22 @@ body,
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 13px;
-  height: 13px;
+  width: 16px;
+  height: 16px;
   padding: 0;
   border: 0;
   border-radius: 50%;
   cursor: pointer;
 }
 
+/* Glyphs stay visible (not hover-only) so each button's function reads at a
+   glance: ✕ close, − minimize, + maximize. */
 .win-dot-glyph {
-  opacity: 0.65;
-  font-size: 9px;
+  opacity: 0.85;
+  font-size: 11px;
   line-height: 1;
-  font-weight: 700;
-  color: rgba(0, 0, 0, 0.62);
+  font-weight: 800;
+  color: rgba(0, 0, 0, 0.6);
 }
 
 .window-controls:hover .win-dot-glyph {
@@ -4401,4 +4614,526 @@ body,
 
 .win-dot:hover {
   filter: brightness(0.9);
+}
+
+/* ===== Dashboard — usage statistics ===== */
+
+.dashboard-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Fixed header + scroll body: the title bar is pinned ABOVE the scroll region
+   (not sticky over it), so content never slides under the title — no masking
+   band, and the title doesn't repaint per scroll frame (smoother dragging). */
+.dashboard-content--fixed {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.dashboard-content--fixed > .page-topbar {
+  flex-shrink: 0;
+}
+
+.dashboard-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding-right: 4px;
+}
+
+/* The dashboard's outer .content must not scroll (the inner .dashboard-scroll
+   does) — fill the height, no reserved gutter. */
+.content--dashboard {
+  overflow: hidden;
+  scrollbar-gutter: auto;
+}
+
+/* KPI grid: 4 cards per row, the success-rate card emphasized. */
+.kpi-grid--usage {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.kpi-card--emphasis strong {
+  font-size: 32px;
+  font-weight: 800;
+}
+
+.kpi-card--emphasis.kpi-card--green strong {
+  color: #16a34a;
+}
+
+.kpi-card--emphasis.kpi-card--orange strong {
+  color: #d97706;
+}
+
+/* Filter bar */
+.usage-filter-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.usage-filter-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.range-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 14px;
+  background: rgba(148, 163, 184, 0.12);
+}
+
+.range-tab {
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: #64748b;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.range-tab:hover {
+  color: #334155;
+}
+
+.range-tab--active {
+  background: #ffffff;
+  color: #2563eb;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.18);
+}
+
+.usage-filter-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.auto-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.auto-refresh-label,
+.sort-label {
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.usage-filter-bar .secondary-action,
+.account-summary-tools .secondary-action,
+.prices-dialog .secondary-action {
+  width: auto;
+  margin-top: 0;
+  padding: 9px 16px;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.secondary-action--busy {
+  opacity: 0.7;
+}
+
+.usage-filter-bar .secondary-action svg {
+  width: 15px;
+  height: 15px;
+}
+
+.custom-range-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.custom-range-row input {
+  padding: 8px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  border-radius: 12px;
+  background: #ffffff;
+  color: inherit;
+  font: inherit;
+}
+
+.custom-range-sep {
+  color: #94a3b8;
+}
+
+.usage-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.usage-search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.usage-search {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 12px;
+  background: rgba(248, 250, 252, 0.8);
+  color: #94a3b8;
+}
+
+.usage-search input {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: #172033;
+  font: inherit;
+  outline: none;
+}
+
+.usage-search--compact {
+  flex: 0 1 220px;
+  padding: 7px 12px;
+}
+
+.usage-search-row .ghost-action,
+.account-summary-tools .ghost-action,
+.prices-dialog .ghost-action,
+.prices-add {
+  padding: 9px 16px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* Account summary */
+.account-summary-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.account-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.account-summary-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.account-summary-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sort-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.view-toggle {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 11px;
+  background: rgba(148, 163, 184, 0.14);
+}
+
+.view-toggle-btn {
+  padding: 6px 14px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #64748b;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.view-toggle-btn--active {
+  background: #ffffff;
+  color: #2563eb;
+  box-shadow: 0 3px 9px rgba(37, 99, 235, 0.16);
+}
+
+.account-summary-empty {
+  padding: 38px 20px;
+  text-align: center;
+  border: 1px dashed rgba(148, 163, 184, 0.4);
+  border-radius: 16px;
+}
+
+.account-summary-empty strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.account-summary-empty p {
+  margin: 0 auto;
+  max-width: 560px;
+  color: #64748b;
+  font-size: 13px;
+}
+
+/* Account table */
+.account-table-wrap {
+  overflow-x: auto;
+}
+
+.account-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.account-table th,
+.account-table td {
+  padding: 11px 12px;
+  text-align: left;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  white-space: nowrap;
+}
+
+.account-table th {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.account-table th.num,
+.account-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.account-table tbody tr:hover {
+  background: rgba(148, 163, 184, 0.07);
+}
+
+.account-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.account-name {
+  font-weight: 600;
+}
+
+.account-provider {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #64748b;
+}
+
+.health-pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.health-pill--good {
+  color: #15803d;
+  background: rgba(34, 197, 94, 0.16);
+}
+
+.health-pill--warn {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.18);
+}
+
+.health-pill--bad {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.16);
+}
+
+.health-pill--neutral {
+  color: #64748b;
+  background: rgba(148, 163, 184, 0.18);
+}
+
+/* Account cards */
+.acct-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.acct-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 16px;
+  background: rgba(248, 250, 252, 0.7);
+}
+
+.acct-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.acct-card-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+
+.acct-card-metrics dt {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.acct-card-metrics dd {
+  margin: 2px 0 0;
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.acct-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #64748b;
+}
+
+/* Model prices dialog */
+.prices-dialog {
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 24px;
+  border-radius: 20px;
+  background: #ffffff;
+  box-shadow: 0 30px 70px rgba(15, 23, 42, 0.3);
+}
+
+.prices-dialog-head strong {
+  font-size: 17px;
+}
+
+.prices-dialog-head p {
+  margin: 6px 0 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.prices-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.prices-table th {
+  padding: 6px 8px;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+  text-align: left;
+}
+
+.prices-table th.num {
+  text-align: right;
+}
+
+.prices-table td {
+  padding: 4px 6px;
+}
+
+.prices-table input {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.32);
+  border-radius: 10px;
+  background: #ffffff;
+  color: inherit;
+  font: inherit;
+}
+
+.prices-table td.num input {
+  text-align: right;
+}
+
+.prices-add {
+  align-self: flex-start;
+  background: #f1f5f9;
+  color: #334155;
+}
+
+.prices-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* Dark theme overrides */
+:root[data-theme="dark"] .range-tab--active,
+:root[data-theme="dark"] .view-toggle-btn--active {
+  background: rgba(37, 99, 235, 0.28);
+  color: #bfdbfe;
+}
+
+:root[data-theme="dark"] .usage-search,
+:root[data-theme="dark"] .acct-card,
+:root[data-theme="dark"] .custom-range-row input,
+:root[data-theme="dark"] .prices-table input {
+  background: rgba(30, 41, 59, 0.7);
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+:root[data-theme="dark"] .usage-search input {
+  color: #eef2ff;
+}
+
+:root[data-theme="dark"] .prices-dialog {
+  background: #111827;
+}
+
+:root[data-theme="dark"] .account-table tbody tr:hover {
+  background: rgba(148, 163, 184, 0.1);
+}
+
+@media (max-width: 1180px) {
+  .kpi-grid--usage {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }

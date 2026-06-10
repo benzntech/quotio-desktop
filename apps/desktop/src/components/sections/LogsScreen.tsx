@@ -287,5 +287,6 @@ function isErrorLog(line: string) {
 }
 
 function formatCompact(value: number) {
-  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value);
+  // Force en-US compact units (K/M/B/T) so tokens read as "166K", not "16.6万".
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }

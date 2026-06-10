@@ -289,11 +289,17 @@ pub fn run_command_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> io::Result<CommandOutput> {
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
+    }
+    let mut child = command.spawn()?;
 
     let started_at = Instant::now();
     loop {
@@ -521,6 +527,12 @@ pub fn open_file_manager(path: &Path) -> io::Result<()> {
         command.arg(target);
         command
     };
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
 
     command.spawn()?.wait()?;
     Ok(())
