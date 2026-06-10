@@ -13,8 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, params_from_iter, types::Value, Connection};
 
 use quotio_types::{
-    AccountAuthHealth, AccountSummaryRow, ApiKeyOption, ModelPrice, RequestLogEntry, UsageEvent,
-    UsageFilterOptions, UsageQuery, UsageAggregate, UsageStatusFilter,
+    AccountAuthHealth, AccountSummaryRow, ApiKeyOption, ModelPrice, RequestLogEntry,
+    UsageAggregate, UsageChartBucket, UsageEvent, UsageFilterOptions, UsageModelBreakdownRow,
+    UsageQuery, UsageStatusFilter, UsageTimeSeriesPoint,
 };
 
 /// Thread-safe handle to the usage database. Shared via `Arc` between the
@@ -255,7 +256,7 @@ impl UsageStore {
                 COALESCE(SUM(e.input_tokens),0), \
                 COALESCE(SUM(e.output_tokens),0), \
                 COALESCE(SUM(e.total_tokens),0), \
-                COALESCE(SUM(e.input_tokens*COALESCE(p.prompt_per_1m,0)/1000000.0 \
+                COALESCE(SUM(MAX(e.input_tokens - e.cached_tokens, 0)*COALESCE(p.prompt_per_1m,0)/1000000.0 \
                     + e.output_tokens*COALESCE(p.completion_per_1m,0)/1000000.0 \
                     + e.cached_tokens*COALESCE(p.cache_per_1m,0)/1000000.0),0), \
                 MAX(e.timestamp_ms), MAX(e.timestamp) \
@@ -286,6 +287,112 @@ impl UsageStore {
                 estimated_cost: if prices_configured { Some(cost) } else { None },
                 last_request_ms: row.get::<_, i64>(9)?,
                 last_request: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+            })
+        });
+        match rows {
+            Ok(iter) => iter.flatten().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Time-bucketed totals for the dashboard trend and token-composition charts.
+    pub fn usage_timeseries(
+        &self,
+        query: &UsageQuery,
+        bucket: UsageChartBucket,
+    ) -> Vec<UsageTimeSeriesPoint> {
+        let conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let (where_sql, query_params) = build_where(query);
+        let prices_configured = has_prices(&conn);
+        let bucket_label = bucket_expr(bucket);
+        let sql = format!(
+            "SELECT {bucket_label}, MIN(e.timestamp_ms), COUNT(*), \
+                COALESCE(SUM(CASE WHEN e.failed=0 THEN 1 ELSE 0 END),0), \
+                COALESCE(SUM(e.failed),0), \
+                COALESCE(SUM(e.input_tokens),0), \
+                COALESCE(SUM(e.output_tokens),0), \
+                COALESCE(SUM(e.cached_tokens),0), \
+                COALESCE(SUM(MAX(e.input_tokens - e.cached_tokens, 0)),0), \
+                COALESCE(SUM(e.total_tokens),0), \
+                COALESCE(SUM(MAX(e.input_tokens - e.cached_tokens, 0)*COALESCE(p.prompt_per_1m,0)/1000000.0 \
+                    + e.output_tokens*COALESCE(p.completion_per_1m,0)/1000000.0 \
+                    + e.cached_tokens*COALESCE(p.cache_per_1m,0)/1000000.0),0) \
+             FROM usage_events e LEFT JOIN model_prices p ON p.model = e.model{where_sql} \
+             GROUP BY 1 ORDER BY 2 ASC"
+        );
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
+            let cost = row.get::<_, f64>(10)?;
+            Ok(UsageTimeSeriesPoint {
+                bucket: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                bucket_start_ms: row.get::<_, i64>(1)?,
+                total_requests: row.get::<_, i64>(2)? as u64,
+                success_requests: row.get::<_, i64>(3)? as u64,
+                failed_requests: row.get::<_, i64>(4)? as u64,
+                input_tokens: row.get::<_, i64>(5)? as u64,
+                output_tokens: row.get::<_, i64>(6)? as u64,
+                cached_tokens: row.get::<_, i64>(7)? as u64,
+                uncached_input_tokens: row.get::<_, i64>(8)? as u64,
+                total_tokens: row.get::<_, i64>(9)? as u64,
+                estimated_cost: if prices_configured { Some(cost) } else { None },
+            })
+        });
+        match rows {
+            Ok(iter) => iter.flatten().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Per-model rollup for the dashboard model-cost ranking chart.
+    pub fn model_breakdown(&self, query: &UsageQuery, limit: usize) -> Vec<UsageModelBreakdownRow> {
+        let conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let (where_sql, query_params) = build_where(query);
+        let prices_configured = has_prices(&conn);
+        let sql = format!(
+            "SELECT e.model, COUNT(*), \
+                COALESCE(SUM(e.input_tokens),0), \
+                COALESCE(SUM(e.output_tokens),0), \
+                COALESCE(SUM(e.cached_tokens),0), \
+                COALESCE(SUM(MAX(e.input_tokens - e.cached_tokens, 0)),0), \
+                COALESCE(SUM(e.total_tokens),0), \
+                COALESCE(SUM(MAX(e.input_tokens - e.cached_tokens, 0)*COALESCE(p.prompt_per_1m,0)/1000000.0 \
+                    + e.output_tokens*COALESCE(p.completion_per_1m,0)/1000000.0 \
+                    + e.cached_tokens*COALESCE(p.cache_per_1m,0)/1000000.0),0) \
+             FROM usage_events e LEFT JOIN model_prices p ON p.model = e.model{where_sql} \
+             GROUP BY e.model ORDER BY 8 DESC, COUNT(*) DESC LIMIT ?"
+        );
+        let mut params = query_params;
+        params.push(Value::Integer(limit as i64));
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            let input = row.get::<_, i64>(2)? as u64;
+            let cached = row.get::<_, i64>(4)? as u64;
+            let cost = row.get::<_, f64>(7)?;
+            Ok(UsageModelBreakdownRow {
+                model: row
+                    .get::<_, Option<String>>(0)?
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                total_requests: row.get::<_, i64>(1)? as u64,
+                input_tokens: input,
+                output_tokens: row.get::<_, i64>(3)? as u64,
+                cached_tokens: cached,
+                uncached_input_tokens: row.get::<_, i64>(5)? as u64,
+                total_tokens: row.get::<_, i64>(6)? as u64,
+                cache_hit_rate: pct(cached, input),
+                estimated_cost: if prices_configured { Some(cost) } else { None },
             })
         });
         match rows {
@@ -345,8 +452,9 @@ impl UsageStore {
             let successes = row.get::<_, i64>(5)? as u64;
             // Suggest re-auth ONLY when the recent window has no successes and is
             // dominated by genuine 401/403 — never on 429/5xx-heavy accounts.
-            let recommend_reauth =
-                successes == 0 && auth_failures >= 2 && auth_failures >= rate_limited + server_errors;
+            let recommend_reauth = successes == 0
+                && auth_failures >= 2
+                && auth_failures >= rate_limited + server_errors;
             Ok(AccountAuthHealth {
                 account: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 recent_total: row.get::<_, i64>(1)? as u64,
@@ -590,7 +698,7 @@ fn build_where(query: &UsageQuery) -> (String, Vec<Value>) {
 
 fn cost_for(conn: &Connection, where_sql: &str, query_params: &[Value]) -> f64 {
     let sql = format!(
-        "SELECT COALESCE(SUM(e.input_tokens*p.prompt_per_1m/1000000.0 \
+        "SELECT COALESCE(SUM(MAX(e.input_tokens - e.cached_tokens, 0)*p.prompt_per_1m/1000000.0 \
             + e.output_tokens*p.completion_per_1m/1000000.0 \
             + e.cached_tokens*p.cache_per_1m/1000000.0),0) \
          FROM usage_events e JOIN model_prices p ON p.model = e.model{where_sql}"
@@ -599,6 +707,18 @@ fn cost_for(conn: &Connection, where_sql: &str, query_params: &[Value]) -> f64 {
         row.get::<_, f64>(0)
     })
     .unwrap_or(0.0)
+}
+
+fn bucket_expr(bucket: UsageChartBucket) -> &'static str {
+    match bucket {
+        UsageChartBucket::TwentyMinute => {
+            "strftime('%Y-%m-%d %H:', e.timestamp_ms / 1000, 'unixepoch', 'localtime') || printf('%02d', (CAST(strftime('%M', e.timestamp_ms / 1000, 'unixepoch', 'localtime') AS INTEGER) / 20) * 20)"
+        }
+        UsageChartBucket::Hour => {
+            "strftime('%Y-%m-%d %H:00', e.timestamp_ms / 1000, 'unixepoch', 'localtime')"
+        }
+        UsageChartBucket::Day => "strftime('%Y-%m-%d', e.timestamp_ms / 1000, 'unixepoch', 'localtime')",
+    }
 }
 
 fn has_prices(conn: &Connection) -> bool {
@@ -655,7 +775,14 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    fn event(hash: &str, ts: i64, model: &str, source: &str, failed: bool, input: u64) -> UsageEvent {
+    fn event(
+        hash: &str,
+        ts: i64,
+        model: &str,
+        source: &str,
+        failed: bool,
+        input: u64,
+    ) -> UsageEvent {
         UsageEvent {
             event_hash: hash.to_string(),
             request_id: Some(hash.to_string()),
@@ -721,13 +848,23 @@ mod tests {
 
         let options = store.filter_options();
         assert_eq!(options.providers, vec!["codex".to_string()]);
-        assert_eq!(options.models, vec!["claude".to_string(), "gpt-5.5".to_string()]);
+        assert_eq!(
+            options.models,
+            vec!["claude".to_string(), "gpt-5.5".to_string()]
+        );
     }
 
     #[test]
     fn cost_estimation_uses_prices() {
         let store = UsageStore::open_in_memory();
-        store.insert_events(&[event("a", 1000, "gpt-5.5", "alice@example.com", false, 1_000_000)]);
+        store.insert_events(&[event(
+            "a",
+            1000,
+            "gpt-5.5",
+            "alice@example.com",
+            false,
+            1_000_000,
+        )]);
         store.set_model_prices(&[ModelPrice {
             model: "gpt-5.5".to_string(),
             prompt_per_1m: 2.0,
@@ -737,9 +874,235 @@ mod tests {
         }]);
         let stats = store.query_stats(&UsageQuery::default());
         assert!(stats.prices_configured);
-        // 1e6 input * 2/1e6 + 10 output * 8/1e6 + 5 cached * 0.5/1e6 ≈ 2.00008
+        // Cached input is priced at the cache rate instead of the full prompt rate.
         let cost = stats.estimated_cost.unwrap();
         assert!((cost - 2.00008).abs() < 0.001, "cost was {cost}");
+    }
+
+    #[test]
+    fn cached_tokens_replace_prompt_cost_in_estimates() {
+        let store = UsageStore::open_in_memory();
+        let mut cached = event(
+            "cached",
+            1000,
+            "gpt-5.5",
+            "alice@example.com",
+            false,
+            1_000_000,
+        );
+        cached.cached_tokens = 800_000;
+        cached.output_tokens = 100_000;
+        cached.total_tokens = 1_100_000;
+        store.insert_events(&[cached]);
+        store.set_model_prices(&[ModelPrice {
+            model: "gpt-5.5".to_string(),
+            prompt_per_1m: 10.0,
+            completion_per_1m: 20.0,
+            cache_per_1m: 1.0,
+            source: Some("manual".to_string()),
+        }]);
+
+        let stats = store.query_stats(&UsageQuery::default());
+        let summary = store.account_summary(&UsageQuery::default());
+
+        // Only uncached input should use the full prompt price:
+        // 200k prompt + 800k cache + 100k completion = 2 + 0.8 + 2 = 4.8.
+        let cost = stats.estimated_cost.unwrap();
+        assert!((cost - 4.8).abs() < 0.001, "cost was {cost}");
+        assert_eq!(summary.len(), 1);
+        let account_cost = summary[0].estimated_cost.unwrap();
+        assert!(
+            (account_cost - 4.8).abs() < 0.001,
+            "account cost was {account_cost}"
+        );
+    }
+
+    #[test]
+    fn usage_timeseries_groups_by_day_with_correct_cost_formula() {
+        let store = UsageStore::open_in_memory();
+        let mut first = event(
+            "ts-a",
+            1_764_636_000_000,
+            "gpt-5.5",
+            "alice@example.com",
+            false,
+            1_000_000,
+        );
+        first.cached_tokens = 800_000;
+        first.output_tokens = 100_000;
+        first.total_tokens = 1_100_000;
+        let mut second = event(
+            "ts-b",
+            1_764_722_400_000,
+            "gpt-5.5",
+            "alice@example.com",
+            true,
+            500_000,
+        );
+        second.cached_tokens = 100_000;
+        second.output_tokens = 50_000;
+        second.total_tokens = 550_000;
+        store.insert_events(&[first, second]);
+        store.set_model_prices(&[ModelPrice {
+            model: "gpt-5.5".to_string(),
+            prompt_per_1m: 10.0,
+            completion_per_1m: 20.0,
+            cache_per_1m: 1.0,
+            source: Some("manual".to_string()),
+        }]);
+
+        let points = store.usage_timeseries(&UsageQuery::default(), UsageChartBucket::Day);
+
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].total_requests, 1);
+        assert_eq!(points[0].success_requests, 1);
+        assert_eq!(points[0].failed_requests, 0);
+        assert_eq!(points[0].uncached_input_tokens, 200_000);
+        assert_eq!(points[0].cached_tokens, 800_000);
+        assert_eq!(points[0].output_tokens, 100_000);
+        assert!((points[0].estimated_cost.unwrap() - 4.8).abs() < 0.001);
+        assert_eq!(points[1].total_requests, 1);
+        assert_eq!(points[1].success_requests, 0);
+        assert_eq!(points[1].failed_requests, 1);
+        assert_eq!(points[1].uncached_input_tokens, 400_000);
+        assert!((points[1].estimated_cost.unwrap() - 5.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn usage_timeseries_groups_by_twenty_minute_windows() {
+        let store = UsageStore::open_in_memory();
+        let base = 1_764_633_600_000;
+        store.insert_events(&[
+            event(
+                "ts-20-a",
+                base + 60_000,
+                "gpt-5.5",
+                "alice@example.com",
+                false,
+                100,
+            ),
+            event(
+                "ts-20-b",
+                base + 19 * 60_000,
+                "gpt-5.5",
+                "alice@example.com",
+                false,
+                200,
+            ),
+            event(
+                "ts-20-c",
+                base + 20 * 60_000,
+                "gpt-5.5",
+                "alice@example.com",
+                true,
+                300,
+            ),
+            event(
+                "ts-20-d",
+                base + 41 * 60_000,
+                "gpt-5.5",
+                "alice@example.com",
+                false,
+                400,
+            ),
+        ]);
+
+        let points = store.usage_timeseries(&UsageQuery::default(), UsageChartBucket::TwentyMinute);
+
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0].total_requests, 2);
+        assert_eq!(points[0].success_requests, 2);
+        assert_eq!(points[0].failed_requests, 0);
+        assert_eq!(points[0].input_tokens, 300);
+        assert_eq!(points[1].total_requests, 1);
+        assert_eq!(points[1].success_requests, 0);
+        assert_eq!(points[1].failed_requests, 1);
+        assert_eq!(points[2].total_requests, 1);
+        assert_eq!(points[2].input_tokens, 400);
+    }
+
+    #[test]
+    fn usage_timeseries_keeps_bucket_start_on_real_event_time() {
+        let store = UsageStore::open_in_memory();
+        let first_ms = 1_764_636_123_456;
+        let second_ms = first_ms + 3_600_000;
+        store.insert_events(&[
+            event(
+                "ts-real-a",
+                first_ms,
+                "gpt-5.5",
+                "alice@example.com",
+                false,
+                100,
+            ),
+            event(
+                "ts-real-b",
+                second_ms,
+                "gpt-5.5",
+                "alice@example.com",
+                false,
+                100,
+            ),
+        ]);
+
+        let points = store.usage_timeseries(&UsageQuery::default(), UsageChartBucket::Day);
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].bucket_start_ms, first_ms);
+    }
+
+    #[test]
+    fn usage_model_breakdown_ranks_by_corrected_cost() {
+        let store = UsageStore::open_in_memory();
+        let mut expensive = event(
+            "mb-a",
+            1000,
+            "gpt-5.5",
+            "alice@example.com",
+            false,
+            1_000_000,
+        );
+        expensive.cached_tokens = 800_000;
+        expensive.output_tokens = 100_000;
+        expensive.total_tokens = 1_100_000;
+        let mut cheap = event(
+            "mb-b",
+            2000,
+            "gpt-5.4-mini",
+            "alice@example.com",
+            false,
+            1_000_000,
+        );
+        cheap.cached_tokens = 900_000;
+        cheap.output_tokens = 10_000;
+        cheap.total_tokens = 1_010_000;
+        store.insert_events(&[expensive, cheap]);
+        store.set_model_prices(&[
+            ModelPrice {
+                model: "gpt-5.5".to_string(),
+                prompt_per_1m: 10.0,
+                completion_per_1m: 20.0,
+                cache_per_1m: 1.0,
+                source: Some("manual".to_string()),
+            },
+            ModelPrice {
+                model: "gpt-5.4-mini".to_string(),
+                prompt_per_1m: 1.0,
+                completion_per_1m: 2.0,
+                cache_per_1m: 0.1,
+                source: Some("manual".to_string()),
+            },
+        ]);
+
+        let rows = store.model_breakdown(&UsageQuery::default(), 10);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].model, "gpt-5.5");
+        assert!((rows[0].estimated_cost.unwrap() - 4.8).abs() < 0.001);
+        assert_eq!(rows[0].uncached_input_tokens, 200_000);
+        assert!((rows[0].cache_hit_rate - 80.0).abs() < 0.001);
+        assert_eq!(rows[1].model, "gpt-5.4-mini");
+        assert!((rows[1].estimated_cost.unwrap() - 0.21).abs() < 0.001);
     }
 
     fn coded(hash: &str, ts: i64, source: &str, status: u16) -> UsageEvent {
@@ -774,17 +1137,26 @@ mod tests {
         let alice = &health["alice@example.com"];
         assert_eq!(alice.auth_failures, 3);
         assert_eq!(alice.successes, 0);
-        assert!(alice.recommend_reauth, "all-401 no-success should suggest re-auth");
+        assert!(
+            alice.recommend_reauth,
+            "all-401 no-success should suggest re-auth"
+        );
 
         let bob = &health["bob@example.com"];
         assert_eq!(bob.auth_failures, 0);
         assert_eq!(bob.rate_limited, 1);
         assert_eq!(bob.server_errors, 2);
-        assert!(!bob.recommend_reauth, "429/500-heavy must NOT suggest re-auth");
+        assert!(
+            !bob.recommend_reauth,
+            "429/500-heavy must NOT suggest re-auth"
+        );
 
         let carol = &health["carol@example.com"];
         assert_eq!(carol.auth_failures, 2);
         assert_eq!(carol.successes, 1);
-        assert!(!carol.recommend_reauth, "a recent success means auth still works");
+        assert!(
+            !carol.recommend_reauth,
+            "a recent success means auth still works"
+        );
     }
 }

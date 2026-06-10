@@ -4,6 +4,7 @@ import { UsageFilterBar } from "./UsageFilterBar";
 import { UsageKpiGrid } from "./UsageKpiGrid";
 import { AccountSummaryPanel } from "./AccountSummaryPanel";
 import { ModelPricesDialog } from "./ModelPricesDialog";
+import { UsageChartsPanel } from "./UsageChartsPanel";
 import { useUsageDashboard } from "../../state/usageDashboard";
 import { CheckIcon, CopyIcon } from "../icons";
 import { useT } from "../../i18n";
@@ -59,6 +60,12 @@ export function DashboardScreen({ appState }: DashboardScreenProps) {
         />
 
         <UsageKpiGrid stats={dash.stats} />
+
+        <UsageChartsPanel
+          timeseries={dash.timeseries}
+          modelBreakdown={dash.modelBreakdown}
+          loading={dash.loading}
+        />
 
         <AccountSummaryPanel
           rows={dash.summary}

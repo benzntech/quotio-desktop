@@ -21,13 +21,13 @@ use std::{
 use management::{ManagementApiClient, ManagementApiError};
 use quotio_types::{
     default_available_models, default_providers, mask_secret, AccountAuthHealth, AccountQuota,
-    AccountSummaryRow, AuthFile, AgentBackupFile,
-    AgentConfigurationRequest, AgentConfigurationResult, ApiKeyEntry, AppSettings, AppState,
-    AvailableModel, ConnectionMode, CredentialStatus, FallbackConfigAction, FallbackConfiguration,
-    FallbackEntry, FallbackEntryMoveDirection, FallbackRouteState, FallbackRuntimeState,
-    ManagementSnapshot, MigrationPhase, ModelPrice, PlatformInfo, ProxyHealthState,
-    ProxyPlatformResourceStatus, ProxyResourceStatus, ProxyState, ProxyStatusKind, RequestStats,
-    RoutingStrategy, SavedAgentConfiguration, UsageAggregate, UsageFilterOptions, UsageQuery,
+    AccountSummaryRow, AgentBackupFile, AgentConfigurationRequest, AgentConfigurationResult,
+    ApiKeyEntry, AppSettings, AppState, AuthFile, AvailableModel, ConnectionMode, CredentialStatus,
+    FallbackConfigAction, FallbackConfiguration, FallbackEntry, FallbackEntryMoveDirection,
+    FallbackRouteState, FallbackRuntimeState, ManagementSnapshot, MigrationPhase, ModelPrice,
+    PlatformInfo, ProxyHealthState, ProxyPlatformResourceStatus, ProxyResourceStatus, ProxyState,
+    ProxyStatusKind, RequestStats, RoutingStrategy, SavedAgentConfiguration, UsageAggregate,
+    UsageChartBucket, UsageFilterOptions, UsageModelBreakdownRow, UsageQuery, UsageTimeSeriesPoint,
     VirtualModel,
 };
 use usage_store::UsageStore;
@@ -288,6 +288,24 @@ impl AppCore {
         self.usage_store.account_summary(query)
     }
 
+    /// Time-bucketed rollup for the dashboard usage charts.
+    pub fn query_usage_timeseries(
+        &self,
+        query: &UsageQuery,
+        bucket: UsageChartBucket,
+    ) -> Vec<UsageTimeSeriesPoint> {
+        self.usage_store.usage_timeseries(query, bucket)
+    }
+
+    /// Per-model rollup for the dashboard model ranking chart.
+    pub fn query_usage_model_breakdown(
+        &self,
+        query: &UsageQuery,
+        limit: usize,
+    ) -> Vec<UsageModelBreakdownRow> {
+        self.usage_store.model_breakdown(query, limit)
+    }
+
     /// Distinct filter values for the dashboard dropdowns.
     pub fn usage_filter_options(&self) -> UsageFilterOptions {
         self.usage_store.filter_options()
@@ -397,8 +415,7 @@ impl AppCore {
             }
         }
 
-        std::fs::write(&target, content)
-            .map_err(|error| format!("写入账号文件失败：{}", error))?;
+        std::fs::write(&target, content).map_err(|error| format!("写入账号文件失败：{}", error))?;
         Ok(self.app_state())
     }
 
@@ -719,12 +736,10 @@ fn derive_fallback_route_states(config: &FallbackConfiguration) -> Vec<FallbackR
 
 fn api_key_entries(keys: &[String]) -> Vec<ApiKeyEntry> {
     keys.iter()
-        .map(|key| {
-            ApiKeyEntry {
-                value: key.clone(),
-                masked_value: mask_secret(key),
-                source: "management".to_string(),
-            }
+        .map(|key| ApiKeyEntry {
+            value: key.clone(),
+            masked_value: mask_secret(key),
+            source: "management".to_string(),
         })
         .collect()
 }
@@ -1036,7 +1051,8 @@ fn save_custom_providers(list: &[CustomProvider]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建配置目录失败：{}", error))?;
     }
-    let json = serde_json::to_string_pretty(list).map_err(|error| format!("序列化失败：{}", error))?;
+    let json =
+        serde_json::to_string_pretty(list).map_err(|error| format!("序列化失败：{}", error))?;
     std::fs::write(&path, json).map_err(|error| format!("写入自定义服务商失败：{}", error))
 }
 
@@ -1059,7 +1075,11 @@ pub fn add_custom_provider(
         name: name.to_string(),
         base_url: base_url.to_string(),
         api_key: api_key.trim().to_string(),
-        kind: if kind.is_empty() { "openai".to_string() } else { kind.to_string() },
+        kind: if kind.is_empty() {
+            "openai".to_string()
+        } else {
+            kind.to_string()
+        },
         prefix: prefix.trim().to_string(),
     });
     save_custom_providers(&list)?;
@@ -2004,7 +2024,10 @@ fn render_payload_overrides(settings: &AppSettings) -> String {
         params.push(format!("        \"model\": {}", yaml_quote(force_model)));
     }
     if !reasoning.is_empty() {
-        params.push(format!("        \"reasoning.effort\": {}", yaml_quote(reasoning)));
+        params.push(format!(
+            "        \"reasoning.effort\": {}",
+            yaml_quote(reasoning)
+        ));
     }
     if params.is_empty() {
         return String::new();
@@ -2066,7 +2089,9 @@ fn kill_process_by_name(name: &str) {
     }
     #[cfg(not(windows))]
     {
-        let _ = std::process::Command::new("pkill").args(["-f", name]).output();
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", name])
+            .output();
     }
 }
 
@@ -2164,7 +2189,9 @@ fn kill_process_on_port(port: u16) {
             .output()
         {
             for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-                let _ = std::process::Command::new("kill").args(["-9", pid]).output();
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid])
+                    .output();
             }
         }
     }

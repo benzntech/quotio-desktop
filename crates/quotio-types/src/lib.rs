@@ -616,6 +616,51 @@ pub struct UsageAggregate {
     pub prices_configured: bool,
 }
 
+/// Time bucket size for dashboard chart aggregations.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageChartBucket {
+    TwentyMinute,
+    Hour,
+    Day,
+}
+
+impl Default for UsageChartBucket {
+    fn default() -> Self {
+        UsageChartBucket::Day
+    }
+}
+
+/// One point in the dashboard usage trend chart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageTimeSeriesPoint {
+    pub bucket: String,
+    pub bucket_start_ms: i64,
+    pub total_requests: u64,
+    pub success_requests: u64,
+    pub failed_requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub uncached_input_tokens: u64,
+    pub total_tokens: u64,
+    pub estimated_cost: Option<f64>,
+}
+
+/// One model row in the dashboard model cost ranking chart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageModelBreakdownRow {
+    pub model: String,
+    pub total_requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub uncached_input_tokens: u64,
+    pub total_tokens: u64,
+    pub cache_hit_rate: f64,
+    pub estimated_cost: Option<f64>,
+}
+
 /// One row in the account summary table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccountSummaryRow {
@@ -1657,7 +1702,10 @@ mod tests {
 
         assert_eq!(settings.proxy_port, 28317);
         assert_eq!(settings.endpoint(), "http://127.0.0.1:28317");
-        assert_eq!(settings.management_endpoint(), "http://127.0.0.1:28317/v0/management");
+        assert_eq!(
+            settings.management_endpoint(),
+            "http://127.0.0.1:28317/v0/management"
+        );
         assert_eq!(proxy_config.port, 28317);
     }
 

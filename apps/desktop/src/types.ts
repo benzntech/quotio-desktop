@@ -439,6 +439,34 @@ export type UsageAggregate = {
   prices_configured: boolean;
 };
 
+export type UsageChartBucket = "twenty_minute" | "hour" | "day";
+
+export type UsageTimeSeriesPoint = {
+  bucket: string;
+  bucket_start_ms: number;
+  total_requests: number;
+  success_requests: number;
+  failed_requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  uncached_input_tokens: number;
+  total_tokens: number;
+  estimated_cost: number | null;
+};
+
+export type UsageModelBreakdownRow = {
+  model: string;
+  total_requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  uncached_input_tokens: number;
+  total_tokens: number;
+  cache_hit_rate: number;
+  estimated_cost: number | null;
+};
+
 export type AccountSummaryRow = {
   account: string;
   provider: string | null;

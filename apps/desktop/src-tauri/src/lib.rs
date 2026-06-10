@@ -5,7 +5,8 @@ use quotio_types::{
     AccountAuthHealth, AccountSummaryRow, AgentBackupFile, AgentConfigurationRequest,
     AgentConfigurationResult, AppSettings, AppState, AuthFile, AvailableModel, CredentialStatus,
     FallbackConfigAction, ManagementSnapshot, ModelPrice, OAuthStatusResponse, OAuthUrlResponse,
-    PlatformInfo, SavedAgentConfiguration, UsageFilterOptions, UsageQuery, UsageAggregate,
+    PlatformInfo, SavedAgentConfiguration, UsageAggregate, UsageChartBucket, UsageFilterOptions,
+    UsageModelBreakdownRow, UsageQuery, UsageTimeSeriesPoint,
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -238,9 +239,7 @@ async fn start_proxy(app: AppHandle, state: State<'_, DesktopState>) -> Result<A
     // crash + probes health, so run it on a blocking thread to never freeze UI.
     let core = Arc::clone(&state.core);
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let mut core = core
-            .lock()
-            .map_err(|_| "无法启动代理核心".to_string())?;
+        let mut core = core.lock().map_err(|_| "无法启动代理核心".to_string())?;
         core.start_proxy().map_err(|error| error.to_string())
     })
     .await
@@ -254,9 +253,7 @@ async fn start_proxy(app: AppHandle, state: State<'_, DesktopState>) -> Result<A
 async fn stop_proxy(app: AppHandle, state: State<'_, DesktopState>) -> Result<AppState, String> {
     let core = Arc::clone(&state.core);
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let mut core = core
-            .lock()
-            .map_err(|_| "无法停止代理核心".to_string())?;
+        let mut core = core.lock().map_err(|_| "无法停止代理核心".to_string())?;
         core.stop_proxy().map_err(|error| error.to_string())
     })
     .await
@@ -558,28 +555,19 @@ async fn drain_request_logs(state: State<'_, DesktopState>) -> Result<AppState, 
     // collector — both write to the same deduplicated store. No-op when
     // management isn't reachable.
     let Ok(client) = management_client(&state, "") else {
-        let mut core = state
-            .core
-            .lock()
-            .map_err(|_| "无法读取状态".to_string())?;
+        let mut core = state.core.lock().map_err(|_| "无法读取状态".to_string())?;
         return Ok(core.app_state());
     };
     let _ = client.set_usage_statistics_enabled(true).await;
     let events = client.fetch_usage_events(2000).await.unwrap_or_default();
     let store = {
-        let core = state
-            .core
-            .lock()
-            .map_err(|_| "无法读取状态".to_string())?;
+        let core = state.core.lock().map_err(|_| "无法读取状态".to_string())?;
         core.usage_store()
     };
     if !events.is_empty() {
         store.insert_events(&events);
     }
-    let mut core = state
-        .core
-        .lock()
-        .map_err(|_| "无法读取状态".to_string())?;
+    let mut core = state.core.lock().map_err(|_| "无法读取状态".to_string())?;
     Ok(core.app_state())
 }
 
@@ -608,9 +596,33 @@ fn query_account_summary(
 }
 
 #[tauri::command]
-fn list_usage_filter_options(
+fn query_usage_timeseries(
+    query: UsageQuery,
+    bucket: UsageChartBucket,
     state: State<'_, DesktopState>,
-) -> Result<UsageFilterOptions, String> {
+) -> Result<Vec<UsageTimeSeriesPoint>, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法读取用量趋势".to_string())?;
+    Ok(core.query_usage_timeseries(&query, bucket))
+}
+
+#[tauri::command]
+fn query_usage_model_breakdown(
+    query: UsageQuery,
+    limit: Option<usize>,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<UsageModelBreakdownRow>, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法读取模型排行".to_string())?;
+    Ok(core.query_usage_model_breakdown(&query, limit.unwrap_or(10)))
+}
+
+#[tauri::command]
+fn list_usage_filter_options(state: State<'_, DesktopState>) -> Result<UsageFilterOptions, String> {
     let core = state
         .core
         .lock()
@@ -670,10 +682,7 @@ fn import_auth_file(
     content: String,
     state: State<'_, DesktopState>,
 ) -> Result<AppState, String> {
-    let mut core = state
-        .core
-        .lock()
-        .map_err(|_| "无法导入账号".to_string())?;
+    let mut core = state.core.lock().map_err(|_| "无法导入账号".to_string())?;
     core.import_auth_file(&filename, &content)
 }
 
@@ -746,7 +755,10 @@ fn update_api_key(
 }
 
 #[tauri::command]
-async fn refresh_quotas(app: AppHandle, state: State<'_, DesktopState>) -> Result<AppState, String> {
+async fn refresh_quotas(
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<AppState, String> {
     // Resolve the user-configured upstream proxy under a short lock, then release
     // it so the (blocking, multi-provider) network fetch never holds the core
     // mutex or freezes the UI. Provider requests route through that proxy (like
@@ -772,7 +784,8 @@ async fn refresh_quotas(app: AppHandle, state: State<'_, DesktopState>) -> Resul
     .map_err(|error| format!("额度刷新任务异常：{}", error))?;
 
     // "Quota at a glance" tray tooltip: lowest remaining % per provider.
-    let mut by_provider: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    let mut by_provider: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
     for account in &quotas {
         for model in &account.models {
             let entry = by_provider
@@ -786,7 +799,9 @@ async fn refresh_quotas(app: AppHandle, state: State<'_, DesktopState>) -> Resul
     } else {
         by_provider
             .iter()
-            .map(|(provider, remaining)| format!("{} {}%", provider_short(provider), remaining.round() as i64))
+            .map(|(provider, remaining)| {
+                format!("{} {}%", provider_short(provider), remaining.round() as i64)
+            })
             .collect::<Vec<_>>()
             .join(" · ")
     };
@@ -794,10 +809,7 @@ async fn refresh_quotas(app: AppHandle, state: State<'_, DesktopState>) -> Resul
         let _ = tray.set_tooltip(Some(tooltip.as_str()));
     }
 
-    let mut core = state
-        .core
-        .lock()
-        .map_err(|_| "无法刷新额度".to_string())?;
+    let mut core = state.core.lock().map_err(|_| "无法刷新额度".to_string())?;
     Ok(core.set_quotas(quotas))
 }
 
@@ -1299,6 +1311,8 @@ pub fn run() {
             drain_request_logs,
             query_usage_stats,
             query_account_summary,
+            query_usage_timeseries,
+            query_usage_model_breakdown,
             list_usage_filter_options,
             query_account_auth_health,
             get_model_prices,

@@ -4118,6 +4118,41 @@ h3 {
   background: rgba(255, 255, 255, 0.05);
 }
 
+:root[data-theme="dark"] .usage-charts-head p,
+:root[data-theme="dark"] .usage-chart-empty,
+:root[data-theme="dark"] .usage-chart-canvas .recharts-text {
+  color: var(--quotio-muted);
+  fill: var(--quotio-muted);
+}
+
+:root[data-theme="dark"] .usage-chart-tabs {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+:root[data-theme="dark"] .usage-chart-tab {
+  color: var(--quotio-muted);
+}
+
+:root[data-theme="dark"] .usage-chart-tab:hover,
+:root[data-theme="dark"] .usage-chart-tab--active {
+  color: #93c5fd;
+}
+
+:root[data-theme="dark"] .usage-chart-tab--active {
+  background: rgba(59, 130, 246, 0.16);
+  box-shadow: none;
+}
+
+:root[data-theme="dark"] .usage-chart-canvas .recharts-cartesian-grid line {
+  stroke: rgba(148, 163, 184, 0.18);
+}
+
+:root[data-theme="dark"] .usage-chart-canvas .recharts-default-tooltip {
+  color: var(--quotio-text) !important;
+  background: rgba(15, 23, 42, 0.96) !important;
+  border-color: var(--quotio-border-strong) !important;
+}
+
 :root[data-theme="dark"] .provider-pill,
 :root[data-theme="dark"] .account-card,
 :root[data-theme="dark"] .agent-card {
@@ -4823,6 +4858,89 @@ body,
   border-radius: 12px;
   font-weight: 700;
   cursor: pointer;
+}
+
+/* Usage charts */
+.usage-charts-panel {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+}
+
+.usage-charts-panel--loading {
+  opacity: 0.78;
+}
+
+.usage-charts-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.usage-charts-head p {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.usage-chart-tabs {
+  display: inline-flex;
+  gap: 8px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.12);
+}
+
+.usage-chart-tab {
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 999px;
+  color: #64748b;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 800;
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+}
+
+.usage-chart-tab:hover {
+  color: #334155;
+}
+
+.usage-chart-tab--active {
+  color: #1d4ed8;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.16);
+}
+
+.usage-chart-canvas {
+  height: 280px;
+  min-width: 0;
+}
+
+.usage-chart-canvas .recharts-cartesian-grid line {
+  stroke: rgba(148, 163, 184, 0.24);
+}
+
+.usage-chart-canvas .recharts-text {
+  fill: #64748b;
+  font-size: 12px;
+}
+
+.usage-chart-canvas .recharts-default-tooltip {
+  border: 1px solid rgba(148, 163, 184, 0.28) !important;
+  border-radius: 12px;
+  box-shadow: 0 16px 44px rgba(15, 23, 42, 0.14);
+}
+
+.usage-chart-empty {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  color: #64748b;
+  font-size: 13px;
 }
 
 /* Account summary */

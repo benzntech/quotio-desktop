@@ -5,16 +5,20 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "../lib/tauri";
+import { rangeBounds, type TimeRangeKey } from "./usageRange";
 import type {
   AccountSummaryRow,
   ModelPrice,
   UsageAggregate,
+  UsageChartBucket,
   UsageFilterOptions,
+  UsageModelBreakdownRow,
   UsageQuery,
   UsageStatusFilter,
+  UsageTimeSeriesPoint,
 } from "../types";
 
-export type TimeRangeKey = "today" | "7d" | "14d" | "30d" | "all" | "custom";
+export type { TimeRangeKey } from "./usageRange";
 
 export type UsageFilters = {
   provider: string;
@@ -44,37 +48,8 @@ const EMPTY_OPTIONS: UsageFilterOptions = {
   api_keys: [],
 };
 
-const DAY_MS = 86_400_000;
-
-/// Compute the [start, end] unix-ms bounds for a range preset. "today" is
-/// local-midnight aware; rolling windows are relative to now; custom parses the
-/// two datetime-local inputs.
-export function rangeBounds(
-  range: TimeRangeKey,
-  customStart?: string,
-  customEnd?: string,
-): { start: number | null; end: number | null } {
-  const now = Date.now();
-  switch (range) {
-    case "today": {
-      const start = new Date();
-      start.setHours(0, 0, 0, 0);
-      return { start: start.getTime(), end: null };
-    }
-    case "7d":
-      return { start: now - 7 * DAY_MS, end: null };
-    case "14d":
-      return { start: now - 14 * DAY_MS, end: null };
-    case "30d":
-      return { start: now - 30 * DAY_MS, end: null };
-    case "all":
-      return { start: null, end: null };
-    case "custom":
-      return {
-        start: customStart ? new Date(customStart).getTime() : null,
-        end: customEnd ? new Date(customEnd).getTime() : null,
-      };
-  }
+function chartBucketForRange(range: TimeRangeKey): UsageChartBucket {
+  return range === "today" ? "twenty_minute" : "day";
 }
 
 export function useUsageDashboard() {
@@ -86,6 +61,8 @@ export function useUsageDashboard() {
 
   const [stats, setStats] = useState<UsageAggregate | null>(null);
   const [summary, setSummary] = useState<AccountSummaryRow[]>([]);
+  const [timeseries, setTimeseries] = useState<UsageTimeSeriesPoint[]>([]);
+  const [modelBreakdown, setModelBreakdown] = useState<UsageModelBreakdownRow[]>([]);
   const [options, setOptions] = useState<UsageFilterOptions>(EMPTY_OPTIONS);
   const [prices, setPrices] = useState<ModelPrice[]>([]);
   const [loading, setLoading] = useState(false);
@@ -108,18 +85,23 @@ export function useUsageDashboard() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextStats, nextSummary] = await Promise.all([
+      const bucket = chartBucketForRange(range);
+      const [nextStats, nextSummary, nextTimeseries, nextModelBreakdown] = await Promise.all([
         invoke<UsageAggregate>("query_usage_stats", { query }),
         invoke<AccountSummaryRow[]>("query_account_summary", { query }),
+        invoke<UsageTimeSeriesPoint[]>("query_usage_timeseries", { query, bucket }),
+        invoke<UsageModelBreakdownRow[]>("query_usage_model_breakdown", { query, limit: 10 }),
       ]);
       setStats(nextStats);
       setSummary(nextSummary);
+      setTimeseries(nextTimeseries);
+      setModelBreakdown(nextModelBreakdown);
     } catch {
       /* leave previous data on a transient failure */
     } finally {
       setLoading(false);
     }
-  }, [query]);
+  }, [query, range]);
 
   const refreshOptions = useCallback(async () => {
     try {
@@ -217,6 +199,8 @@ export function useUsageDashboard() {
     setAutoRefreshSec,
     stats,
     summary,
+    timeseries,
+    modelBreakdown,
     options,
     prices,
     loading,
