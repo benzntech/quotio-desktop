@@ -1,6 +1,7 @@
 pub mod agent_config;
 pub mod agents;
 pub mod bridge;
+pub mod codex_launch;
 pub mod management;
 pub mod proxy_download;
 pub mod quota;

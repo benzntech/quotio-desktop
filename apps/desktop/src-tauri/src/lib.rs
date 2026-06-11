@@ -5,7 +5,8 @@ use quotio_types::{
     AccountAuthHealth, AccountSummaryRow, AgentBackupFile, AgentConfigurationRequest,
     AgentConfigurationResult, AppSettings, AppState, AuthFile, AvailableModel, CredentialStatus,
     FallbackConfigAction, ManagementSnapshot, ModelPrice, OAuthStatusResponse, OAuthUrlResponse,
-    PlatformInfo, SavedAgentConfiguration, UsageAggregate, UsageChartBucket, UsageFilterOptions,
+    PlatformInfo, ProxyStatusKind, SavedAgentConfiguration, UsageAggregate, UsageChartBucket,
+    UsageFilterOptions,
     UsageModelBreakdownRow, UsageQuery, UsageTimeSeriesPoint,
 };
 use tauri::{
@@ -107,6 +108,68 @@ fn configure_agent(
         .map_err(|_| "无法配置 agent".to_string())?;
     core.configure_agent_with_result(request)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn detect_codex_app() -> Option<String> {
+    quotio_core::codex_launch::detect_codex_app_path()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn list_codex_launch_accounts() -> Vec<quotio_core::codex_launch::CodexAccountRef> {
+    quotio_core::codex_launch::list_codex_accounts()
+}
+
+/// 一键：确保代理运行 → 写 ~/.codex 配置 → 绑定账号注入 auth.json → 启动 App/CLI。
+#[tauri::command]
+fn configure_and_launch_codex(
+    request: AgentConfigurationRequest,
+    account_key: String,
+    launch_mode: String,
+    app_path: Option<String>,
+    state: State<'_, DesktopState>,
+) -> Result<String, String> {
+    use quotio_core::codex_launch;
+    let mut core = state
+        .core
+        .lock()
+        .map_err(|_| "无法启动 Codex".to_string())?;
+
+    let running = matches!(
+        core.app_state().proxy.status,
+        ProxyStatusKind::Running | ProxyStatusKind::Starting
+    );
+    if !running {
+        core.start_proxy()
+            .map_err(|error| format!("启动代理失败：{error}"))?;
+    }
+
+    core.configure_agent_with_result(request)
+        .map_err(|error| error.to_string())?;
+
+    let account_key = account_key.trim();
+    if account_key.is_empty() {
+        return Err("请先选择要绑定的 Codex 账号".to_string());
+    }
+    codex_launch::inject_bound_account(account_key)?;
+
+    match launch_mode.as_str() {
+        "cli" => {
+            codex_launch::launch_codex_cli()?;
+            Ok("已在终端启动 Codex CLI".to_string())
+        }
+        _ => {
+            let exe = app_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.exists())
+                .or_else(codex_launch::detect_codex_app_path)
+                .ok_or_else(|| "未找到 Codex 应用，请在设置里手填应用路径".to_string())?;
+            let pid = codex_launch::launch_codex_app(&exe)?;
+            Ok(format!("已启动 Codex 应用（pid={pid}）"))
+        }
+    }
 }
 
 #[tauri::command]
@@ -1294,6 +1357,9 @@ pub fn run() {
             list_agent_backups,
             restore_agent_backup,
             reset_agent_configuration,
+            detect_codex_app,
+            list_codex_launch_accounts,
+            configure_and_launch_codex,
             discover_available_models,
             refresh_fallback_route_state,
             credential_status,

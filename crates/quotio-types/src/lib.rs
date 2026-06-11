@@ -129,6 +129,12 @@ pub struct AppSettings {
     pub max_retry_interval_seconds: u16,
     pub remote_endpoint_url: Option<String>,
     pub remote_management_key: Option<String>,
+    /// Codex 桌面应用可执行文件路径（探测得到或用户手填；空则启动时自动探测）。
+    pub codex_app_path: String,
+    /// Codex 启动模式："app"（桌面应用）或 "cli"（终端）。
+    pub codex_launch_mode: String,
+    /// 一键启动时绑定的 Codex 账号 key（`~/.cli-proxy-api` 文件名去 .json）。
+    pub codex_bound_account: String,
 }
 
 impl Default for AppSettings {
@@ -161,6 +167,9 @@ impl Default for AppSettings {
             max_retry_interval_seconds: 30,
             remote_endpoint_url: None,
             remote_management_key: None,
+            codex_app_path: String::new(),
+            codex_launch_mode: "app".to_string(),
+            codex_bound_account: String::new(),
         }
     }
 }
