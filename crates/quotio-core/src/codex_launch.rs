@@ -129,6 +129,14 @@ pub fn detect_codex_app_path() -> Option<PathBuf> {
     None
 }
 
+/// 带缓存的探测：整个进程只真正跑一次（Appx/扫盘较慢），供 agent 检测等高频调用，
+/// 避免每次刷新都跑一遍 powershell。需要强制重探时用 [`detect_codex_app_path`]。
+pub fn detect_codex_app_path_cached() -> Option<PathBuf> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE.get_or_init(detect_codex_app_path).clone()
+}
+
 // ---------- 账号列表 + 绑定注入 ----------
 
 /// 一个可绑定的 Codex 账号（来自 `~/.cli-proxy-api` 的 codex auth 文件）。

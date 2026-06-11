@@ -8,13 +8,23 @@ pub fn detect_agents() -> Vec<AgentStatus> {
 
 pub fn detect_agent(agent: CliAgentSummary) -> AgentStatus {
     let executable = quotio_platform::find_first_executable(&agent.binary_names, &[]);
-    let installed = executable.is_some();
-    let binary_path = executable
+    let mut installed = executable.is_some();
+    let mut binary_path = executable
         .as_ref()
         .map(|executable| executable.path.display().to_string());
     let version = executable
         .as_ref()
         .and_then(|executable| quotio_platform::read_version(&executable.path));
+
+    // Codex 特例：只装了桌面应用（没有 codex CLI）也算"已安装"——
+    // 配置写的是同一个 ~/.codex，一键启动拉起的就是桌面应用。
+    if agent.id == "codex" && !installed {
+        if let Some(app) = crate::codex_launch::detect_codex_app_path_cached() {
+            installed = true;
+            binary_path = Some(app.display().to_string());
+        }
+    }
+
     let configured = is_configured(&agent);
     let last_configured = if configured {
         latest_config_modified_at(&agent)

@@ -40,6 +40,8 @@ const modelSlots: ModelSlot[] = ["opus", "sonnet", "haiku"];
 
 // Codex（OpenAI GPT-5 系列）可选模型，对齐 quotio-master 的列表。
 const CODEX_MODELS = [
+  "gpt-5.5-codex",
+  "gpt-5.5",
   "gpt-5.3-codex",
   "gpt-5.2",
   "gpt-5.2-codex",
