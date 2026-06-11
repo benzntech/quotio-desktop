@@ -38,6 +38,29 @@ type AgentsScreenProps = {
 
 const modelSlots: ModelSlot[] = ["opus", "sonnet", "haiku"];
 
+// Codex（OpenAI GPT-5 系列）可选模型，对齐 quotio-master 的列表。
+const CODEX_MODELS = [
+  "gpt-5.3-codex",
+  "gpt-5.2",
+  "gpt-5.2-codex",
+  "gpt-5.1",
+  "gpt-5.1-codex",
+  "gpt-5.1-codex-max",
+  "gpt-5.1-codex-mini",
+  "gpt-5",
+  "gpt-5-codex",
+  "gpt-5-codex-mini",
+];
+
+// Codex 思考程度（model_reasoning_effort）。xhigh=极高，gpt-5.1-codex-max 等支持。
+const CODEX_REASONING: { value: string; fallback: string }[] = [
+  { value: "minimal", fallback: "最低" },
+  { value: "low", fallback: "低" },
+  { value: "medium", fallback: "中" },
+  { value: "high", fallback: "高" },
+  { value: "xhigh", fallback: "极高" },
+];
+
 const AGENT_ACCENTS: Record<string, string> = {
   claude: "D97757",
   codex: "10A37F",
@@ -181,6 +204,13 @@ export function AgentsScreen({
   function configForm(status: AgentStatus) {
     const configuration = agentConfigurations[status.agent.id];
     const backups = agentBackups[status.agent.id] ?? configuration?.backups ?? [];
+    // Codex 模型 = 固定的 GPT-5/Codex 列表 ∪ 代理发现的 codex/gpt-5 模型。
+    const codexModelList = [
+      ...new Set([
+        ...CODEX_MODELS,
+        ...modelOptions.filter((model) => /gpt-5|codex/i.test(model.id)).map((model) => model.id),
+      ]),
+    ];
 
     return (
       <div className="agent-config-panel">
@@ -236,31 +266,24 @@ export function AgentsScreen({
           <div className="settings-form-grid">
             <label>
               {t("agents.codexModel", "模型")}
-              {modelOptions.length > 0 ? (
-                <Select
-                  value={slotDrafts.sonnet ?? appState.settings.codex_model ?? ""}
-                  options={[{ value: "", label: t("agents.unspecified") }, ...modelOptions.map((model) => ({ value: model.id, label: model.name || model.id }))]}
-                  disabled={isBusy}
-                  onChange={(value) => setSlotDrafts((current) => ({ ...current, sonnet: value }))}
-                />
-              ) : (
-                <input
-                  value={slotDrafts.sonnet ?? appState.settings.codex_model ?? ""}
-                  onChange={(event) => setSlotDrafts((current) => ({ ...current, sonnet: event.target.value }))}
-                  placeholder="gpt-5.x"
-                />
-              )}
+              <Select
+                value={slotDrafts.sonnet ?? appState.settings.codex_model ?? ""}
+                options={[
+                  { value: "", label: t("agents.unspecified") },
+                  ...codexModelList.map((model) => ({ value: model, label: model })),
+                ]}
+                disabled={isBusy}
+                onChange={(value) => setSlotDrafts((current) => ({ ...current, sonnet: value }))}
+              />
             </label>
             <label>
               {t("agents.codexReasoning", "思考程度")}
               <Select
                 value={codexReasoning}
-                options={[
-                  { value: "minimal", label: t("agents.reasoningMinimal", "最低") },
-                  { value: "low", label: t("agents.reasoningLow", "低") },
-                  { value: "medium", label: t("agents.reasoningMedium", "中") },
-                  { value: "high", label: t("agents.reasoningHigh", "高") },
-                ]}
+                options={CODEX_REASONING.map((item) => ({
+                  value: item.value,
+                  label: t(`agents.reasoning.${item.value}`, item.fallback),
+                }))}
                 disabled={isBusy}
                 onChange={setCodexReasoning}
               />
