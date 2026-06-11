@@ -24,6 +24,7 @@ export function LogsScreen({ appState, isManagementBusy, onRefreshManagement, on
   const [tab, setTab] = useState<LogTab>("requests");
   const [query, setQuery] = useState("");
   const [provider, setProvider] = useState("all");
+  const [todayOnly, setTodayOnly] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(0);
   const PAGE_SIZE = 20;
@@ -53,13 +54,14 @@ export function LogsScreen({ appState, isManagementBusy, onRefreshManagement, on
   const filteredRequests = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return requests.filter((entry) => {
+      if (todayOnly && !isToday(entry.timestamp)) return false;
       const entryProvider = entry.provider ?? entry.resolved_provider ?? "";
       if (provider !== "all" && entryProvider !== provider) return false;
       if (!normalized) return true;
       const entryModel = entry.model ?? entry.resolved_model ?? "";
       return entryModel.toLowerCase().includes(normalized) || entryProvider.toLowerCase().includes(normalized);
     });
-  }, [requests, query, provider]);
+  }, [requests, query, provider, todayOnly]);
 
   const stats = useMemo(() => computeStats(filteredRequests), [filteredRequests]);
 
@@ -68,7 +70,7 @@ export function LogsScreen({ appState, isManagementBusy, onRefreshManagement, on
   const pagedRequests = filteredRequests.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
   useEffect(() => {
     setPage(0);
-  }, [query, provider, tab]);
+  }, [query, provider, tab, todayOnly]);
 
   const filteredProxy = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -133,6 +135,22 @@ export function LogsScreen({ appState, isManagementBusy, onRefreshManagement, on
               <strong>{stats.avgMs}ms</strong>
             </div>
             <div className="log-stats-spacer" />
+            <div className="view-toggle log-range-toggle">
+              <button
+                type="button"
+                className={todayOnly ? "view-toggle-btn view-toggle-btn--active" : "view-toggle-btn"}
+                onClick={() => setTodayOnly(true)}
+              >
+                {t("logs.today", "今天")}
+              </button>
+              <button
+                type="button"
+                className={!todayOnly ? "view-toggle-btn view-toggle-btn--active" : "view-toggle-btn"}
+                onClick={() => setTodayOnly(false)}
+              >
+                {t("logs.all", "全部")}
+              </button>
+            </div>
             <label className="log-provider">
               <span>{t("logs.provider")}</span>
               <Select
@@ -279,6 +297,19 @@ function formatLogTime(timestamp: string): string {
   if (!timestamp.includes("T")) return timestamp;
   const parsed = new Date(timestamp);
   return Number.isNaN(parsed.getTime()) ? timestamp : parsed.toLocaleTimeString();
+}
+
+// Whether a request's timestamp falls on the local calendar day. Unparseable
+// timestamps (e.g. dev-mock time-only strings) are kept rather than hidden.
+function isToday(timestamp: string): boolean {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return true;
+  const now = new Date();
+  return (
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate()
+  );
 }
 
 function isErrorLog(line: string) {
