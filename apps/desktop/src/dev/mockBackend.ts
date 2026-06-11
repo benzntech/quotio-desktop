@@ -594,6 +594,8 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       return "已停止 Codex 并还原配置（mock）" as unknown as T;
     case "codex_launch_active":
       return false as unknown as T;
+    case "fetch_codex_models":
+      return ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark", "codex-auto-review"] as unknown as T;
     case "save_settings": {
       const settings = args?.settings as AppState["settings"] | undefined;
       if (settings) {

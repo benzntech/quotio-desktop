@@ -151,6 +151,21 @@ fn codex_launch_active(state: State<'_, DesktopState>) -> Result<bool, String> {
     Ok(core.codex_active())
 }
 
+/// 拉取代理实际服务的 codex 模型（前端模型下拉用）。best-effort：拿不到返回空，前端回退内置列表。
+#[tauri::command]
+fn fetch_codex_models(state: State<'_, DesktopState>) -> Result<Vec<String>, String> {
+    let (endpoint, api_key) = {
+        let core = state
+            .core
+            .lock()
+            .map_err(|_| "无法读取 Codex 模型".to_string())?;
+        core.codex_model_fetch_params()
+    };
+    Ok(quotio_core::codex_launch::fetch_proxy_codex_models(
+        &endpoint, &api_key,
+    ))
+}
+
 #[tauri::command]
 fn list_agent_backups(
     agent_id: String,
@@ -1341,6 +1356,7 @@ pub fn run() {
             codex_start,
             codex_stop,
             codex_launch_active,
+            fetch_codex_models,
             discover_available_models,
             refresh_fallback_route_state,
             credential_status,

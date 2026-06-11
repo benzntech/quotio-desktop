@@ -38,20 +38,13 @@ type AgentsScreenProps = {
 
 const modelSlots: ModelSlot[] = ["opus", "sonnet", "haiku"];
 
-// Codex（OpenAI GPT-5 系列）可选模型，对齐 quotio-master 的列表。
+// Codex 模型的**回退**列表（仅当拉不到代理实时模型时用）；实际优先用 fetch_codex_models 从代理拉。
 const CODEX_MODELS = [
-  "gpt-5.5-codex",
   "gpt-5.5",
-  "gpt-5.3-codex",
-  "gpt-5.2",
-  "gpt-5.2-codex",
-  "gpt-5.1",
-  "gpt-5.1-codex",
-  "gpt-5.1-codex-max",
-  "gpt-5.1-codex-mini",
-  "gpt-5",
-  "gpt-5-codex",
-  "gpt-5-codex-mini",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.3-codex-spark",
+  "codex-auto-review",
 ];
 
 // Codex 思考程度（model_reasoning_effort）。xhigh=极高，gpt-5.1-codex-max 等支持。
@@ -120,12 +113,15 @@ export function AgentsScreen({
   const [codexReasoning, setCodexReasoning] = useState<string>(appState.settings.codex_reasoning || "high");
   const [codexAccounts, setCodexAccounts] = useState<CodexAccountRef[]>([]);
   const [codexActive, setCodexActive] = useState(false);
+  const [proxyModels, setProxyModels] = useState<string[]>([]);
   const [launchBusy, setLaunchBusy] = useState(false);
   const [launchMsg, setLaunchMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
     invoke<CodexAccountRef[]>("list_codex_launch_accounts").then(setCodexAccounts).catch(() => {});
     invoke<boolean>("codex_launch_active").then(setCodexActive).catch(() => {});
+    // 从运行中的代理拉真实的 codex 模型（拉不到就用内置回退列表）。
+    invoke<string[]>("fetch_codex_models").then(setProxyModels).catch(() => {});
   }, []);
 
   // 把 Codex 启动档案（账号/模式/模型/思考程度/密钥）存进设置，供卡片「启动」按钮使用。
@@ -206,13 +202,18 @@ export function AgentsScreen({
   function configForm(status: AgentStatus) {
     const configuration = agentConfigurations[status.agent.id];
     const backups = agentBackups[status.agent.id] ?? configuration?.backups ?? [];
-    // Codex 模型 = 固定的 GPT-5/Codex 列表 ∪ 代理发现的 codex/gpt-5 模型。
-    const codexModelList = [
-      ...new Set([
-        ...CODEX_MODELS,
-        ...modelOptions.filter((model) => /gpt-5|codex/i.test(model.id)).map((model) => model.id),
-      ]),
-    ];
+    // Codex 模型：优先用从代理实时拉到的（fetch_codex_models）；拉不到才回退到内置列表 ∪ 发现的模型。
+    const codexModelList =
+      proxyModels.length > 0
+        ? proxyModels
+        : [
+            ...new Set([
+              ...CODEX_MODELS,
+              ...modelOptions
+                .filter((model) => /gpt-5|codex/i.test(model.id))
+                .map((model) => model.id),
+            ]),
+          ];
 
     return (
       <div className="agent-config-panel">

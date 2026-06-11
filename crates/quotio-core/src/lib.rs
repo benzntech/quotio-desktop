@@ -569,6 +569,19 @@ impl AppCore {
         self.codex_session.is_some()
     }
 
+    /// 拉取代理真实模型所需的参数（推理端点 + 一个 api-key）。
+    /// 单独取出来，让命令层在拿到后释放锁再发 HTTP，避免阻塞期间一直持锁。
+    pub fn codex_model_fetch_params(&self) -> (String, String) {
+        let endpoint = self.proxy.state.endpoint.clone();
+        let api_key = self
+            .management_snapshot
+            .api_keys
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        (endpoint, api_key)
+    }
+
     pub fn list_agent_backups(
         &self,
         agent_id: &str,

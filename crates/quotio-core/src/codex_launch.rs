@@ -152,6 +152,49 @@ pub fn detect_codex_app_path_cached() -> Option<PathBuf> {
     CACHE.get_or_init(detect_codex_app_path).clone()
 }
 
+// ---------- 从代理拉取真实模型 ----------
+
+/// 从运行中的代理拉它实际服务的 codex/gpt-5 模型（OpenAI 兼容 `GET /v1/models`）。
+/// best-effort：拿不到（代理没跑 / 无 key / 网络错）就返回空，前端回退到内置列表。
+pub fn fetch_proxy_codex_models(endpoint: &str, api_key: &str) -> Vec<String> {
+    let base = endpoint.trim_end_matches('/').trim_end_matches("/v1");
+    if base.is_empty() || api_key.is_empty() {
+        return Vec::new();
+    }
+    let url = format!("{base}/v1/models");
+    let agent = ureq::builder()
+        .timeout_connect(std::time::Duration::from_secs(4))
+        .timeout_read(std::time::Duration::from_secs(6))
+        .build();
+    let response = match agent
+        .get(&url)
+        .set("Authorization", &format!("Bearer {api_key}"))
+        .set("Accept", "application/json")
+        .call()
+    {
+        Ok(response) => response,
+        Err(_) => return Vec::new(),
+    };
+    let json: Value = match response.into_json() {
+        Ok(json) => json,
+        Err(_) => return Vec::new(),
+    };
+    json.get("data")
+        .and_then(|data| data.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
+                .filter(|id| {
+                    let lower = id.to_lowercase();
+                    (lower.contains("gpt-5") || lower.contains("codex")) && !lower.contains("image")
+                })
+                .map(|id| id.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ---------- 账号列表 + 绑定注入 ----------
 
 /// 一个可绑定的 Codex 账号（来自 `~/.cli-proxy-api` 的 codex auth 文件）。
