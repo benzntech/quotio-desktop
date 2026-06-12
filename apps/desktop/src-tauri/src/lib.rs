@@ -1270,6 +1270,36 @@ fn spawn_usage_collector(app: AppHandle) {
                     }
                 }
             }
+
+            // Codex 一键启动监控（每 ~3s）：用户自己退出 Codex（没点「停止」）时，
+            // 自动还原 auth.json/config.toml 并通知前端刷新状态。
+            // 进程探测（tasklist）在锁外执行，两次取锁都是纯内存操作，不阻塞 UI 命令；
+            // 无会话时 probe 直接返回 None，零开销。
+            if tick % 2 == 0 {
+                let probe = app.try_state::<DesktopState>().and_then(|state| {
+                    state
+                        .core
+                        .lock()
+                        .ok()
+                        .and_then(|core| core.codex_monitor_probe())
+                });
+                if let Some((generation, probe)) = probe {
+                    let alive = probe.run();
+                    let restored = app
+                        .try_state::<DesktopState>()
+                        .and_then(|state| {
+                            state
+                                .core
+                                .lock()
+                                .ok()
+                                .map(|mut core| core.codex_monitor_apply(generation, alive))
+                        })
+                        .unwrap_or(false);
+                    if restored {
+                        let _ = app.emit("codex-launch-changed", false);
+                    }
+                }
+            }
             tick = tick.wrapping_add(1);
             std::thread::sleep(std::time::Duration::from_millis(USAGE_COLLECTOR_POLL_MS));
         }

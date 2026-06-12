@@ -96,6 +96,30 @@ pub struct AppCore {
     credential_error: Option<String>,
     /// 当前 Codex 一键启动会话（启动时建立，停止/关软件时还原成启动前的样子）。
     codex_session: Option<codex_launch::CodexSession>,
+    /// 会话代数：每次启动 +1。监控的进程探测在锁外执行，
+    /// 写回结果时校验代数，期间停止/重启过就丢弃这次探测。
+    codex_session_generation: u64,
+}
+
+/// Codex 监控的进程探测目标。由 [`AppCore::codex_monitor_probe`] 在锁内产出，
+/// [`CodexMonitorProbe::run`] 在锁外执行（会 spawn tasklist，几十毫秒），
+/// 结果再经 [`AppCore::codex_monitor_apply`] 写回。
+#[derive(Debug, Clone, Copy)]
+pub enum CodexMonitorProbe {
+    /// 按进程名查 Codex 桌面应用（App 模式）。
+    AppByName,
+    /// 按 pid 查启动的终端进程（CLI 模式）。
+    CliByPid(u32),
+}
+
+impl CodexMonitorProbe {
+    /// 执行实际的进程探测。调用方应在不持有 core 锁时调用。
+    pub fn run(&self) -> bool {
+        match self {
+            CodexMonitorProbe::AppByName => codex_launch::codex_app_process_running(),
+            CodexMonitorProbe::CliByPid(pid) => codex_launch::process_alive(*pid),
+        }
+    }
 }
 
 impl Default for AppCore {
@@ -125,6 +149,7 @@ impl Default for AppCore {
             usage_store: open_usage_store(),
             credential_error,
             codex_session: None,
+            codex_session_generation: 0,
         }
     }
 }
@@ -585,10 +610,8 @@ impl AppCore {
                 })?;
             codex_launch::launch_codex_app(&exe).map_err(ManagementCoreError::Unavailable)?
         };
-        self.codex_session = Some(codex_launch::CodexSession {
-            pid,
-            launch_mode: mode.to_string(),
-        });
+        self.codex_session = Some(codex_launch::CodexSession::new(pid, mode));
+        self.codex_session_generation = self.codex_session_generation.wrapping_add(1);
         Ok(if mode == "cli" {
             "已在终端启动 Codex CLI（停止会还原配置）".to_string()
         } else {
@@ -621,6 +644,52 @@ impl AppCore {
     /// 当前是否有 Codex 一键启动会话在运行。
     pub fn codex_active(&self) -> bool {
         self.codex_session.is_some() || codex_launch::launch_backup_exists()
+    }
+
+    /// 监控第一步（持锁，纯内存）：有可监控的会话时返回（会话代数, 探测目标）。
+    /// 实际的进程探测（tasklist，几十毫秒）由调用方在锁外执行（[`CodexMonitorProbe::run`]），
+    /// 避免拿着 core 锁阻塞 UI 命令。
+    pub fn codex_monitor_probe(&self) -> Option<(u64, CodexMonitorProbe)> {
+        let session = self.codex_session.as_ref()?;
+        let probe = match (session.launch_mode.as_str(), session.pid) {
+            // CLI 模式监控终端进程；没拿到终端 pid（cmd start 兜底路径）就无从监控。
+            ("cli", Some(pid)) => CodexMonitorProbe::CliByPid(pid),
+            ("cli", None) => return None,
+            // App 模式按进程名查：启动前已 close_codex_app，跑着的 Codex.exe 都属于本会话。
+            _ => CodexMonitorProbe::AppByName,
+        };
+        Some((self.codex_session_generation, probe))
+    }
+
+    /// 监控第二步（持锁，纯内存）：写回锁外的探测结果。用户自己退出 Codex
+    /// （没点「停止」）时，自动还原 auth.json/config.toml 并清理会话。
+    /// 返回 true 表示发生了自动还原。代数不匹配（探测期间停止/重启过）则丢弃。
+    pub fn codex_monitor_apply(&mut self, generation: u64, alive: bool) -> bool {
+        if generation != self.codex_session_generation {
+            return false;
+        }
+        let Some(session) = self.codex_session.as_mut() else {
+            return false;
+        };
+        if alive {
+            session.seen_running = true;
+            session.miss_count = 0;
+            return false;
+        }
+        if session.seen_running {
+            // 去抖：连续两次查不到才认定退出，tasklist 偶发失败不触发还原。
+            session.miss_count = session.miss_count.saturating_add(1);
+            if session.miss_count < 2 {
+                return false;
+            }
+        } else if session.started_at.elapsed() < Duration::from_secs(60) {
+            // 启动宽限期：商店版 shell 激活可能要几秒进程才出现。
+            // 60 秒还没见到进程就当启动失败，同样还原配置。
+            return false;
+        }
+        self.codex_session = None;
+        let _ = codex_launch::restore_codex_state_from_launch_backup();
+        true
     }
 
     /// 拉取代理真实模型所需的参数（推理端点 + 一个 api-key）。
@@ -2589,6 +2658,59 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn codex_monitor_apply_ignores_stale_generation_and_debounces() {
+        let mut core = AppCore::default();
+        core.codex_session = Some(codex_launch::CodexSession::new(Some(4242), "app"));
+        core.codex_session_generation = 7;
+
+        // 代数不匹配：探测期间发生过停止/重启，丢弃这次结果。
+        assert!(!core.codex_monitor_apply(6, false));
+        assert!(core.codex_session.is_some());
+
+        // 活着：标记 seen_running 并清零去抖计数。
+        assert!(!core.codex_monitor_apply(7, true));
+        assert!(core.codex_session.as_ref().unwrap().seen_running);
+
+        // 第一次查不到：去抖，不还原、不清会话。
+        assert!(!core.codex_monitor_apply(7, false));
+        assert!(core.codex_session.is_some());
+        assert_eq!(core.codex_session.as_ref().unwrap().miss_count, 1);
+    }
+
+    #[test]
+    fn codex_monitor_apply_waits_out_startup_grace_period() {
+        let mut core = AppCore::default();
+        core.codex_session = Some(codex_launch::CodexSession::new(None, "app"));
+        core.codex_session_generation = 1;
+
+        // 刚启动、还没观测到过进程：宽限期内查不到不算退出。
+        assert!(!core.codex_monitor_apply(1, false));
+        assert!(core.codex_session.is_some());
+    }
+
+    #[test]
+    fn codex_monitor_probe_targets_match_launch_mode() {
+        let mut core = AppCore::default();
+        assert!(core.codex_monitor_probe().is_none());
+
+        core.codex_session = Some(codex_launch::CodexSession::new(None, "app"));
+        assert!(matches!(
+            core.codex_monitor_probe(),
+            Some((_, CodexMonitorProbe::AppByName))
+        ));
+
+        core.codex_session = Some(codex_launch::CodexSession::new(Some(99), "cli"));
+        assert!(matches!(
+            core.codex_monitor_probe(),
+            Some((_, CodexMonitorProbe::CliByPid(99)))
+        ));
+
+        // CLI 模式没拿到终端 pid：无从监控。
+        core.codex_session = Some(codex_launch::CodexSession::new(None, "cli"));
+        assert!(core.codex_monitor_probe().is_none());
+    }
 
     #[test]
     fn own_proxy_listener_is_recognized_and_foreign_is_not() {

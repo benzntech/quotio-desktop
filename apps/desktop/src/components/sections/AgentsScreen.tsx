@@ -123,6 +123,27 @@ export function AgentsScreen({
     invoke<boolean>("codex_launch_active").then(setCodexActive).catch(() => {});
     // 从运行中的代理拉真实的 codex 模型（拉不到就用内置回退列表）。
     invoke<string[]>("fetch_codex_models").then(setProxyModels).catch(() => {});
+    // 后台监控发现用户自己退出了 Codex（没点「停止」）：状态回落，配置已自动还原。
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen("codex-launch-changed", () => {
+          setCodexActive(false);
+          setLaunchMsg({
+            ok: true,
+            text: t("agents.launch.autoRestored", "检测到 Codex 已退出，已自动还原配置"),
+          });
+        }),
+      )
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      if (unlisten) unlisten();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 把 Codex 启动档案（账号/模式/模型/思考程度/密钥）存进设置，供卡片「启动」按钮使用。

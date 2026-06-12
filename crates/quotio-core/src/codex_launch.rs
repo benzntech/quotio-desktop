@@ -436,6 +436,75 @@ struct CodexLaunchBackup {
 pub struct CodexSession {
     pub pid: Option<u32>,
     pub launch_mode: String,
+    /// 监控：是否已观测到 Codex 进程在跑（启动初期进程可能还没出现，避免误判退出）。
+    pub seen_running: bool,
+    /// 监控：连续未观测到进程的次数（去抖：tasklist 偶发失败不算退出）。
+    pub miss_count: u8,
+    /// 会话创建时间（启动宽限期判断用）。
+    pub started_at: std::time::Instant,
+}
+
+impl CodexSession {
+    pub fn new(pid: Option<u32>, launch_mode: &str) -> Self {
+        Self {
+            pid,
+            launch_mode: launch_mode.to_string(),
+            seen_running: false,
+            miss_count: 0,
+            started_at: std::time::Instant::now(),
+        }
+    }
+}
+
+/// Codex 桌面应用进程是否在运行（按进程名，best-effort；查不到命令时按「在跑」算，避免误还原）。
+pub fn codex_app_process_running() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(output) = quiet_command("tasklist")
+            .args(["/FI", "IMAGENAME eq Codex.exe", "/NH"])
+            .output()
+        else {
+            return true;
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .to_lowercase()
+            .contains("codex.exe")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("pgrep")
+            .args(["-f", "Codex.app"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(true)
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        true
+    }
+}
+
+/// 指定 pid 的进程是否存活（best-effort；查不到命令时按存活算，避免误还原）。
+pub fn process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(output) = quiet_command("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return true;
+        };
+        // 命中时输出 CSV 行（含引号包着的 pid 列）；无命中时是一行 INFO 提示。
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(true)
+    }
 }
 
 /// 读当前 auth.json + config.toml 内容（None = 文件不存在），用于启动前备份。
