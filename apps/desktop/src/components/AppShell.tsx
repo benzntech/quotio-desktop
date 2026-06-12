@@ -327,6 +327,7 @@ function renderSection(section: AppSection, props: AppShellProps) {
           onRefreshManagement={() => props.onRunManagementStateAction("refresh_management_state")}
           onRefreshQuotas={props.onRefreshQuotas}
           onRunManagementStateAction={props.onRunManagementStateAction}
+          onSaveSettings={props.onSaveSettings}
         />
       );
     case "agents":

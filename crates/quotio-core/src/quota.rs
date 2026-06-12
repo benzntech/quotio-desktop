@@ -268,7 +268,20 @@ fn model_usage(name: &str, remaining_percent: f64, reset_at: Option<String>) -> 
         used_percent: (100.0 - remaining).clamp(0.0, 100.0),
         remaining_percent: remaining,
         reset_at,
+        reset_at_unix: None,
     }
+}
+
+/// 同 [`model_usage`]，但从原始 unix 秒生成展示字符串，并保留原始值
+/// （`reset_at_unix` 给智能调度规则用）。
+fn model_usage_unix(name: &str, remaining_percent: f64, reset_at_unix: Option<i64>) -> QuotaModelUsage {
+    let mut usage = model_usage(
+        name,
+        remaining_percent,
+        reset_at_unix.and_then(format_reset_unix),
+    );
+    usage.reset_at_unix = reset_at_unix.filter(|unix| *unix > 0);
+    usage
 }
 
 /// Fetch a provider's accounts concurrently (bounded), so one slow or
@@ -497,15 +510,15 @@ fn fetch_codex_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<A
         is_forbidden: session_used >= 100,
         status_message: codex_plan_status(&auth, usage.plan_type.as_deref()),
         models: vec![
-            model_usage(
+            model_usage_unix(
                 "Session",
                 (100 - session_used.clamp(0, 100)) as f64,
-                session_reset.and_then(format_reset_unix),
+                session_reset,
             ),
-            model_usage(
+            model_usage_unix(
                 "Weekly",
                 (100 - weekly_used.clamp(0, 100)) as f64,
-                weekly_reset.and_then(format_reset_unix),
+                weekly_reset,
             ),
         ],
     })
@@ -949,8 +962,12 @@ fn fetch_claude_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<
 
 fn claude_window_model(name: &str, window: ClaudeWindow) -> QuotaModelUsage {
     let util = window.utilization.unwrap_or(0.0);
-    let reset = window.resets_at.as_deref().and_then(format_reset_iso);
-    model_usage(name, 100.0 - util, reset)
+    let reset_unix = window
+        .resets_at
+        .as_deref()
+        .and_then(|iso| DateTime::parse_from_rfc3339(iso.trim()).ok())
+        .map(|dt| dt.timestamp());
+    model_usage_unix(name, 100.0 - util, reset_unix)
 }
 
 fn fetch_claude_usage(

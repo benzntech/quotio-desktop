@@ -47,6 +47,17 @@ export type AppSettings = {
   codex_model: string;
   codex_reasoning: string;
   codex_api_key: string;
+  scheduler_rule: string;
+  scheduler_min_hold_minutes: number;
+  scheduler_switch_margin_minutes: number;
+};
+
+// Mirrors crates/quotio-types `SchedulerStatus`(智能账号调度状态).
+export type SchedulerStatus = {
+  rule: string;
+  target_label: string | null;
+  target_reset_at_unix: number | null;
+  standby_count: number;
 };
 
 export type CodexAccountRef = {
@@ -137,6 +148,7 @@ export type AuthFile = {
   updated_at?: string | null;
   last_refresh?: string | null;
   quotio_bound_login_only?: boolean | null;
+  quotio_scheduler_standby?: boolean | null;
   active_in_ide?: boolean | null;
   success?: number | null;
   failed?: number | null;
@@ -374,6 +386,7 @@ export type QuotaModelUsage = {
   used_percent: number;
   remaining_percent: number;
   reset_at: string | null;
+  reset_at_unix?: number | null;
   count?: number | null;
 };
 
@@ -550,6 +563,7 @@ export type AppState = {
   credentials: CredentialStatus;
   platform_features: PlatformFeatureState;
   config_root: string;
+  scheduler?: SchedulerStatus;
 };
 
 export type ProxyCommand = "start_proxy" | "stop_proxy" | "restart_proxy" | "check_proxy_health" | "download_proxy_binary";

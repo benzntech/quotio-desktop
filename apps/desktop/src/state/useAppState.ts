@@ -103,6 +103,20 @@ export function useAppState() {
     };
   }, []);
 
+  // 智能调度切换了账号池状态(选号/待命/还原) → 重拉状态刷新界面。
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    void listen("scheduler-changed", () => {
+      void refreshState();
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   // Background poll: refresh the management snapshot every 15s while the local
   // proxy runs, so BOTH the Logs "Requests" tab AND each account's health (✓/✗
   // counts + dots) stay current without a manual refresh. refresh_management_state
@@ -219,6 +233,30 @@ export function useAppState() {
       setAppState(state);
     } catch {
       return; // management/proxy unreachable — can't gate safely
+    }
+    // 智能调度开启时由调度器接管池子(排序天然排除打满账号),
+    // 原闸门停用,避免两套逻辑互相翻转 disabled。
+    // 交接:把闸门自己禁用过的账号重新启用并清账——否则它们没有调度器的
+    // standby 标记,会被当成「用户手动禁用」而永远卡在禁用态。
+    if (state.settings.scheduler_rule && state.settings.scheduler_rule !== "off") {
+      const auto = loadAutoDisabled();
+      const names = Object.keys(auto);
+      if (names.length > 0) {
+        const authFiles = state.management.auth_files ?? [];
+        for (const name of names) {
+          const file = authFiles.find((entry) => entry.name === name);
+          if (file?.disabled) {
+            try {
+              await invoke("set_management_auth_file_disabled", { name, disabled: false });
+            } catch {
+              continue; // 代理不可达——留在账上,下轮交接重试
+            }
+          }
+          delete auto[name];
+        }
+        saveAutoDisabled(auto);
+      }
+      return;
     }
     const authFiles = state.management.auth_files ?? [];
     if (authFiles.length === 0) return; // need the proxy's auth-files to act

@@ -2301,6 +2301,44 @@ h3 {
 }
 
 /* ===== Quota page ===== */
+/* 智能调度卡片（额度页顶部）：开关 + 当前选号状态。 */
+.scheduler-block {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1.5px solid rgba(99, 102, 241, 0.45);
+  border-radius: var(--quotio-radius-lg);
+  background: rgba(99, 102, 241, 0.05);
+}
+
+.scheduler-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scheduler-head strong {
+  font-size: 13.5px;
+}
+
+.scheduler-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: rgba(99, 102, 241, 0.14);
+  color: #4f46e5;
+}
+
+.scheduler-switch {
+  margin-left: auto;
+}
+
+.scheduler-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--quotio-muted);
+}
+
 .quota-tabs {
   display: flex;
   gap: 8px;

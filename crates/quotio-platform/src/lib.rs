@@ -409,7 +409,30 @@ pub fn backup_file(path: &Path, namespace: &str) -> io::Result<Option<PathBuf>> 
         current_unix_millis()
     ));
     fs::copy(path, &backup_path)?;
+    // 每个源文件只保留最新一份备份：每次写配置/每次「恢复」都会新增一份，
+    // 不清理会无限堆积，这里写完新备份就把同文件的旧备份删掉。
+    prune_old_backups(&backup_dir, file_name, &backup_path);
     Ok(Some(backup_path))
+}
+
+/// 删除 `dir` 里同一源文件的其它 `.bak`（保留 `keep`）。best-effort，删不掉不报错。
+fn prune_old_backups(dir: &Path, source_file_name: &str, keep: &Path) {
+    let prefix = format!("{}.", sanitize_filename(source_file_name));
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && name.ends_with(".bak") {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 pub fn list_backups(namespace: &str) -> io::Result<Vec<BackupFile>> {
@@ -752,4 +775,72 @@ fn credential_entry(account: &str) -> Result<Entry, String> {
 
 fn keyring_error(error: KeyringError) -> String {
     format!("{}", error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_keeps_only_latest_backup_for_same_source_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_backup_prune_{}_{}",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str| fs::write(dir.join(name), b"x").unwrap();
+        write("config.toml.100.bak");
+        write("config.toml.200.bak");
+        write("config.toml.300.bak");
+        // 其它源文件的备份不受影响。
+        write("settings.json.100.bak");
+
+        let keep = dir.join("config.toml.300.bak");
+        prune_old_backups(&dir, "config.toml", &keep);
+
+        assert!(keep.exists());
+        assert!(!dir.join("config.toml.100.bak").exists());
+        assert!(!dir.join("config.toml.200.bak").exists());
+        assert!(dir.join("settings.json.100.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_then_restore_leaves_a_single_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "ql_backup_single_{}_{}",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        let dir = root.join("backups");
+        fs::create_dir_all(&dir).unwrap();
+        let source = root.join("config.toml");
+
+        // 模拟多次「写配置前备份」：每轮结束后同源文件只剩一份。
+        for round in 0..3 {
+            fs::write(&source, format!("content-{round}")).unwrap();
+            let file_name = "config.toml";
+            let backup_path = dir.join(format!(
+                "{}.{}.bak",
+                sanitize_filename(file_name),
+                current_unix_millis() + round // 避免同毫秒同名
+            ));
+            fs::copy(&source, &backup_path).unwrap();
+            prune_old_backups(&dir, file_name, &backup_path);
+
+            let count = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("config.toml.")
+                })
+                .count();
+            assert_eq!(count, 1, "round {round} should keep exactly one backup");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 }

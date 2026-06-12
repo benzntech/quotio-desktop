@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
-import type { AccountQuota, AppState, AuthFile, ProviderSummary, QuotaModelUsage } from "../../types";
+import type { AccountQuota, AppSettings, AppState, AuthFile, ProviderSummary, QuotaModelUsage } from "../../types";
 import { maskEmail, quotaTone, parsePlan, planTier, matchAuthFile } from "../../lib/format";
 import { RefreshIcon } from "../icons";
 import { HealthDots } from "../HealthDots";
+import { Switch } from "../Switch";
 import { useT } from "../../i18n";
 
 type QuotaScreenProps = {
@@ -13,6 +14,7 @@ type QuotaScreenProps = {
   onRefreshManagement: () => void;
   onRefreshQuotas: () => void;
   onRunManagementStateAction: (command: string, args?: Record<string, unknown>) => void;
+  onSaveSettings: (settings: AppSettings) => void;
 };
 
 type QuotaGroup = {
@@ -22,7 +24,7 @@ type QuotaGroup = {
   accounts: AccountQuota[];
 };
 
-export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas }: QuotaScreenProps) {
+export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSettings }: QuotaScreenProps) {
   const t = useT();
   const groups = useMemo(() => buildGroups(appState.quotas, appState.providers), [appState.quotas, appState.providers]);
   const authFiles = appState.auth_files ?? [];
@@ -53,6 +55,8 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas }: QuotaScr
           <RefreshIcon />
         </button>
       </header>
+
+      <SchedulerCard appState={appState} onSaveSettings={onSaveSettings} />
 
       {proxyUnreachable ? (
         <div className="state-banner state-banner--warn">
@@ -100,6 +104,71 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas }: QuotaScr
   );
 }
 
+/// 智能调度卡片:开关 + 当前选号状态。规则「临近刷新优先」——只让 5h 窗口
+/// 最快刷新的 Codex 账号进代理池,其余临时待命,窗口到点自动换号。
+function SchedulerCard({
+  appState,
+  onSaveSettings,
+}: {
+  appState: AppState;
+  onSaveSettings: (settings: AppSettings) => void;
+}) {
+  const t = useT();
+  const scheduler = appState.scheduler;
+  const schedulerOn = (appState.settings.scheduler_rule || "off") !== "off";
+
+  function toggleScheduler() {
+    onSaveSettings({
+      ...appState.settings,
+      scheduler_rule: schedulerOn ? "off" : "reset_soonest",
+      remote_management_key: null,
+    });
+  }
+
+  // 5h 窗口刷新倒计时(给人看的粗粒度文本)。
+  let resetText: string | null = null;
+  if (scheduler?.target_reset_at_unix) {
+    const secs = scheduler.target_reset_at_unix - Math.floor(Date.now() / 1000);
+    if (secs > 0) {
+      const hours = Math.floor(secs / 3600);
+      const minutes = Math.max(1, Math.floor((secs % 3600) / 60));
+      resetText = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+    }
+  }
+
+  let statusText: string;
+  if (!schedulerOn) {
+    statusText = t(
+      "quota.scheduler.descOff",
+      "开启后只让「5h 窗口最快刷新」的 Codex 账号进代理池,其余临时待命;窗口到点自动换号,余量不浪费。",
+    );
+  } else if (scheduler?.target_label) {
+    const windowText = resetText
+      ? t("quota.scheduler.resetIn", "5h 窗口 {time} 后刷新").replace("{time}", resetText)
+      : t("quota.scheduler.idleWindow", "闲置窗口(使用后开新 5h 窗口)");
+    const standby = t("quota.scheduler.standby", "待命 {count} 个").replace(
+      "{count}",
+      String(scheduler.standby_count),
+    );
+    statusText = `${t("quota.scheduler.current", "当前选中")}:${scheduler.target_label} · ${windowText} · ${standby}`;
+  } else {
+    statusText = t("quota.scheduler.pending", "已开启,等待下一次额度刷新后选号(可点右上角立即刷新)。");
+  }
+
+  return (
+    <div className="scheduler-block">
+      <div className="scheduler-head">
+        <strong>{t("quota.scheduler.title", "智能调度")}</strong>
+        <span className="scheduler-tag">{t("quota.scheduler.rule", "临近刷新优先 · 仅 Codex")}</span>
+        <div className="scheduler-switch">
+          <Switch on={schedulerOn} onChange={toggleScheduler} label="scheduler" />
+        </div>
+      </div>
+      <p className="scheduler-desc">{statusText}</p>
+    </div>
+  );
+}
+
 function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authFiles: AuthFile[] }) {
   const t = useT();
   // The Codex fetcher encodes the subscription tier + expiry into status_message
@@ -118,6 +187,7 @@ function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authF
       : "quota-type-pill quota-plan-pill";
   const file = matchAuthFile(account, authFiles);
   const isCodexLoginOnly = file?.quotio_bound_login_only === true;
+  const isSchedulerStandby = file?.quotio_scheduler_standby === true && file?.disabled === true;
   const recent = file?.recent_requests ?? [];
   return (
     <article className="panel quota-card">
@@ -150,6 +220,14 @@ function AccountQuotaCard({ account, authFiles }: { account: AccountQuota; authF
               title={t("quota.codexLoginOnly.desc", "该账号仅用于启动 Codex，不参与 Quotio 代理池调用。")}
             >
               {t("quota.codexLoginOnly", "Codex 登录专用")}
+            </span>
+          ) : null}
+          {isSchedulerStandby ? (
+            <span
+              className="quota-pill quota-pill--blue"
+              title={t("quota.schedulerStandby.desc", "被智能调度临时移出代理池;轮到它或关闭调度时自动恢复。")}
+            >
+              {t("quota.schedulerStandby", "调度待命")}
             </span>
           ) : null}
         </div>

@@ -287,6 +287,9 @@ export const mockAppState: AppState = {
     codex_model: "",
     codex_reasoning: "high",
     codex_api_key: "",
+    scheduler_rule: "off",
+    scheduler_min_hold_minutes: 10,
+    scheduler_switch_margin_minutes: 15,
   },
   proxy: {
     status: "running",

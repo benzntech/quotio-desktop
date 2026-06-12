@@ -6,6 +6,7 @@ pub mod codex_session_visibility;
 pub mod management;
 pub mod proxy_download;
 pub mod quota;
+pub mod scheduler;
 pub mod tunnel;
 pub mod usage_store;
 
@@ -99,6 +100,12 @@ pub struct AppCore {
     /// 会话代数：每次启动 +1。监控的进程探测在锁外执行，
     /// 写回结果时校验代数，期间停止/重启过就丢弃这次探测。
     codex_session_generation: u64,
+    /// 智能调度当前选中的账号（auth 文件名, 选中时刻——最小保持时间从这里算）。
+    scheduler_current: Option<(String, Instant)>,
+    /// 当前选中账号的展示名 / 5h 窗口刷新时间 / 待命数（给状态快照与提前触发用）。
+    scheduler_target_label: Option<String>,
+    scheduler_current_reset_at: Option<i64>,
+    scheduler_standby_count: u32,
 }
 
 /// Codex 监控的进程探测目标。由 [`AppCore::codex_monitor_probe`] 在锁内产出，
@@ -150,6 +157,10 @@ impl Default for AppCore {
             credential_error,
             codex_session: None,
             codex_session_generation: 0,
+            scheduler_current: None,
+            scheduler_target_label: None,
+            scheduler_current_reset_at: None,
+            scheduler_standby_count: 0,
         }
     }
 }
@@ -244,6 +255,8 @@ impl AppCore {
             codex_launch::close_codex_app();
             let _ = codex_launch::restore_codex_state_from_launch_backup();
         }
+        // 退出时恢复被调度临时禁用的账号，别让池子带着 standby 状态过夜。
+        let _ = scheduler::release_all_in(&quotio_platform::proxy_auth_dir());
         self.proxy.shutdown(&self.settings);
     }
 
@@ -407,8 +420,85 @@ impl AppCore {
     /// Store quotas fetched off-thread, so the Tauri command can run the
     /// (blocking) network fetch without holding the lock or blocking the UI.
     pub fn set_quotas(&mut self, quotas: Vec<AccountQuota>) -> AppState {
-        self.quotas = quotas;
+        self.store_quotas(quotas);
         self.app_state()
+    }
+
+    /// 只存配额不生成快照（调用方随后自己跑 [`Self::scheduler_reconcile`] + `app_state`）。
+    pub fn store_quotas(&mut self, quotas: Vec<AccountQuota>) {
+        self.quotas = quotas;
+    }
+
+    /// 智能调度评估 + 守门执行。每次配额刷新后调用；规则关闭时负责把
+    /// standby 账号放回池子（fail-open 同理）。返回是否改动了池子状态。
+    pub fn scheduler_reconcile(&mut self) -> bool {
+        let dir = quotio_platform::proxy_auth_dir();
+        if self.settings.scheduler_rule != "reset_soonest" {
+            let changed = scheduler::release_all_in(&dir);
+            self.scheduler_clear();
+            return changed;
+        }
+
+        let pool = scheduler::read_pool(&dir);
+        let now_unix = now_unix_seconds() as i64;
+        let candidates = scheduler::build_candidates(&pool, &self.quotas, now_unix);
+        let current = self
+            .scheduler_current
+            .as_ref()
+            .map(|(file, since)| (file.as_str(), since.elapsed()));
+        let min_hold = Duration::from_secs(self.settings.scheduler_min_hold_minutes as u64 * 60);
+        let margin = self.settings.scheduler_switch_margin_minutes as i64 * 60;
+
+        let Some(target) = scheduler::pick_target(&candidates, current, min_hold, margin) else {
+            // 没有任何可用账号：fail-open，恢复全池，退回代理默认策略。
+            let changed = scheduler::release_all_in(&dir);
+            self.scheduler_clear();
+            return changed;
+        };
+
+        let target_changed = self
+            .scheduler_current
+            .as_ref()
+            .map(|(file, _)| file != &target)
+            .unwrap_or(true);
+        if target_changed {
+            self.scheduler_current = Some((target.clone(), Instant::now()));
+        }
+        let (pool_changed, standby_count) = scheduler::apply_target_in(&dir, &pool, &target);
+
+        let picked = candidates.iter().find(|c| c.file_name == target);
+        self.scheduler_target_label = picked.map(|c| c.label.clone());
+        self.scheduler_current_reset_at = picked.and_then(|c| c.session_reset_at);
+        self.scheduler_standby_count = standby_count;
+        target_changed || pool_changed
+    }
+
+    fn scheduler_clear(&mut self) {
+        self.scheduler_current = None;
+        self.scheduler_target_label = None;
+        self.scheduler_current_reset_at = None;
+        self.scheduler_standby_count = 0;
+    }
+
+    /// 当前选中账号的 5h 窗口是否已刷新（后台线程用：到点提前触发重评估，
+    /// 不必干等下一次 5 分钟配额轮询）。纯内存判断。
+    pub fn scheduler_reset_due(&self) -> bool {
+        self.settings.scheduler_rule == "reset_soonest"
+            && self.scheduler_current.is_some()
+            && self
+                .scheduler_current_reset_at
+                .map(|reset| reset <= now_unix_seconds() as i64)
+                .unwrap_or(false)
+    }
+
+    /// 调度状态快照（给前端展示）。
+    fn scheduler_status(&self) -> quotio_types::SchedulerStatus {
+        quotio_types::SchedulerStatus {
+            rule: self.settings.scheduler_rule.clone(),
+            target_label: self.scheduler_target_label.clone(),
+            target_reset_at_unix: self.scheduler_current_reset_at,
+            standby_count: self.scheduler_standby_count,
+        }
     }
 
     /// Import a CLIProxyAPI account JSON file into the auth directory
@@ -542,6 +632,9 @@ impl AppCore {
 
         codex_launch::mark_bound_account_login_only(&account_key)
             .map_err(ManagementCoreError::Unavailable)?;
+        // 绑定占用可能正好拿走了调度器当前选中的账号：立刻重选，
+        // 避免「目标被绑定 + 其余都在待命」导致代理池空窗。
+        let _ = self.scheduler_reconcile();
         if !matches!(
             self.app_state().proxy.status,
             ProxyStatusKind::Running | ProxyStatusKind::Starting
@@ -802,6 +895,7 @@ impl AppCore {
                 self.settings.notifications_enabled,
             ),
             config_root: quotio_platform::app_config_dir().display().to_string(),
+            scheduler: self.scheduler_status(),
         }
     }
 }
@@ -1252,6 +1346,10 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
             .as_ref()
             .and_then(|value| value.get("quotio_bound_login_only"))
             .and_then(|value| value.as_bool());
+        let quotio_scheduler_standby = parsed
+            .as_ref()
+            .and_then(|value| value.get("quotio_scheduler_standby"))
+            .and_then(|value| value.as_bool());
         files.push(AuthFile {
             id: name.to_string(),
             name: name.to_string(),
@@ -1272,6 +1370,7 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
             updated_at: None,
             last_refresh: None,
             quotio_bound_login_only,
+            quotio_scheduler_standby,
             success: None,
             failed: None,
             recent_requests: None,
@@ -1288,6 +1387,9 @@ fn enrich_auth_files_with_local_markers(files: &mut [AuthFile], local_accounts: 
         };
         if file.quotio_bound_login_only.is_none() {
             file.quotio_bound_login_only = local.quotio_bound_login_only;
+        }
+        if file.quotio_scheduler_standby.is_none() {
+            file.quotio_scheduler_standby = local.quotio_scheduler_standby;
         }
         if local.quotio_bound_login_only == Some(true) {
             file.disabled = true;

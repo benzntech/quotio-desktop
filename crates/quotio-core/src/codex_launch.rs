@@ -218,7 +218,7 @@ pub struct CodexAccountRef {
     pub disabled: bool,
 }
 
-fn is_codex_auth(file_name: &str, value: &Value) -> bool {
+pub(crate) fn is_codex_auth(file_name: &str, value: &Value) -> bool {
     let name = file_name.to_lowercase();
     let type_codex = value.get("type").and_then(|v| v.as_str()) == Some("codex");
     let has_tokens = value.get("access_token").is_some()
@@ -298,13 +298,13 @@ fn read_proxy_codex_account(key: &str) -> Result<Value, String> {
     serde_json::from_str::<Value>(&text).map_err(|e| format!("解析账号文件失败: {e}"))
 }
 
-fn read_proxy_account_from(path: &Path) -> Result<Value, String> {
+pub(crate) fn read_proxy_account_from(path: &Path) -> Result<Value, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("读取账号文件失败 {}: {e}", path.display()))?;
     serde_json::from_str::<Value>(&text).map_err(|e| format!("解析账号文件失败: {e}"))
 }
 
-fn write_proxy_account_to(path: &Path, value: &Value) -> Result<(), String> {
+pub(crate) fn write_proxy_account_to(path: &Path, value: &Value) -> Result<(), String> {
     let text =
         serde_json::to_string_pretty(value).map_err(|e| format!("序列化账号文件失败: {e}"))?;
     std::fs::write(path, text).map_err(|e| format!("写入账号文件失败 {}: {e}", path.display()))

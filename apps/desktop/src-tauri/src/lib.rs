@@ -53,12 +53,20 @@ fn get_platform_info(state: State<'_, DesktopState>) -> Result<PlatformInfo, Str
 
 #[tauri::command]
 fn save_settings(
+    app: AppHandle,
     settings: AppSettings,
     state: State<'_, DesktopState>,
 ) -> Result<AppState, String> {
     let mut core = state.core.lock().map_err(|_| "无法保存设置".to_string())?;
-    core.save_settings(settings)
-        .map_err(|error| error.to_string())
+    let result = core
+        .save_settings(settings)
+        .map_err(|error| error.to_string())?;
+    // 调度规则可能刚被开/关：立即收敛池子（开→接管，关→还原 standby 账号）。
+    if core.scheduler_reconcile() {
+        let _ = app.emit("scheduler-changed", ());
+        return Ok(core.app_state());
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -877,7 +885,12 @@ async fn refresh_quotas(
     }
 
     let mut core = state.core.lock().map_err(|_| "无法刷新额度".to_string())?;
-    Ok(core.set_quotas(quotas))
+    core.store_quotas(quotas);
+    // 配额刷新后跑一轮智能调度（规则关闭时它负责把 standby 账号放回池子）。
+    if core.scheduler_reconcile() {
+        let _ = app.emit("scheduler-changed", ());
+    }
+    Ok(core.app_state())
 }
 
 #[tauri::command]
@@ -1267,6 +1280,47 @@ fn spawn_usage_collector(app: AppHandle) {
                     let inserted = store.insert_events(&events);
                     if inserted > 0 {
                         let _ = app.emit("usage-updated", inserted);
+                    }
+                }
+            }
+
+            // 智能调度（每 ~30s 查一次，纯内存判断）：当前账号的 5h 窗口到点
+            // 刷新后，提前重拉配额并重评估，不必干等前端的 5 分钟轮询。
+            // 配额拉取在锁外（阻塞网络请求），只有存结果和评估时短暂取锁。
+            if tick % 20 == 10 {
+                let due = app
+                    .try_state::<DesktopState>()
+                    .and_then(|state| {
+                        state
+                            .core
+                            .lock()
+                            .ok()
+                            .map(|core| core.scheduler_reset_due())
+                    })
+                    .unwrap_or(false);
+                if due {
+                    let proxy_url = app.try_state::<DesktopState>().and_then(|state| {
+                        state
+                            .core
+                            .lock()
+                            .ok()
+                            .and_then(|core| core.proxy_upstream_url())
+                    });
+                    let quotas = quotio_core::quota::fetch_all_quotas_streaming(
+                        proxy_url.as_deref(),
+                        &|_| {},
+                    );
+                    let changed = app
+                        .try_state::<DesktopState>()
+                        .and_then(|state| {
+                            state.core.lock().ok().map(|mut core| {
+                                core.store_quotas(quotas);
+                                core.scheduler_reconcile()
+                            })
+                        })
+                        .unwrap_or(false);
+                    if changed {
+                        let _ = app.emit("scheduler-changed", ());
                     }
                 }
             }

@@ -141,6 +141,12 @@ pub struct AppSettings {
     pub codex_reasoning: String,
     /// Codex 代理访问密钥（写入 config.toml 的 experimental_bearer_token）。
     pub codex_api_key: String,
+    /// 智能账号调度规则："off"（关闭）或 "reset_soonest"（5h 窗口临近刷新优先）。
+    pub scheduler_rule: String,
+    /// 调度防抖：已选账号最小保持分钟数（除非打满/出错被迫切换）。
+    pub scheduler_min_hold_minutes: u32,
+    /// 调度防抖：候选要比当前账号早刷新至少多少分钟才主动切换。
+    pub scheduler_switch_margin_minutes: u32,
 }
 
 impl Default for AppSettings {
@@ -179,6 +185,9 @@ impl Default for AppSettings {
             codex_model: String::new(),
             codex_reasoning: "high".to_string(),
             codex_api_key: String::new(),
+            scheduler_rule: "off".to_string(),
+            scheduler_min_hold_minutes: 10,
+            scheduler_switch_margin_minutes: 15,
         }
     }
 }
@@ -366,6 +375,9 @@ pub struct AuthFile {
     pub updated_at: Option<String>,
     pub last_refresh: Option<String>,
     pub quotio_bound_login_only: Option<bool>,
+    /// 智能调度临时禁用（待命）标记——本地文件富化得到，管理 API 不返回。
+    #[serde(default)]
+    pub quotio_scheduler_standby: Option<bool>,
     #[serde(default)]
     pub success: Option<u64>,
     #[serde(default)]
@@ -398,6 +410,9 @@ pub struct QuotaModelUsage {
     pub used_percent: f64,
     pub remaining_percent: f64,
     pub reset_at: Option<String>,
+    /// 窗口刷新时间的原始 unix 秒（`reset_at` 是给人看的字符串，这个给调度规则用）。
+    #[serde(default)]
+    pub reset_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1315,6 +1330,20 @@ impl Default for ManagementSnapshot {
     }
 }
 
+/// 智能账号调度的当前状态（给前端展示）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SchedulerStatus {
+    /// 生效规则："off" 或 "reset_soonest"。
+    pub rule: String,
+    /// 当前选中账号的展示名（email）。
+    pub target_label: Option<String>,
+    /// 当前选中账号 5h 窗口的刷新时间（unix 秒）。
+    pub target_reset_at_unix: Option<i64>,
+    /// 被调度临时禁用（待命）的账号数。
+    pub standby_count: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppState {
     pub migration_phase: MigrationPhase,
@@ -1335,6 +1364,9 @@ pub struct AppState {
     pub credentials: CredentialStatus,
     pub platform_features: PlatformFeatureState,
     pub config_root: String,
+    /// 智能账号调度状态。
+    #[serde(default)]
+    pub scheduler: SchedulerStatus,
 }
 
 pub fn default_providers() -> Vec<ProviderSummary> {
@@ -1841,6 +1873,8 @@ mod tests {
                 created_at: None,
                 updated_at: None,
                 last_refresh: None,
+                quotio_bound_login_only: None,
+                quotio_scheduler_standby: None,
                 success: None,
                 failed: None,
                 recent_requests: None,
