@@ -25,6 +25,7 @@ import { LogsScreen } from "./sections/LogsScreen";
 import { ProvidersScreen } from "./sections/ProvidersScreen";
 import { QuotaScreen } from "./sections/QuotaScreen";
 import { SettingsScreen } from "./sections/SettingsScreen";
+import { ProxyInstabilityBanner } from "./ProxyInstabilityBanner";
 
 type AppShellProps = {
   appState: AppState;
@@ -232,6 +233,8 @@ export function AppShell(props: AppShellProps) {
       <section className={activeSection === "dashboard" ? "content content--dashboard" : "content"}>
         {renderSection(activeSection, props)}
       </section>
+
+      <ProxyInstabilityBanner appState={props.appState} />
 
       {closeDialog ? (
         <div className="modal-overlay" onClick={() => setCloseDialog(false)}>

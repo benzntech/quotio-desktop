@@ -402,6 +402,9 @@ const en: Record<string, string> = {
   "import.button": "Add account",
   "import.importing": "Importing…",
   "import.done": "Imported {n} — refresh Quota to see them",
+  // Upstream-proxy instability banner
+  "banner.proxyUnstable.title": "Upstream proxy unstable",
+  "banner.proxyUnstable.body": "{count} recent requests were dropped at the upstream proxy ({proxy}). This is usually the proxy/node — not your account or quota. Switch nodes in your proxy client and retry.",
 };
 
 const zh: Record<string, string> = {
@@ -796,6 +799,9 @@ const zh: Record<string, string> = {
   "import.button": "添加账号",
   "import.importing": "导入中…",
   "import.done": "已导入 {n} 个 —— 去额度页刷新查看",
+  // 上游代理不稳定提示
+  "banner.proxyUnstable.title": "上游代理连接不稳定",
+  "banner.proxyUnstable.body": "最近 {count} 次请求在上游代理（{proxy}）处被中断。这通常是代理/节点的问题,不是账号或额度——建议在代理客户端更换节点后重试。",
 };
 
 const DICT: Record<Locale, Record<string, string>> = { en, zh };

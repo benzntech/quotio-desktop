@@ -2532,6 +2532,56 @@ h3 {
   margin: 0;
 }
 
+/* Floating, dismissible warning when the upstream proxy/node keeps dropping
+   requests (connection reset / 5xx). Solid card so content behind stays
+   readable; amber left accent signals a warning. */
+.proxy-instability-banner {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 1400;
+  max-width: 380px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: var(--quotio-card-solid);
+  border: 1px solid var(--quotio-border);
+  border-left: 3px solid #f59e0b;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.2);
+  color: var(--quotio-text);
+}
+.proxy-instability-text {
+  flex: 1;
+  min-width: 0;
+}
+.proxy-instability-text strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 700;
+}
+.proxy-instability-text p {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--quotio-muted);
+}
+.proxy-instability-dismiss {
+  flex: none;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  color: var(--quotio-muted);
+  opacity: 0.7;
+}
+.proxy-instability-dismiss:hover {
+  opacity: 1;
+}
+
 .boot-bar {
   position: relative;
   width: 200px;
