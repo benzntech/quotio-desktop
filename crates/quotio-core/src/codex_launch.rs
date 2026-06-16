@@ -557,6 +557,11 @@ fn restore_codex_state_from_launch_backup_in(home: &Path) -> Result<(), String> 
         serde_json::from_str(&text).map_err(|e| format!("解析 Codex 启动备份失败: {e}"))?;
     restore_one(&home.join("auth.json"), &backup.auth_json)?;
     restore_one(&home.join("config.toml"), &backup.config_toml)?;
+    // Restoring config.toml flips Codex's model_provider back (cliproxyapi →
+    // openai). Codex hides history whose provider != the current config's, so
+    // re-align the session metadata to the restored provider — otherwise the
+    // sessions from the proxy run vanish after stopping. Best-effort, no backup.
+    let _ = crate::codex_session_visibility::repair_session_visibility_in_dir(home, false);
     std::fs::remove_file(&backup_path)
         .map_err(|e| format!("删除 Codex 启动备份失败 {}: {e}", backup_path.display()))?;
     Ok(())

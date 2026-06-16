@@ -761,6 +761,14 @@ fn import_auth_file(
     core.import_auth_file(&filename, &content)
 }
 
+/// Export all CPA account credential files as one zip into the user's Downloads
+/// folder (falling back to the app config dir). Returns the zip's path so the UI
+/// can reveal it in the file manager.
+#[tauri::command]
+fn export_auth_files(path: String) -> Result<String, String> {
+    quotio_core::export_auth_files(std::path::Path::new(&path))
+}
+
 #[tauri::command]
 fn list_local_accounts() -> Vec<AuthFile> {
     quotio_core::list_local_accounts()
@@ -1437,9 +1445,15 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }));
+        // 自动更新（仅桌面）：updater 负责检查/下载/安装新版本，process 提供
+        // 安装后 relaunch 的能力。两者都需要前端 @tauri-apps/plugin-* 配合。
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init());
     }
     builder
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1548,6 +1562,7 @@ pub fn run() {
             quit_app,
             show_menubar,
             import_auth_file,
+            export_auth_files,
             list_local_accounts,
             list_custom_providers,
             add_custom_provider,

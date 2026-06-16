@@ -90,6 +90,8 @@ export function ProvidersScreen({
   const [showAdd, setShowAdd] = useState(false);
   // Two-step confirm for the destructive "clear all accounts" action.
   const [confirmClearAll, setConfirmClearAll] = useState(false);
+  // Transient feedback for the "export accounts" button.
+  const [exportState, setExportState] = useState<"idle" | "busy" | "done" | "error">("idle");
   const [projectId, setProjectId] = useState("");
   const [oauthSession, setOAuthSession] = useState<OAuthSession | null>(null);
   const [vertexJson, setVertexJson] = useState("");
@@ -277,6 +279,43 @@ export function ProvidersScreen({
     }
   }
 
+  async function onExportAccounts() {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    // Default name: account email (first, "+N" when several) + a readable
+    // timestamp. The save dialog lets the user change the name and location.
+    const emails = authFiles.map((file) => file.email).filter((email): email is string => Boolean(email));
+    const now = new Date();
+    const pad = (value: number) => String(value).padStart(2, "0");
+    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const base =
+      emails.length === 1
+        ? emails[0]
+        : emails.length > 1
+          ? `${emails[0]}+${emails.length - 1}`
+          : `${authFiles.length}accounts`;
+    const defaultName = `quotio_${base.replace(/[<>:"\\|?* -]/g, "-")}_${stamp}.zip`;
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const target = await save({
+        defaultPath: defaultName,
+        filters: [{ name: "Zip", extensions: ["zip"] }],
+      });
+      if (!target) return; // user cancelled the dialog
+      setExportState("busy");
+      const path = await invoke<string>("export_auth_files", { path: target });
+      setExportState("done");
+      try {
+        const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+        await revealItemInDir(path);
+      } catch {
+        /* revealing the folder is best-effort */
+      }
+    } catch {
+      setExportState("error");
+    }
+    window.setTimeout(() => setExportState("idle"), 4000);
+  }
+
   return (
     <section className="section-page providers-page">
       <header className="page-topbar" data-tauri-drag-region>
@@ -364,6 +403,23 @@ export function ProvidersScreen({
                 onChange={onImportFiles}
               />
             </label>
+            {authFiles.length > 0 ? (
+              <button
+                className="ghost-action"
+                type="button"
+                disabled={isManagementBusy || exportState === "busy"}
+                title="把所有 CPA 账号凭证打包导出为 zip(内含登录令牌,妥善保管)"
+                onClick={() => void onExportAccounts()}
+              >
+                {exportState === "busy"
+                  ? "导出中…"
+                  : exportState === "done"
+                    ? "已导出 ✓"
+                    : exportState === "error"
+                      ? "导出失败"
+                      : "导出"}
+              </button>
+            ) : null}
             {authFiles.length > 0 ? (
               <button
                 className="ghost-action"
@@ -549,6 +605,10 @@ function accountState(
   // triggers re-auth, since 500/429 failures are rate-limit/transient, not auth.
   if (authFailed) return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "需重新授权", needsReauth: true };
   if (health?.recommend_reauth) return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "需重新授权", needsReauth: true };
+  if (account.disabled && account.quotio_scheduler_standby)
+    return { tone: "muted", key: "providers.stateStandby", fallback: "待命(调度)", needsReauth: false };
+  if (account.disabled && account.quotio_bound_login_only)
+    return { tone: "muted", key: "providers.stateBoundLogin", fallback: "绑定登录", needsReauth: false };
   if (account.disabled) return { tone: "muted", key: "providers.statusDisabled", fallback: "已禁用", needsReauth: false };
   if (account.unavailable) return { tone: "bad", key: "providers.stateUnavailable", fallback: "不可用", needsReauth: true };
   const status = (account.status ?? "").trim().toLowerCase();
@@ -560,6 +620,11 @@ function accountState(
     if (failures === 0) return { tone: "good", key: "providers.stateActive", fallback: "正常", needsReauth: false };
     if (health.rate_limited > 0 && health.rate_limited >= health.server_errors && health.rate_limited >= health.auth_failures)
       return { tone: "warn", key: "providers.stateRateLimited", fallback: "限流", needsReauth: false };
+    // 5xx dominate the failures → upstream proxy / server congestion (the
+    // "wsarecv: forcibly closed" resets), NOT a problem with this account. Flag it
+    // as upstream-unstable (warn) rather than the alarming "失败偏多 / 异常".
+    if (health.server_errors > 0 && health.server_errors >= health.auth_failures && health.server_errors >= health.rate_limited)
+      return { tone: "warn", key: "providers.stateUpstream", fallback: "上游不稳(5xx)", needsReauth: false };
     if (failures >= health.successes)
       return { tone: "bad", key: "providers.stateFailing", fallback: "异常 · 失败偏多", needsReauth: false };
     return { tone: "warn", key: "providers.stateDegraded", fallback: "部分失败", needsReauth: false };

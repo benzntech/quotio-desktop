@@ -429,7 +429,39 @@ impl AppCore {
 
     /// 只存配额不生成快照（调用方随后自己跑 [`Self::scheduler_reconcile`] + `app_state`）。
     pub fn store_quotas(&mut self, quotas: Vec<AccountQuota>) {
-        self.quotas = quotas;
+        // Preserve last-known-good quota. A probe routed through a flaky upstream
+        // proxy often comes back blank (no models, not forbidden, not auth-failed)
+        // for some accounts; blindly storing that flaps each card to "额度获取失败"
+        // and back every poll. So when SOME accounts succeeded, keep the previous
+        // numbers for the ones that came back transiently blank. If EVERY account
+        // is blank, store as-is — that's a real "proxy unreachable" the UI surfaces
+        // (rather than masking an outage behind stale numbers).
+        fn is_blank(account: &AccountQuota) -> bool {
+            account.models.is_empty()
+                && !account.is_forbidden
+                && account.status_message.as_deref() != Some("auth_failed")
+        }
+        if quotas.iter().all(is_blank) {
+            self.quotas = quotas;
+            return;
+        }
+        let previous = std::mem::take(&mut self.quotas);
+        self.quotas = quotas
+            .into_iter()
+            .map(|account| {
+                if is_blank(&account) {
+                    if let Some(old) = previous.iter().find(|old| {
+                        old.provider_id == account.provider_id
+                            && old.account_key == account.account_key
+                    }) {
+                        if !old.models.is_empty() {
+                            return old.clone();
+                        }
+                    }
+                }
+                account
+            })
+            .collect();
     }
 
     /// 智能调度评估 + 守门执行。每次配额刷新后调用；规则关闭时负责把
@@ -690,6 +722,10 @@ impl AppCore {
         agent_config::write_codex_proxy_config_no_backup(&request)?;
         codex_launch::inject_bound_account(&account_key)
             .map_err(ManagementCoreError::Unavailable)?;
+        // 刚把 config 切到代理(cliproxyapi)。Codex 只显示 provider 跟当前 config 一致
+        // 的历史会话,所以把会话元数据一并对齐到 cliproxyapi,否则历史会话在代理会话里
+        // 会消失。此刻 Codex 已关闭(上面 close_codex_app),改库安全。Best-effort。
+        let _ = codex_session_visibility::repair_session_visibility_in_default_dir_no_backup();
 
         let mode = if settings.codex_launch_mode.trim().is_empty() {
             "app"
@@ -1536,6 +1572,49 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));
     files
+}
+
+/// Bundle every CPA account credential file (`~/.cli-proxy-api/*.json`, minus the
+/// GLM key file) into a single zip under `dest_dir`, for backup / moving to
+/// another machine. Returns the written zip's path; errors when there's nothing
+/// to export. NOTE: the zip contains live OAuth tokens — treat it as a secret.
+pub fn export_auth_files(zip_path: &std::path::Path) -> Result<String, String> {
+    use std::io::Write as _;
+    let src = quotio_platform::proxy_auth_dir();
+    let entries = std::fs::read_dir(&src).map_err(|error| format!("读取账号目录失败：{}", error))?;
+    if let Some(parent) = zip_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("创建导出目录失败：{}", error))?;
+    }
+    let file =
+        std::fs::File::create(zip_path).map_err(|error| format!("创建导出文件失败：{}", error))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if !lower.ends_with(".json") || lower.starts_with("glm-keys") {
+            continue;
+        }
+        let Ok(content) = std::fs::read(&path) else {
+            continue;
+        };
+        zip.start_file(name, options)
+            .map_err(|error| format!("写入压缩包失败：{}", error))?;
+        zip.write_all(&content)
+            .map_err(|error| format!("写入压缩包失败：{}", error))?;
+        count += 1;
+    }
+    zip.finish().map_err(|error| format!("完成压缩包失败：{}", error))?;
+    if count == 0 {
+        let _ = std::fs::remove_file(zip_path);
+        return Err("没有可导出的账号文件".to_string());
+    }
+    Ok(zip_path.display().to_string())
 }
 
 fn enrich_auth_files_with_local_markers(files: &mut [AuthFile], local_accounts: &[AuthFile]) {
@@ -2914,6 +2993,51 @@ fn now_unix_seconds() -> u64 {
 mod tests {
     use super::*;
     use quotio_types::{ConnectionMode, MigrationPhase};
+
+    fn quota_with_models(key: &str) -> quotio_types::AccountQuota {
+        quotio_types::AccountQuota {
+            provider_id: "codex".to_string(),
+            account_label: key.to_string(),
+            account_key: key.to_string(),
+            is_forbidden: false,
+            status_message: None,
+            models: vec![quotio_types::QuotaModelUsage {
+                model: "gpt-5".to_string(),
+                used_percent: 20.0,
+                remaining_percent: 80.0,
+                reset_at: None,
+                reset_at_unix: None,
+            }],
+        }
+    }
+
+    fn quota_blank(key: &str) -> quotio_types::AccountQuota {
+        quotio_types::AccountQuota {
+            provider_id: "codex".to_string(),
+            account_label: key.to_string(),
+            account_key: key.to_string(),
+            is_forbidden: false,
+            status_message: None,
+            models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn store_quotas_keeps_last_good_on_transient_blank() {
+        let mut core = AppCore::default();
+        core.store_quotas(vec![quota_with_models("a"), quota_with_models("b")]);
+        // "a" comes back blank (transient probe failure), "b" still good →
+        // "a" keeps its previous numbers instead of flapping to "fetch failed".
+        core.store_quotas(vec![quota_blank("a"), quota_with_models("b")]);
+        let a = core.quotas.iter().find(|item| item.account_key == "a").unwrap();
+        assert_eq!(a.models.len(), 1, "transiently-blank 'a' keeps its previous models");
+        // An all-blank refresh is a real outage — stored as-is so the UI can flag it.
+        core.store_quotas(vec![quota_blank("a"), quota_blank("b")]);
+        assert!(
+            core.quotas.iter().all(|item| item.models.is_empty()),
+            "all-blank refresh stores as-is so the proxy-unreachable banner can fire"
+        );
+    }
     use std::{
         net::{TcpListener, TcpStream},
         sync::{Arc, Mutex},

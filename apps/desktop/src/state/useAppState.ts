@@ -50,8 +50,14 @@ function upsertQuota(quotas: AccountQuota[], account: AccountQuota): AccountQuot
     (item) => item.provider_id === account.provider_id && item.account_key === account.account_key,
   );
   if (index >= 0) {
+    // Mirror the backend's "keep last-known-good" rule while streaming: a probe
+    // that came back transiently blank (no models, not exhausted, not auth-failed)
+    // must not wipe the numbers we're already showing for this account.
+    const old = quotas[index];
+    const blank =
+      account.models.length === 0 && !account.is_forbidden && account.status_message !== "auth_failed";
     const next = quotas.slice();
-    next[index] = account;
+    next[index] = blank && old.models.length > 0 ? old : account;
     return next;
   }
   return [...quotas, account];
@@ -117,23 +123,22 @@ export function useAppState() {
     };
   }, []);
 
-  // Background poll: refresh the management snapshot every 15s while the local
-  // proxy runs, so BOTH the Logs "Requests" tab AND each account's health (✓/✗
-  // counts + dots) stay current without a manual refresh. refresh_management_state
-  // is a superset of drain_request_logs — it pulls /auth-files health and drains
-  // the log queue — which fixes health lagging the logs (logs were 15s-fresh but
-  // health only refreshed on the 5-min quota poll). Only in the real Tauri app.
+  // Background poll: refresh the management snapshot (each account's health ✓/✗
+  // dots + the Logs "Requests" tab) every 5 minutes. This is UI-only — draining
+  // the proxy's usage queue is owned by the backend usage collector (a separate
+  // ~1.5s loop that persists to SQLite), and the dashboard updates live off its
+  // "usage-updated" events. So a slow cadence here loses no data; it just makes
+  // the health dots / request log slightly staler, which avoids the constant
+  // whole-app re-render. Only in the real Tauri app; throws (caught) when the
+  // proxy is unreachable, which also covers an orphaned/externally-started proxy.
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     if (isMenuBarView) return;
-    // Poll every 15s regardless of the app-tracked proxy status. It throws (caught
-    // below) when the proxy is unreachable, and this also covers a proxy that is
-    // running but was not started by (or was orphaned from) this app session.
     const interval = window.setInterval(() => {
       invoke<AppState>("refresh_management_state")
         .then(setAppState)
         .catch(() => {});
-    }, 30000);
+    }, 5 * 60 * 1000);
     return () => window.clearInterval(interval);
   }, []);
 

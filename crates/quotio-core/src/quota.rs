@@ -130,10 +130,38 @@ fn auth_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".cli-proxy-api"))
 }
 
+/// Issue a request, retrying on transient transport errors (timeout / connection
+/// reset — i.e. network jitter or a flaky upstream proxy) with a short backoff.
+/// A real HTTP status (401/403/429/5xx) is returned immediately — that's a server
+/// answer, not jitter, so retrying would only waste time. `build_request` is
+/// re-invoked each attempt because `.call()` consumes the request.
+fn call_with_retry(
+    build_request: impl Fn() -> ureq::Request,
+) -> Result<ureq::Response, ureq::Error> {
+    let mut delay = Duration::from_millis(700);
+    for attempt in 0..3u8 {
+        match build_request().call() {
+            Ok(response) => return Ok(response),
+            Err(error @ ureq::Error::Status(_, _)) => return Err(error),
+            Err(error) => {
+                if attempt == 2 {
+                    return Err(error);
+                }
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+        }
+    }
+    unreachable!()
+}
+
 fn build_agent(proxy_url: Option<&str>) -> ureq::Agent {
+    // Generous timeouts: a flaky upstream proxy or network jitter shouldn't make
+    // a probe give up early and blank the account. Paired with store_quotas
+    // keeping last-good, transient slowness no longer drops the numbers.
     let mut builder = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(12));
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30));
     // Route through the user's HTTP proxy (clash/v2ray etc.) like the original
     // macOS app's proxied URLSession (ProxyConfigurationService) — provider
     // endpoints are otherwise unreachable in many regions. Prefer the upstream
@@ -561,17 +589,20 @@ fn fetch_codex_usage(
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<CodexUsageResponse, FetchError> {
-    let mut request = agent
-        .get(CODEX_USAGE_URL)
-        .set("Authorization", &format!("Bearer {}", access_token))
-        .set("Accept", "application/json");
-    if let Some(id) = account_id {
-        if !id.is_empty() {
-            request = request.set("ChatGPT-Account-Id", id);
+    let response = call_with_retry(|| {
+        let mut request = agent
+            .get(CODEX_USAGE_URL)
+            .set("Authorization", &format!("Bearer {}", access_token))
+            .set("Accept", "application/json");
+        if let Some(id) = account_id {
+            if !id.is_empty() {
+                request = request.set("ChatGPT-Account-Id", id);
+            }
         }
-    }
+        request
+    });
 
-    match request.call() {
+    match response {
         Ok(response) => response
             .into_json::<CodexUsageResponse>()
             .map_err(|_| FetchError::Other),

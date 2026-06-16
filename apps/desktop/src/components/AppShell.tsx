@@ -26,6 +26,8 @@ import { ProvidersScreen } from "./sections/ProvidersScreen";
 import { QuotaScreen } from "./sections/QuotaScreen";
 import { SettingsScreen } from "./sections/SettingsScreen";
 import { ProxyInstabilityBanner } from "./ProxyInstabilityBanner";
+import { UpdateDialog } from "./UpdateDialog";
+import { useUpdater } from "../state/useUpdater";
 
 type AppShellProps = {
   appState: AppState;
@@ -133,6 +135,7 @@ export function AppShell(props: AppShellProps) {
   const [closeDialog, setCloseDialog] = useState(false);
   const [rememberClose, setRememberClose] = useState(false);
   const [closing, setClosing] = useState(false);
+  const updater = useUpdater();
 
   // First time the user opens the Quota tab this session, kick off a fresh fetch
   // (with the loading card) so they get current data on demand — not just the
@@ -231,10 +234,20 @@ export function AppShell(props: AppShellProps) {
       </aside>
 
       <section className={activeSection === "dashboard" ? "content content--dashboard" : "content"}>
-        {renderSection(activeSection, props)}
+        {renderSection(activeSection, props, updater)}
       </section>
 
       <ProxyInstabilityBanner appState={props.appState} />
+
+      <UpdateDialog
+        status={updater.status}
+        version={updater.version}
+        notes={updater.notes}
+        percent={updater.percent}
+        error={updater.error}
+        onInstall={updater.install}
+        onDismiss={updater.dismiss}
+      />
 
       {closeDialog ? (
         <div className="modal-overlay" onClick={() => setCloseDialog(false)}>
@@ -305,7 +318,7 @@ export function AppShell(props: AppShellProps) {
   );
 }
 
-function renderSection(section: AppSection, props: AppShellProps) {
+function renderSection(section: AppSection, props: AppShellProps, updater: ReturnType<typeof useUpdater>) {
   switch (section) {
     case "providers":
       return (
@@ -408,7 +421,13 @@ function renderSection(section: AppSection, props: AppShellProps) {
         />
       );
     case "about":
-      return <AboutScreen appState={props.appState} />;
+      return (
+        <AboutScreen
+          appState={props.appState}
+          onCheckUpdate={() => void updater.check(true)}
+          checking={updater.status === "checking"}
+        />
+      );
     case "dashboard":
     default:
       return <DashboardScreen appState={props.appState} />;
@@ -500,8 +519,24 @@ function ProxyStatusCard({ proxy, isProxyBusy, proxyAction, onRunProxyAction }: 
   );
 }
 
-function AboutScreen({ appState }: { appState: AppState }) {
+function AboutScreen({
+  appState,
+  onCheckUpdate,
+  checking,
+}: {
+  appState: AppState;
+  onCheckUpdate: () => void;
+  checking: boolean;
+}) {
   const t = useT();
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    void import("@tauri-apps/api/app")
+      .then(({ getVersion }) => getVersion())
+      .then(setAppVersion)
+      .catch(() => {});
+  }, []);
   return (
     <section className="dashboard-content">
       <header className="page-topbar" data-tauri-drag-region>
@@ -512,8 +547,13 @@ function AboutScreen({ appState }: { appState: AppState }) {
           <div className="about-mark">Q</div>
           <div>
             <strong>Quotio</strong>
-            <span>v0.1.0</span>
+            <span>v{appVersion || "—"}</span>
           </div>
+        </div>
+        <div className="about-update">
+          <button type="button" className="secondary-action" onClick={onCheckUpdate} disabled={checking}>
+            {checking ? t("update.checking", "检查中…") : t("update.check", "检查更新")}
+          </button>
         </div>
         <dl className="detail-list compact-details">
           <div>

@@ -345,11 +345,14 @@ const en: Record<string, string> = {
   "providers.activeInIde": "Active in IDE",
   "providers.useInIde": "Use in IDE",
   "providers.statusDisabled": "disabled",
+  "providers.stateStandby": "Standby (scheduler)",
+  "providers.stateBoundLogin": "Bound for login",
   "providers.stateActive": "Active",
   "providers.stateDegraded": "Some failures",
   "providers.stateError": "Error · re-auth suggested",
   "providers.stateRateLimited": "Rate limited",
   "providers.stateFailing": "Failing often",
+  "providers.stateUpstream": "Upstream unstable (5xx)",
   "providers.stateAnomaly": "Anomaly",
   "providers.stateUnavailable": "Unavailable",
   "providers.stateNeedsReauth": "Needs re-auth",
@@ -405,6 +408,16 @@ const en: Record<string, string> = {
   // Upstream-proxy instability banner
   "banner.proxyUnstable.title": "Upstream proxy unstable",
   "banner.proxyUnstable.body": "{count} recent requests were dropped at the upstream proxy ({proxy}). This is usually the proxy/node — not your account or quota. Switch nodes in your proxy client and retry.",
+  // Auto-update
+  "update.available": "New version available",
+  "update.availableDesc": "A newer version is recommended.",
+  "update.later": "Later",
+  "update.installNow": "Update now",
+  "update.downloading": "Downloading update…",
+  "update.upToDate": "You're on the latest version",
+  "update.failed": "Update check failed",
+  "update.check": "Check for updates",
+  "update.checking": "Checking…",
 };
 
 const zh: Record<string, string> = {
@@ -742,11 +755,14 @@ const zh: Record<string, string> = {
   "providers.activeInIde": "IDE 中活跃",
   "providers.useInIde": "IDE 使用中",
   "providers.statusDisabled": "已禁用",
+  "providers.stateStandby": "待命(调度)",
+  "providers.stateBoundLogin": "绑定登录",
   "providers.stateActive": "正常",
   "providers.stateDegraded": "部分失败",
   "providers.stateError": "异常 · 建议重授权",
   "providers.stateRateLimited": "限流",
   "providers.stateFailing": "异常 · 失败偏多",
+  "providers.stateUpstream": "上游不稳(5xx)",
   "providers.stateAnomaly": "异常",
   "providers.stateUnavailable": "不可用",
   "providers.stateNeedsReauth": "需重新授权",
@@ -802,6 +818,16 @@ const zh: Record<string, string> = {
   // 上游代理不稳定提示
   "banner.proxyUnstable.title": "上游代理连接不稳定",
   "banner.proxyUnstable.body": "最近 {count} 次请求在上游代理（{proxy}）处被中断。这通常是代理/节点的问题,不是账号或额度——建议在代理客户端更换节点后重试。",
+  // 自动更新
+  "update.available": "发现新版本",
+  "update.availableDesc": "建议更新到最新版本。",
+  "update.later": "稍后",
+  "update.installNow": "立即更新",
+  "update.downloading": "正在下载更新…",
+  "update.upToDate": "已是最新版本",
+  "update.failed": "检查更新失败",
+  "update.check": "检查更新",
+  "update.checking": "检查中…",
 };
 
 const DICT: Record<Locale, Record<string, string>> = { en, zh };

@@ -56,6 +56,10 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 自动更新签名密钥(在仓库 Settings → Secrets and variables → Actions 配置)。
+          # 缺失时不会生成 latest.json / .sig,自动更新不可用,但安装包照常构建。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
@@ -71,3 +75,33 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+  # 等三端构建完成后,把 latest.json 里的安装包直链改写为走 ghproxy 镜像,
+  # 改善国内自动更新的下载速度。应用拉取清单的端点见
+  # apps/desktop/src-tauri/tauri.conf.json 的 plugins.updater.endpoints。
+  rewrite-manifest:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Rewrite latest.json download URLs through ghproxy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          # 镜像挂了随时换:在仓库 Settings → Variables 设 GHPROXY_PREFIX 覆盖(末尾带 /)。
+          GHPROXY: ${{ vars.GHPROXY_PREFIX || 'https://ghfast.top/' }}
+        run: |
+          set -euo pipefail
+          # latest.json 仅在配置了签名密钥时才会由 tauri-action 生成;没有就跳过,不让发版失败。
+          if ! gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p latest.json --clobber; then
+            echo "本次 Release 无 latest.json(可能未配置签名密钥),跳过 ghproxy 改写。"
+            exit 0
+          fi
+          jq --arg p "$GHPROXY" '
+            .platforms |= with_entries(
+              .value.url |= (if startswith($p) then . else $p + . end)
+            )
+          ' latest.json > latest.rewritten.json
+          mv latest.rewritten.json latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber

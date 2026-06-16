@@ -22,11 +22,22 @@ pub struct CodexSessionVisibilityRepairSummary {
 pub fn repair_session_visibility_in_default_dir(
 ) -> Result<CodexSessionVisibilityRepairSummary, String> {
     let root = quotio_platform::expand_home_path("~/.codex");
-    repair_session_visibility_in_dir(&root)
+    repair_session_visibility_in_dir(&root, true)
+}
+
+/// Like [`repair_session_visibility_in_default_dir`] but without the on-disk
+/// backup. Used by the automatic repair on Codex start/stop: it fires every
+/// launch/stop and the change is deterministic + reversible, so keeping a backup
+/// per provider switch would just pile up copies of the sessions in `~/.codex`.
+pub fn repair_session_visibility_in_default_dir_no_backup(
+) -> Result<CodexSessionVisibilityRepairSummary, String> {
+    let root = quotio_platform::expand_home_path("~/.codex");
+    repair_session_visibility_in_dir(&root, false)
 }
 
 pub fn repair_session_visibility_in_dir(
     root: &Path,
+    make_backup: bool,
 ) -> Result<CodexSessionVisibilityRepairSummary, String> {
     if !root.exists() {
         return Err(format!("Codex 配置目录不存在：{}", root.display()));
@@ -40,8 +51,11 @@ pub fn repair_session_visibility_in_dir(
 
     let mut backup_dirs = Vec::new();
     if should_mutate {
-        let backup_dir = backup_instance_files(root, &rollout_changes, sqlite_rows_to_update > 0)?;
-        backup_dirs.push(backup_dir.to_string_lossy().to_string());
+        if make_backup {
+            let backup_dir =
+                backup_instance_files(root, &rollout_changes, sqlite_rows_to_update > 0)?;
+            backup_dirs.push(backup_dir.to_string_lossy().to_string());
+        }
 
         for path in &rollout_changes {
             repair_rollout_file(path, &target_provider)?;
@@ -373,7 +387,7 @@ mod tests {
         )
         .unwrap();
 
-        let summary = repair_session_visibility_in_dir(&root).unwrap();
+        let summary = repair_session_visibility_in_dir(&root, true).unwrap();
 
         assert_eq!(summary.changed_rollout_file_count, 1);
         assert_eq!(summary.updated_sqlite_row_count, 0);
@@ -408,7 +422,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let summary = repair_session_visibility_in_dir(&root).unwrap();
+        let summary = repair_session_visibility_in_dir(&root, true).unwrap();
 
         assert_eq!(summary.changed_rollout_file_count, 0);
         assert_eq!(summary.updated_sqlite_row_count, 1);
@@ -435,7 +449,7 @@ mod tests {
         )
         .unwrap();
 
-        let summary = repair_session_visibility_in_dir(&root).unwrap();
+        let summary = repair_session_visibility_in_dir(&root, true).unwrap();
 
         assert_eq!(summary.mutated_instance_count, 0);
         assert_eq!(summary.changed_rollout_file_count, 0);

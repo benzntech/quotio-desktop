@@ -112,6 +112,13 @@ export function SettingsScreen({
       logs_max_total_size_mb: settings.logs_max_total_size_mb,
     });
   }, [settings.force_model, settings.session_affinity_ttl, settings.max_retry_credentials, settings.logs_max_total_size_mb]);
+  // Draft for the "Request retry" field so it commits on blur, not on every
+  // keystroke (the old onChange saved live each keystroke, which set the field
+  // busy → disabled → you couldn't actually finish typing a value).
+  const [retryDraft, setRetryDraft] = useState(settings.request_retry);
+  useEffect(() => {
+    setRetryDraft(settings.request_retry);
+  }, [settings.request_retry]);
 
   const activeMode: AppMode =
     settings.connection_mode === "remote" || settings.operating_mode === "remote"
@@ -433,9 +440,17 @@ export function SettingsScreen({
               type="number"
               min={0}
               max={10}
-              value={config?.request_retry ?? settings.request_retry}
-              onChange={(event) => onRunManagementStateAction("set_management_request_retry", { count: Number(event.target.value) })}
-              disabled={isManagementBusy || !config}
+              value={retryDraft}
+              onChange={(event) => setRetryDraft(Number(event.target.value))}
+              onBlur={() => {
+                if (retryDraft === settings.request_retry) return;
+                // Persist to settings.json (regenerated into config.yaml) AND apply
+                // live on the running proxy. Committing on blur means typing no
+                // longer fires a save per keystroke.
+                onSaveSettings({ ...settings, request_retry: retryDraft });
+                if (config) onRunManagementStateAction("set_management_request_retry", { count: retryDraft });
+              }}
+              disabled={isManagementBusy}
             />
           </div>
           <div className="settings-row settings-row--input">
