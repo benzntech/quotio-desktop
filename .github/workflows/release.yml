@@ -60,6 +60,14 @@ jobs:
           # 缺失时不会生成 latest.json / .sig,自动更新不可用,但安装包照常构建。
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # 内置 OAuth 凭据(Google 公开安装版凭据),构建期由 option_env! 注入到
+          # native_oauth.rs(gemini-cli)/ quota.rs(Antigravity)。在仓库
+          # Settings → Secrets and variables → Actions 配置;缺失则对应登录/额度功能
+          # 在发布版里不可用(优雅降级),其余功能照常。
+          QUOTIO_GEMINI_CLIENT_ID: ${{ secrets.QUOTIO_GEMINI_CLIENT_ID }}
+          QUOTIO_GEMINI_CLIENT_SECRET: ${{ secrets.QUOTIO_GEMINI_CLIENT_SECRET }}
+          QUOTIO_ANTIGRAVITY_CLIENT_ID: ${{ secrets.QUOTIO_ANTIGRAVITY_CLIENT_ID }}
+          QUOTIO_ANTIGRAVITY_CLIENT_SECRET: ${{ secrets.QUOTIO_ANTIGRAVITY_CLIENT_SECRET }}
         with:
           projectPath: apps/desktop
           tagName: ${{ github.ref_name }}
