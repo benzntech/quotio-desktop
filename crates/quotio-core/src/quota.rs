@@ -44,9 +44,18 @@ const ANTIGRAVITY_MODELS_URL: &str =
 const ANTIGRAVITY_PROJECT_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const ANTIGRAVITY_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const ANTIGRAVITY_CLIENT_ID: &str =
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
+// Antigravity uses Google's well-known installed-app OAuth credential. Not
+// hardcoded in source — supplied at build time via env vars
+// QUOTIO_ANTIGRAVITY_CLIENT_ID / QUOTIO_ANTIGRAVITY_CLIENT_SECRET (baked in by
+// `option_env!`). Absent at build → Antigravity quota refresh is unavailable.
+const ANTIGRAVITY_CLIENT_ID: &str = match option_env!("QUOTIO_ANTIGRAVITY_CLIENT_ID") {
+    Some(v) => v,
+    None => "",
+};
+const ANTIGRAVITY_CLIENT_SECRET: &str = match option_env!("QUOTIO_ANTIGRAVITY_CLIENT_SECRET") {
+    Some(v) => v,
+    None => "",
+};
 const ANTIGRAVITY_USER_AGENT: &str = "antigravity/1.11.3 Darwin/arm64";
 
 // ---- Kiro (AWS CodeWhisperer) ----
