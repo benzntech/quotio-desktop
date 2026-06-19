@@ -46,6 +46,10 @@ resources/proxy/**/*.exe
 resources/proxy/**/CLIProxyAPI*
 resources/proxy/**/cli-proxy-api*
 
+# kiro-rs sidecar binary (bundled separately, not committed)
+resources/kiro/**/*.exe
+resources/kiro/**/kiro-rs*
+
 # Tauri generated files
 apps/desktop/src-tauri/gen/schemas/
 

@@ -786,13 +786,22 @@ fn add_custom_provider(
     api_key: String,
     kind: String,
     prefix: String,
+    models: String,
+    proxy_mode: String,
+    state: State<'_, DesktopState>,
 ) -> Result<Vec<quotio_core::CustomProvider>, String> {
-    quotio_core::add_custom_provider(name, base_url, api_key, kind, prefix)
+    let result = quotio_core::add_custom_provider(name, base_url, api_key, kind, prefix, models, proxy_mode)?;
+    let core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
+    Ok(result)
 }
 
 #[tauri::command]
-fn delete_custom_provider(id: String) -> Result<Vec<quotio_core::CustomProvider>, String> {
-    quotio_core::delete_custom_provider(&id)
+fn delete_custom_provider(id: String, state: State<'_, DesktopState>) -> Result<Vec<quotio_core::CustomProvider>, String> {
+    let result = quotio_core::delete_custom_provider(&id)?;
+    let core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
+    Ok(result)
 }
 
 #[tauri::command]
@@ -803,8 +812,51 @@ fn update_custom_provider(
     api_key: String,
     kind: String,
     prefix: String,
+    models: String,
+    proxy_mode: String,
+    state: State<'_, DesktopState>,
 ) -> Result<Vec<quotio_core::CustomProvider>, String> {
-    quotio_core::update_custom_provider(id, name, base_url, api_key, kind, prefix)
+    let result = quotio_core::update_custom_provider(id, name, base_url, api_key, kind, prefix, models, proxy_mode)?;
+    let core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
+    Ok(result)
+}
+
+#[tauri::command]
+fn add_provider_key(
+    provider_id: String,
+    label: String,
+    api_key: String,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<quotio_core::CustomProvider>, String> {
+    let result = quotio_core::add_provider_key(&provider_id, label, api_key)?;
+    let core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
+    Ok(result)
+}
+
+#[tauri::command]
+fn remove_provider_key(
+    provider_id: String,
+    key_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<quotio_core::CustomProvider>, String> {
+    let result = quotio_core::remove_provider_key(&provider_id, &key_id)?;
+    let core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
+    Ok(result)
+}
+
+#[tauri::command]
+fn toggle_provider_key(
+    provider_id: String,
+    key_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<quotio_core::CustomProvider>, String> {
+    let result = quotio_core::toggle_provider_key(&provider_id, &key_id)?;
+    let core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
+    Ok(result)
 }
 
 #[tauri::command]
@@ -813,9 +865,27 @@ fn list_api_keys() -> Vec<String> {
 }
 
 #[tauri::command]
+fn get_api_key_bindings() -> Vec<quotio_types::ApiKeyBinding> {
+    quotio_core::get_api_key_bindings()
+}
+
+#[tauri::command]
+fn set_api_key_binding(
+    api_key: String,
+    provider_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<quotio_types::ApiKeyBinding>, String> {
+    let result = quotio_core::set_api_key_binding(api_key, provider_id)?;
+    let core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
+    Ok(result)
+}
+
+#[tauri::command]
 fn add_api_key(key: String, state: State<'_, DesktopState>) -> Result<AppState, String> {
     quotio_core::add_api_key(key)?;
     let mut core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
     Ok(core.app_state())
 }
 
@@ -823,6 +893,7 @@ fn add_api_key(key: String, state: State<'_, DesktopState>) -> Result<AppState, 
 fn remove_api_key(key: String, state: State<'_, DesktopState>) -> Result<AppState, String> {
     quotio_core::remove_api_key(&key)?;
     let mut core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
     Ok(core.app_state())
 }
 
@@ -834,6 +905,7 @@ fn update_api_key(
 ) -> Result<AppState, String> {
     quotio_core::update_api_key(&key, replacement)?;
     let mut core = state.core.lock().map_err(|_| "无法访问核心".to_string())?;
+    core.rewrite_proxy_config();
     Ok(core.app_state())
 }
 
@@ -1176,6 +1248,44 @@ async fn poll_management_oauth(
 #[tauri::command]
 fn submit_oauth_callback(url: String) -> Result<(), String> {
     quotio_core::submit_oauth_callback(&url)
+}
+
+// ---------------------------------------------------------------------------
+// Native OAuth (no proxy dependency)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn native_oauth_start(provider_id: String) -> Result<quotio_core::native_oauth::OAuthStartResponse, String> {
+    quotio_core::native_oauth::start_oauth(&provider_id)
+}
+
+#[tauri::command]
+fn native_oauth_complete(
+    login_id: String,
+    state: State<'_, DesktopState>,
+) -> Result<quotio_core::native_oauth::OAuthCompleteResponse, String> {
+    let result = quotio_core::native_oauth::complete_oauth(&login_id)?;
+    if result.status == "success" {
+        if let Ok(core) = state.core.lock() {
+            core.dedup_codex_auth();
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn native_oauth_cancel(login_id: Option<String>) -> Result<(), String> {
+    quotio_core::native_oauth::cancel_oauth(login_id.as_deref())
+}
+
+#[tauri::command]
+fn native_oauth_submit_callback(login_id: String, callback_url: String) -> Result<(), String> {
+    quotio_core::native_oauth::submit_callback_url(&login_id, &callback_url)
+}
+
+#[tauri::command]
+fn import_auth_token(provider_id: String, content: String) -> Result<(), String> {
+    quotio_core::native_oauth::import_auth_token(&provider_id, &content)
 }
 
 #[tauri::command]
@@ -1568,7 +1678,12 @@ pub fn run() {
             add_custom_provider,
             delete_custom_provider,
             update_custom_provider,
+            add_provider_key,
+            remove_provider_key,
+            toggle_provider_key,
             list_api_keys,
+            get_api_key_bindings,
+            set_api_key_binding,
             add_api_key,
             remove_api_key,
             update_api_key,
@@ -1594,6 +1709,11 @@ pub fn run() {
             start_management_oauth,
             poll_management_oauth,
             submit_oauth_callback,
+            native_oauth_start,
+            native_oauth_complete,
+            native_oauth_cancel,
+            native_oauth_submit_callback,
+            import_auth_token,
             import_management_vertex_service_account,
             set_management_max_retry_interval,
             set_management_logging_to_file,

@@ -52,6 +52,7 @@ const ANTIGRAVITY_USER_AGENT: &str = "antigravity/1.11.3 Darwin/arm64";
 // ---- Kiro (AWS CodeWhisperer) ----
 const KIRO_VERSION: &str = "0.10.32";
 const KIRO_DEFAULT_REGION: &str = "us-east-1";
+const KIRO_REFRESH_ENDPOINT: &str = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken";
 
 // ---- GLM (BigModel) ----
 const GLM_QUOTA_URL: &str = "https://bigmodel.cn/api/monitor/usage/quota/limit";
@@ -1669,6 +1670,126 @@ fn fetch_kiro_quotas(agent: &ureq::Agent) -> Vec<AccountQuota> {
     quotas
 }
 
+/// Refresh a Kiro access token via the Kiro auth refresh endpoint.
+/// On success, updates the auth file on disk and returns the new access_token.
+fn try_refresh_kiro_token(agent: &ureq::Agent, path: &Path, refresh_token: &str) -> Option<String> {
+    let body = serde_json::json!({ "refreshToken": refresh_token });
+    let resp = agent
+        .post(KIRO_REFRESH_ENDPOINT)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .ok()?;
+    let resp_val: serde_json::Value = resp.into_json().ok()?;
+
+    // The response may be wrapped in {"data": {...}}
+    let token_data = resp_val
+        .get("data")
+        .filter(|v| v.is_object())
+        .unwrap_or(&resp_val);
+
+    let new_access = token_data
+        .get("accessToken")
+        .or_else(|| token_data.get("access_token"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+
+    // Write refreshed tokens back to the auth file (preserve other fields).
+    if let Ok(raw) = fs::read_to_string(path) {
+        if let Ok(mut file_json) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(obj) = file_json.as_object_mut() {
+                let at_key = if obj.contains_key("accessToken") {
+                    "accessToken"
+                } else {
+                    "access_token"
+                };
+                obj.insert(at_key.to_string(), serde_json::Value::String(new_access.to_string()));
+
+                if let Some(new_rt) = token_data
+                    .get("refreshToken")
+                    .or_else(|| token_data.get("refresh_token"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    let rt_key = if obj.contains_key("refreshToken") {
+                        "refreshToken"
+                    } else {
+                        "refresh_token"
+                    };
+                    obj.insert(rt_key.to_string(), serde_json::Value::String(new_rt.to_string()));
+                }
+
+                let _ = fs::write(path, serde_json::to_string_pretty(&file_json).unwrap_or_default());
+            }
+        }
+    }
+
+    Some(new_access.to_string())
+}
+
+fn call_kiro_usage(
+    agent: &ureq::Agent,
+    url: &str,
+    access_token: &str,
+    user_agent: &str,
+) -> Result<KiroUsageResponse, ureq::Error> {
+    agent
+        .get(url)
+        .set("Authorization", &format!("Bearer {}", access_token))
+        .set("User-Agent", user_agent)
+        .set("Accept", "application/json")
+        .call()
+        .and_then(|r| r.into_json().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into()))
+}
+
+/// profileArn may sit at the top level or nested inside the cockpit-tools-style
+/// `kiro_auth_token_raw` / `kiro_profile_raw` objects.
+fn kiro_nested_profile_arn(auth: &KiroAuthFile) -> Option<String> {
+    auth.kiro_auth_token_raw
+        .as_ref()
+        .and_then(|v| v.get("profileArn"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Build per-model usage rows from a Kiro usage response (live or cached).
+fn kiro_models_from_usage(usage: &KiroUsageResponse) -> Vec<QuotaModelUsage> {
+    let mut models = Vec::new();
+    for item in usage.usage_breakdown_list.iter().flatten() {
+        let limit = item.usage_limit.unwrap_or(0.0);
+        let used = item.current_usage.unwrap_or(0.0);
+        let remaining = if limit > 0.0 {
+            ((limit - used) / limit * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let reset = item.next_date_reset.and_then(format_reset_epoch);
+        let name = item
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "Usage".to_string());
+        models.push(model_usage(&name, remaining, reset));
+    }
+    models
+}
+
+/// Usage snapshot cached in the auth file — same data cpa-manager displays.
+fn kiro_models_from_cache(auth: &KiroAuthFile) -> Vec<QuotaModelUsage> {
+    if let Some(usage) = auth.kiro_usage_raw.as_ref() {
+        let models = kiro_models_from_usage(usage);
+        if !models.is_empty() {
+            return models;
+        }
+    }
+    if let Some(total) = auth.credits_total.filter(|t| *t > 0.0) {
+        let used = auth.credits_used.unwrap_or(0.0);
+        let remaining = ((total - used) / total * 100.0).clamp(0.0, 100.0);
+        let reset = auth.usage_reset_at.and_then(format_reset_epoch);
+        return vec![model_usage("Credit", remaining, reset)];
+    }
+    Vec::new()
+}
+
 fn fetch_kiro_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<AccountQuota> {
     let raw = fs::read_to_string(path).ok()?;
     let auth: KiroAuthFile = serde_json::from_str(&raw).ok()?;
@@ -1679,7 +1800,13 @@ fn fetch_kiro_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<Ac
         .filter(|email| !email.trim().is_empty())
         .unwrap_or_else(|| key.clone());
 
-    let region = extract_kiro_region(auth.profile_arn.as_deref())
+    let profile_arn = auth
+        .profile_arn
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| kiro_nested_profile_arn(&auth));
+
+    let region = extract_kiro_region(profile_arn.as_deref())
         .or_else(|| auth.region.clone())
         .unwrap_or_else(|| KIRO_DEFAULT_REGION.to_string());
     let machine_id = kiro_machine_id(&auth);
@@ -1692,52 +1819,41 @@ fn fetch_kiro_one(agent: &ureq::Agent, path: &Path, filename: &str) -> Option<Ac
         "https://q.{}.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
         region
     );
-    if let Some(arn) = auth
-        .profile_arn
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(arn) = profile_arn.as_deref().filter(|value| !value.is_empty()) {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(arn)));
     }
 
-    let response = agent
-        .get(&url)
-        .set("Authorization", &format!("Bearer {}", auth.access_token))
-        .set("User-Agent", &user_agent)
-        .set("Accept", "application/json")
-        .call();
-
-    let usage: KiroUsageResponse = match response {
-        Ok(resp) => resp.into_json().ok()?,
-        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
-            return Some(AccountQuota {
-                provider_id: "kiro".to_string(),
-                account_label: label,
-                account_key: key,
-                is_forbidden: true,
-                status_message: Some("需要重新授权".to_string()),
-                models: Vec::new(),
-            });
-        }
-        Err(_) => return None,
+    // Try the live usage endpoint, refreshing the token once on 401/403.
+    let live = match call_kiro_usage(agent, &url, &auth.access_token, &user_agent) {
+        Ok(u) => Some(u),
+        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => auth
+            .refresh_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|rt| try_refresh_kiro_token(agent, path, rt))
+            .and_then(|new_at| call_kiro_usage(agent, &url, &new_at, &user_agent).ok()),
+        Err(_) => None,
     };
 
-    let mut models = Vec::new();
-    for item in usage.usage_breakdown_list.unwrap_or_default() {
-        let limit = item.usage_limit.unwrap_or(0.0);
-        let used = item.current_usage.unwrap_or(0.0);
-        let remaining = if limit > 0.0 {
-            ((limit - used) / limit * 100.0).clamp(0.0, 100.0)
-        } else {
-            0.0
-        };
-        let reset = item.next_date_reset.and_then(format_reset_epoch);
-        let name = item.display_name.unwrap_or_else(|| "Usage".to_string());
-        models.push(model_usage(&name, remaining, reset));
+    // Prefer fresh data; fall back to the snapshot cached in the auth file (what
+    // cpa-manager displays) when the live call fails or returns nothing.
+    let mut models = live
+        .as_ref()
+        .map(kiro_models_from_usage)
+        .unwrap_or_default();
+    if models.is_empty() {
+        models = kiro_models_from_cache(&auth);
     }
 
     if models.is_empty() {
-        return None;
+        return Some(AccountQuota {
+            provider_id: "kiro".to_string(),
+            account_label: label,
+            account_key: key,
+            is_forbidden: true,
+            status_message: Some("需要重新授权".to_string()),
+            models: Vec::new(),
+        });
     }
 
     Some(AccountQuota {
@@ -1796,6 +1912,18 @@ struct KiroAuthFile {
     profile_arn: Option<String>,
     #[serde(default)]
     region: Option<String>,
+    // cockpit-tools-style files cache the last usage snapshot inline. We read it
+    // as a fallback so an expired access_token still shows the real quota.
+    #[serde(default)]
+    kiro_auth_token_raw: Option<serde_json::Value>,
+    #[serde(default)]
+    kiro_usage_raw: Option<KiroUsageResponse>,
+    #[serde(default)]
+    credits_total: Option<f64>,
+    #[serde(default)]
+    credits_used: Option<f64>,
+    #[serde(default)]
+    usage_reset_at: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]

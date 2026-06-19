@@ -1,16 +1,19 @@
-//! 智能账号调度：按规则选出唯一目标账号，其余打 standby 标记临时禁用，
-//! 让 CLIProxyAPI（只用未禁用账号）实际只能用目标账号。
+//! 智能账号调度：按规则为每个服务商选出唯一目标账号，其余打 standby 标记
+//! 临时禁用，让 CLIProxyAPI（只用未禁用账号）实际只能用目标账号。
 //!
-//! 规则「reset_soonest」（临近刷新优先）：5h 窗口最早刷新的账号优先——
+//! 规则「reset_soonest」（临近刷新优先）：额度最早刷新的账号优先——
 //! 窗口余量是会过期的资源，先用快刷新的不浪费；闲置账号（无活跃窗口，
-//! 一用就开全新 5h 窗口）留作储备排最后。打满、鉴权失败、用户手动禁用、
+//! 一用就开全新窗口）留作储备排最后。打满、鉴权失败、用户手动禁用、
 //! Codex 一键启动绑定的账号不参与调度。
 //!
-//! 设计要点（docs/account-scheduler-plan.md）：
+//! 调度覆盖所有服务商（≥2 个账号时自动生效），每个服务商独立选号。
+//!
+//! 设计要点：
 //! - 调度器只动自己标记过的账号（`quotio_scheduler_standby`），
 //!   用户手动禁用（`disabled` 无标记）永远不碰；
 //! - fail-open：无可用账号 / 规则关闭 / 退出软件 → 恢复所有 standby 回池。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -24,12 +27,12 @@ pub(crate) const STANDBY_FIELD: &str = "quotio_scheduler_standby";
 /// Codex 一键启动绑定标记（codex_launch 写入），带它的账号调度器不碰。
 const BOUND_FIELD: &str = "quotio_bound_login_only";
 
-/// 池中一个 Codex auth 文件的调度视角。
+/// 池中一个 auth 文件的调度视角。
 #[derive(Debug, Clone)]
 pub struct PoolFile {
     /// 原始文件名（含 .json），auth 目录内的唯一身份。
     pub file_name: String,
-    /// 清洗名（去 "codex-" 前缀和 ".json" 后缀），与 `AccountQuota.account_key` 对应。
+    /// 清洗名（去 "{provider}-" 前缀和 ".json" 后缀），与 `AccountQuota.account_key` 对应。
     pub key: String,
     pub disabled: bool,
     /// 是否调度器自己标记的临时禁用。
@@ -51,22 +54,28 @@ pub struct Candidate {
     pub file_name: String,
     pub key: String,
     pub label: String,
-    /// 活跃 5h 窗口的刷新时间（unix 秒）；None = 闲置（无窗口或已过期）。
+    /// 最近一次额度刷新时间（unix 秒）；None = 闲置（无窗口或已过期）。
     pub session_reset_at: Option<i64>,
-    /// Weekly 窗口剩余百分比（平手降权用）。
+    /// 总体剩余百分比（平手降权用）。
     pub weekly_remaining: f64,
     /// 是否可被选为目标（打满/鉴权失败/用户禁用/绑定占用 → false）。
     pub eligible: bool,
 }
 
-/// 与 quota.rs `clean_filename` 同规则，保证和 `AccountQuota.account_key` 对得上。
-pub(crate) fn key_for_file(file_name: &str) -> String {
-    let trimmed = file_name.strip_prefix("codex-").unwrap_or(file_name);
+fn key_for_provider_file(file_name: &str, prefix: &str) -> String {
+    let trimmed = file_name.strip_prefix(prefix).unwrap_or(file_name);
     trimmed.strip_suffix(".json").unwrap_or(trimmed).to_string()
 }
 
-/// 扫描 auth 目录里的 Codex 账号文件（调度只覆盖 Codex）。
+/// Codex 向后兼容：扫描 Codex 账号文件。
 pub fn read_pool(dir: &Path) -> Vec<PoolFile> {
+    read_pool_for_provider(dir, "codex")
+}
+
+/// 扫描 auth 目录里属于指定服务商的账号文件。
+/// 匹配条件：JSON `type` 字段等于 provider_id，或文件名以 `{provider_id}-` 开头。
+pub fn read_pool_for_provider(dir: &Path, provider_id: &str) -> Vec<PoolFile> {
+    let prefix = format!("{}-", provider_id);
     let mut pool = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return pool;
@@ -83,7 +92,8 @@ pub fn read_pool(dir: &Path) -> Vec<PoolFile> {
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        if !codex_launch::is_codex_auth(&file_name, &value) {
+        let file_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if file_type != provider_id && !file_name.starts_with(&prefix) {
             continue;
         }
         let flag = |field: &str| {
@@ -93,7 +103,7 @@ pub fn read_pool(dir: &Path) -> Vec<PoolFile> {
                 .unwrap_or(false)
         };
         pool.push(PoolFile {
-            key: key_for_file(&file_name),
+            key: key_for_provider_file(&file_name, &prefix),
             file_name,
             disabled: flag("disabled"),
             standby: flag(STANDBY_FIELD),
@@ -104,26 +114,66 @@ pub fn read_pool(dir: &Path) -> Vec<PoolFile> {
     pool
 }
 
+/// 扫描 auth 目录，返回每个有 ≥2 个文件的服务商 ID 列表。
+pub fn discover_schedulable_providers(dir: &Path) -> Vec<String> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if let Some(ptype) = value.get("type").and_then(|v| v.as_str()) {
+            *counts.entry(ptype.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut providers: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .map(|(provider, _)| provider)
+        .collect();
+    providers.sort();
+    providers
+}
+
 /// 池文件 + 配额数据 → 候选列表。配额缺失（没拉到）的账号视为不可选，
 /// 信息不足时宁可不动它。
 pub fn build_candidates(
     pool: &[PoolFile],
     quotas: &[AccountQuota],
     now_unix: i64,
+    provider_id: &str,
 ) -> Vec<Candidate> {
     pool.iter()
         .map(|file| {
             let quota = quotas
                 .iter()
-                .find(|q| q.provider_id == "codex" && q.account_key == file.key);
-            let session_reset_at = quota
-                .and_then(|q| q.models.iter().find(|m| m.model == "Session"))
-                .and_then(|m| m.reset_at_unix)
-                // 已过期的窗口等于没有窗口（闲置）。
-                .filter(|reset| *reset > now_unix);
+                .find(|q| q.provider_id == provider_id && q.account_key == file.key);
+            // 取所有模型中最早的未过期刷新时间。
+            let session_reset_at = quota.and_then(|q| {
+                q.models
+                    .iter()
+                    .filter_map(|m| m.reset_at_unix)
+                    .filter(|reset| *reset > now_unix)
+                    .min()
+            });
+            // 取所有模型中最低的剩余百分比。
             let weekly_remaining = quota
-                .and_then(|q| q.models.iter().find(|m| m.model == "Weekly"))
-                .map(|m| m.remaining_percent)
+                .map(|q| {
+                    q.models
+                        .iter()
+                        .map(|m| m.remaining_percent)
+                        .reduce(f64::min)
+                        .unwrap_or(100.0)
+                })
                 .unwrap_or(100.0);
             let auth_failed = quota
                 .map(|q| q.status_message.as_deref() == Some("auth_failed"))
@@ -233,12 +283,40 @@ pub fn apply_target_in(
     (changed, standby_count)
 }
 
-/// fail-open / 关闭调度 / 退出软件：恢复所有 standby 账号回池。返回是否有改动。
-pub fn release_all_in(dir: &Path) -> bool {
+/// 恢复指定服务商的所有 standby 账号回池。
+pub fn release_provider_in(dir: &Path, provider_id: &str) -> bool {
     let mut changed = false;
-    for file in read_pool(dir) {
+    for file in read_pool_for_provider(dir, provider_id) {
         if file.standby {
             changed |= set_standby(&dir.join(&file.file_name), false).is_ok();
+        }
+    }
+    changed
+}
+
+/// fail-open / 关闭调度 / 退出软件：恢复所有服务商的 standby 账号回池。
+pub fn release_all_in(dir: &Path) -> bool {
+    let mut changed = false;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if value
+            .get(STANDBY_FIELD)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            changed |= set_standby(&path, false).is_ok();
         }
     }
     changed
@@ -265,6 +343,10 @@ fn set_standby(path: &Path, standby: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     use quotio_types::QuotaModelUsage;
+
+    fn key_for_file(file_name: &str) -> String {
+        key_for_provider_file(file_name, "codex-")
+    }
 
     fn candidate(
         key: &str,
@@ -424,7 +506,7 @@ mod tests {
         };
         let now = 5_000;
         let quotas = vec![quota("a", Some(3_000), false), quota("b", Some(9_000), false)];
-        let candidates = build_candidates(&pool, &quotas, now);
+        let candidates = build_candidates(&pool, &quotas, now, "codex");
 
         // a 的窗口 3000 < now=5000 → 过期视为闲置。
         assert_eq!(candidates[0].session_reset_at, None);

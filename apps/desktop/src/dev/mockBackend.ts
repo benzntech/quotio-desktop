@@ -28,6 +28,7 @@ type ProviderFlags = {
   uses_browser_auth?: boolean;
   uses_cli_quota?: boolean;
   uses_api_key_auth?: boolean;
+  native_oauth?: boolean;
 };
 
 function provider(
@@ -51,6 +52,7 @@ function provider(
     uses_cli_quota: flags.uses_cli_quota ?? false,
     uses_api_key_auth: flags.uses_api_key_auth ?? false,
     enabled: true,
+    native_oauth: flags.native_oauth ?? false,
   };
 }
 
@@ -80,12 +82,12 @@ function authFile(provider: string, index: number, email: string, activeInIde = 
 
 const providers: ProviderSummary[] = [
   provider("antigravity", "Antigravity", "o_auth", "F2682C", { uses_browser_auth: true }),
-  provider("codex", "Codex (OpenAI)", "o_auth", "111111", { uses_browser_auth: true }),
-  provider("copilot", "GitHub Copilot", "o_auth", "1F2328", { uses_browser_auth: true }),
-  provider("kiro", "Kiro (CodeWhisperer)", "o_auth", "6C4CF1", { uses_browser_auth: true }),
-  provider("gemini", "Gemini CLI", "cli", "4285F4", { uses_cli_quota: true }),
-  provider("claude", "Claude Code", "cli", "D97757", { uses_cli_quota: true }),
-  provider("qwen", "Qwen Code", "api_key", "615CED", { uses_api_key_auth: true }),
+  provider("codex", "Codex (OpenAI)", "o_auth", "111111", { uses_browser_auth: true, native_oauth: true }),
+  provider("copilot", "GitHub Copilot", "o_auth", "1F2328", { native_oauth: true }),
+  provider("kiro", "Kiro (CodeWhisperer)", "o_auth", "6C4CF1", { native_oauth: true }),
+  provider("gemini", "Gemini CLI", "o_auth", "4285F4", { uses_cli_quota: true, native_oauth: true }),
+  provider("claude", "Claude Code", "o_auth", "D97757", { uses_cli_quota: true, native_oauth: true }),
+  provider("qwen", "Qwen Code", "o_auth", "615CED", { native_oauth: true }),
   provider("iflow", "iFlow", "api_key", "2D7CF6", { uses_api_key_auth: true }),
   provider("vertex", "Vertex AI", "service_account", "34A853"),
 ];
@@ -362,6 +364,9 @@ export const mockAppState: AppState = {
     { value: "quotio-live-xxxxxxxx4C3C", masked_value: "quotio••••••4C3C", source: "local" },
     { value: "proxyp-live-xxxxxxxxocal", masked_value: "proxyp••••••ocal", source: "local" },
   ],
+  api_key_bindings: [
+    { api_key: "proxyp-live-xxxxxxxxocal", provider_id: "cp-1" },
+  ],
   request_stats: {
     total_requests: 0,
     successful_requests: 0,
@@ -429,6 +434,33 @@ const APP_STATE_COMMANDS = new Set<string>([
 ]);
 
 let mockState: AppState = mockAppState;
+
+type MockCustomProvider = {
+  id: string; name: string; base_url: string; api_key: string; kind: string;
+  prefix: string; default_model: string; models?: string[]; proxy_mode?: string;
+  keys: { id: string; label: string; api_key: string; enabled: boolean; weight: number }[];
+};
+
+function parseMockModels(raw: unknown): string[] {
+  if (typeof raw !== "string") return [];
+  return [...new Set(raw.split(/[,\s]+/).map((m) => m.trim()).filter(Boolean))];
+}
+
+let mockCustomProviders: MockCustomProvider[] = [
+  { id: "cp-1", name: "DeepSeek 代理", base_url: "https://proxy.deepseek.com/v1", api_key: "", kind: "openai", prefix: "", default_model: "deepseek-coder", keys: [
+    { id: "k1a", label: "主力", api_key: "sk-ds-main-xxx", enabled: true, weight: 2 },
+    { id: "k1b", label: "备用", api_key: "sk-ds-backup-xxx", enabled: true, weight: 1 },
+    { id: "k1c", label: "已过期", api_key: "sk-ds-expired-xxx", enabled: false, weight: 1 },
+  ]},
+  { id: "cp-2", name: "公司内部网关", base_url: "https://ai-gateway.internal.corp/api", api_key: "", kind: "openai", prefix: "", default_model: "gpt-4-turbo", keys: [
+    { id: "k2a", label: "默认", api_key: "gw-key-xxx", enabled: true, weight: 1 },
+  ]},
+  { id: "cp-3", name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", api_key: "", kind: "openai", prefix: "openrouter", default_model: "auto", keys: [] },
+];
+
+let mockBindings = [...(mockAppState.api_key_bindings ?? [])];
+let nextCpId = 4;
+let nextKeyId = 100;
 
 function stateWithSettings(settings: AppState["settings"]): AppState {
   const endpoint = `http://${settings.proxy_host}:${settings.proxy_port}`;
@@ -588,6 +620,71 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       return mockModelBreakdown() as unknown as T;
     case "query_account_auth_health":
       return mockAuthHealth() as unknown as T;
+    case "list_custom_providers":
+      return mockCustomProviders as unknown as T;
+    case "add_custom_provider": {
+      const cp: MockCustomProvider = {
+        id: `cp-${nextCpId++}`,
+        name: (args?.name as string) ?? "",
+        base_url: (args?.base_url as string) ?? "",
+        api_key: "",
+        kind: (args?.kind as string) ?? "openai",
+        prefix: (args?.prefix as string) ?? "",
+        default_model: "",
+        models: parseMockModels(args?.models),
+        proxy_mode: (args?.proxyMode as string) === "direct" ? "direct" : "",
+        keys: (args?.api_key as string)
+          ? [{ id: `k-${nextKeyId++}`, label: "默认", api_key: args!.api_key as string, enabled: true, weight: 1 }]
+          : [],
+      };
+      mockCustomProviders = [...mockCustomProviders, cp];
+      return mockCustomProviders as unknown as T;
+    }
+    case "update_custom_provider": {
+      mockCustomProviders = mockCustomProviders.map((p) =>
+        p.id === args?.id
+          ? { ...p, name: (args?.name as string) ?? p.name, base_url: (args?.base_url as string) ?? p.base_url, kind: (args?.kind as string) ?? p.kind, prefix: (args?.prefix as string) ?? p.prefix, models: args?.models !== undefined ? parseMockModels(args?.models) : p.models, proxy_mode: args?.proxyMode !== undefined ? ((args?.proxyMode as string) === "direct" ? "direct" : "") : p.proxy_mode }
+          : p,
+      );
+      return mockCustomProviders as unknown as T;
+    }
+    case "delete_custom_provider": {
+      mockCustomProviders = mockCustomProviders.filter((p) => p.id !== args?.id);
+      mockBindings = mockBindings.filter((b) => b.provider_id !== args?.id);
+      return mockCustomProviders as unknown as T;
+    }
+    case "add_provider_key": {
+      mockCustomProviders = mockCustomProviders.map((p) =>
+        p.id === args?.providerId
+          ? { ...p, keys: [...p.keys, { id: `k-${nextKeyId++}`, label: (args?.label as string) ?? "", api_key: (args?.apiKey as string) ?? "", enabled: true, weight: 1 }] }
+          : p,
+      );
+      return mockCustomProviders as unknown as T;
+    }
+    case "remove_provider_key": {
+      mockCustomProviders = mockCustomProviders.map((p) =>
+        p.id === args?.providerId ? { ...p, keys: p.keys.filter((k) => k.id !== args?.keyId) } : p,
+      );
+      return mockCustomProviders as unknown as T;
+    }
+    case "toggle_provider_key": {
+      mockCustomProviders = mockCustomProviders.map((p) =>
+        p.id === args?.providerId
+          ? { ...p, keys: p.keys.map((k) => (k.id === args?.keyId ? { ...k, enabled: !k.enabled } : k)) }
+          : p,
+      );
+      return mockCustomProviders as unknown as T;
+    }
+    case "get_api_key_bindings":
+      return mockBindings as unknown as T;
+    case "set_api_key_binding": {
+      const ak = args?.apiKey as string;
+      const pid = args?.providerId as string;
+      mockBindings = mockBindings.filter((b) => b.api_key !== ak);
+      if (pid) mockBindings.push({ api_key: ak, provider_id: pid });
+      mockState = { ...mockState, api_key_bindings: [...mockBindings] };
+      return mockBindings as unknown as T;
+    }
     case "get_model_prices":
     case "set_model_prices":
       return [] as unknown as T;
@@ -620,6 +717,31 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
     case "credential_status":
       return mockState.credentials as unknown as T;
     case "open_config_root":
+      return undefined as unknown as T;
+    case "start_management_oauth":
+      return {
+        url: "https://accounts.example.com/o/oauth2/auth?client_id=mock&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid+email&state=mock-state-token",
+        state: "mock-state-token",
+      } as unknown as T;
+    case "poll_management_oauth":
+      return { status: "pending" } as unknown as T;
+    case "submit_oauth_callback":
+      return undefined as unknown as T;
+    case "import_auth_token":
+      return undefined as unknown as T;
+    case "native_oauth_start":
+      return {
+        login_id: "mock-native-login-id",
+        auth_url: "https://example.com/oauth?mock=true",
+        user_code: "",
+        verification_uri: "",
+        provider_id: (args as Record<string, unknown>)?.providerId ?? "codex",
+        flow: "authorization_code",
+      } as unknown as T;
+    case "native_oauth_complete":
+      return { status: "pending", error: null, provider_id: "codex", account_email: null } as unknown as T;
+    case "native_oauth_cancel":
+    case "native_oauth_submit_callback":
       return undefined as unknown as T;
     case "consume_codex_reset_credit":
       // Dev-only: pretend the reset succeeded; the UI then re-fetches quotas.

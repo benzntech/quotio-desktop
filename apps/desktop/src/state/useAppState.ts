@@ -411,10 +411,8 @@ export function useAppState() {
   }
 
   async function startOAuth(endpoint: string, projectId: string | null, isWebui = false) {
-    const command = "start_management_oauth";
-    setManagementAction(command);
     try {
-      const response = await invoke<OAuthUrlResponse>(command, {
+      const response = await invoke<OAuthUrlResponse>("start_management_oauth", {
         endpoint,
         projectId: projectId && projectId.trim().length > 0 ? projectId.trim() : null,
         isWebui,
@@ -424,19 +422,13 @@ export function useAppState() {
     } catch (cause) {
       setError(errorMessage(cause));
       return null;
-    } finally {
-      setManagementAction(null);
     }
   }
 
   async function pollOAuth(token: string) {
-    const command = "poll_management_oauth";
-    setManagementAction(command);
     try {
-      const response = await invoke<OAuthStatusResponse>(command, { token });
+      const response = await invoke<OAuthStatusResponse>("poll_management_oauth", { token });
       setError(response.error);
-      // CLIProxyAPI's /get-auth-status reports success as "ok" (matching the
-      // macOS reference app); keep success/completed as tolerant fallbacks.
       if (response.status === "ok" || response.status === "success" || response.status === "completed") {
         const nextState = await invoke<AppState>("refresh_management_state");
         setAppState(nextState);
@@ -445,8 +437,6 @@ export function useAppState() {
     } catch (cause) {
       setError(errorMessage(cause));
       return null;
-    } finally {
-      setManagementAction(null);
     }
   }
 

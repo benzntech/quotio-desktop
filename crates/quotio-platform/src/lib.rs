@@ -126,6 +126,53 @@ pub fn proxy_resource_dir() -> PathBuf {
         .join(relative)
 }
 
+/// Bundled-resource dir for the kiro-rs sidecar binary. Kept SEPARATE from
+/// [`proxy_resource_dir`] on purpose: the proxy-core resolver treats any `.exe`
+/// in its resource dir as the core and would otherwise copy kiro-rs over
+/// CLIProxyAPI. Derived as a `resources/kiro/<platform>` sibling of the proxy
+/// resource root so it reuses the Tauri-configured root without extra setup.
+pub fn kiro_resource_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("QUOTIO_KIRO_RESOURCE_DIR") {
+        return PathBuf::from(path);
+    }
+
+    let platform = current_proxy_platform();
+
+    if let Some(root) = configured_proxy_resource_root() {
+        // root = <Resource>/resources/proxy → sibling <Resource>/resources/kiro.
+        let base = root.parent().map(|parent| parent.to_path_buf()).unwrap_or(root);
+        return base.join("kiro").join(platform);
+    }
+
+    let relative = PathBuf::from("resources").join("kiro").join(platform);
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        for base in current_dir.ancestors() {
+            let candidate = base.join(&relative);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            for base in exe_dir.ancestors().take(4) {
+                let candidate = base.join(&relative);
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(relative)
+}
+
 pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

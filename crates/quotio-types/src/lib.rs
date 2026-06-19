@@ -341,6 +341,9 @@ pub struct ProviderSummary {
     pub uses_cli_quota: bool,
     pub uses_api_key_auth: bool,
     pub enabled: bool,
+    /// When true, this provider supports native OAuth login (no proxy dependency).
+    #[serde(default)]
+    pub native_oauth: bool,
 }
 
 /// One 10-minute bucket of an account's recent request outcomes, surfaced by the
@@ -452,6 +455,12 @@ pub struct ApiKeyEntry {
     pub value: String,
     pub masked_value: String,
     pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiKeyBinding {
+    pub api_key: String,
+    pub provider_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1330,18 +1339,33 @@ impl Default for ManagementSnapshot {
     }
 }
 
+/// 单个服务商的调度状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ProviderSchedulerEntry {
+    pub provider_id: String,
+    /// 当前选中账号的展示名（email）。
+    pub target_label: Option<String>,
+    /// 当前选中账号额度的刷新时间（unix 秒）。
+    pub target_reset_at_unix: Option<i64>,
+    /// 被调度临时禁用（待命）的账号数。
+    pub standby_count: u32,
+}
+
 /// 智能账号调度的当前状态（给前端展示）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct SchedulerStatus {
     /// 生效规则："off" 或 "reset_soonest"。
     pub rule: String,
-    /// 当前选中账号的展示名（email）。
+    /// 当前选中账号的展示名（email）——向后兼容，取第一个服务商的。
     pub target_label: Option<String>,
-    /// 当前选中账号 5h 窗口的刷新时间（unix 秒）。
+    /// 当前选中账号额度的刷新时间（unix 秒）——向后兼容。
     pub target_reset_at_unix: Option<i64>,
-    /// 被调度临时禁用（待命）的账号数。
+    /// 被调度临时禁用（待命）的账号数——向后兼容，全服务商总和。
     pub standby_count: u32,
+    /// 每个服务商的独立调度状态。
+    pub providers: Vec<ProviderSchedulerEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1358,6 +1382,8 @@ pub struct AppState {
     pub logs: Vec<RequestLogEntry>,
     pub agents: Vec<AgentStatus>,
     pub api_keys: Vec<ApiKeyEntry>,
+    #[serde(default)]
+    pub api_key_bindings: Vec<ApiKeyBinding>,
     pub request_stats: Option<RequestStats>,
     pub fallback: FallbackConfiguration,
     pub fallback_runtime: FallbackRuntimeState,
@@ -1384,6 +1410,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             true,
             false,
+            true,
         ),
         provider(
             "claude",
@@ -1398,6 +1425,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             true,
             false,
+            true,
         ),
         provider(
             "codex",
@@ -1412,6 +1440,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             true,
             false,
+            true,
         ),
         provider(
             "qwen",
@@ -1426,6 +1455,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             false,
             false,
+            true,
         ),
         provider(
             "iflow",
@@ -1437,6 +1467,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             Some("/iflow-auth-url"),
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1454,6 +1485,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             false,
             false,
+            false,
         ),
         provider(
             "vertex",
@@ -1468,11 +1500,12 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             false,
             false,
+            false,
         ),
         provider(
             "kiro",
             "Kiro",
-            AuthMethod::Cli,
+            AuthMethod::OAuth,
             ProviderRole::Provider,
             "kiro",
             "9046FF",
@@ -1482,11 +1515,12 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             false,
             false,
+            true,
         ),
         provider(
             "github-copilot",
             "GitHub Copilot",
-            AuthMethod::Cli,
+            AuthMethod::OAuth,
             ProviderRole::Provider,
             "copilot",
             "238636",
@@ -1496,6 +1530,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             false,
             false,
+            true,
         ),
         provider(
             "cursor",
@@ -1508,6 +1543,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             true,
             false,
             true,
+            false,
             false,
             false,
         ),
@@ -1524,6 +1560,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             true,
             false,
             false,
+            false,
         ),
         provider(
             "glm",
@@ -1538,6 +1575,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             false,
             true,
+            false,
         ),
         provider(
             "warp",
@@ -1552,6 +1590,7 @@ pub fn default_providers() -> Vec<ProviderSummary> {
             false,
             false,
             true,
+            false,
         ),
     ]
 }
@@ -1569,6 +1608,7 @@ fn provider(
     uses_browser_auth: bool,
     uses_cli_quota: bool,
     uses_api_key_auth: bool,
+    native_oauth: bool,
 ) -> ProviderSummary {
     ProviderSummary {
         id: id.to_string(),
@@ -1584,6 +1624,7 @@ fn provider(
         uses_cli_quota,
         uses_api_key_auth,
         enabled: true,
+        native_oauth,
     }
 }
 

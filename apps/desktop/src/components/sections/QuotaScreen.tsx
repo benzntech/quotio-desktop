@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { AccountQuota, AppSettings, AppState, AuthFile, ProviderSummary, QuotaModelUsage } from "../../types";
 import { maskEmail, quotaTone, parsePlan, parseResetCredits, planTier, matchAuthFile } from "../../lib/format";
 import { RefreshIcon } from "../icons";
@@ -6,6 +6,13 @@ import { HealthDots } from "../HealthDots";
 import { Switch } from "../Switch";
 import { useT } from "../../i18n";
 import { invoke } from "../../lib/tauri";
+
+type CustomProviderBrief = {
+  id: string;
+  name: string;
+  kind: string;
+  keys: { id: string; label: string; api_key: string; enabled: boolean; weight: number }[];
+};
 
 type QuotaScreenProps = {
   appState: AppState;
@@ -28,12 +35,15 @@ type QuotaGroup = {
 export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSettings }: QuotaScreenProps) {
   const t = useT();
   const groups = useMemo(() => buildGroups(appState.quotas, appState.providers), [appState.quotas, appState.providers]);
-  // Same source as Providers/gating (management.auth_files carries the live
-  // disabled / recent_requests / scheduler flags); top-level auth_files is the
-  // thinner backfill, so the health dots + standby/login-only pills would go stale.
   const authFiles = appState.management.auth_files ?? appState.auth_files ?? [];
+  const [customProviders, setCustomProviders] = useState<CustomProviderBrief[]>([]);
+  useEffect(() => {
+    void invoke<CustomProviderBrief[]>("list_custom_providers").then(setCustomProviders).catch(() => {});
+  }, []);
+
   const [activeId, setActiveId] = useState<string | null>(null);
   const active = groups.find((group) => group.id === activeId) ?? groups[0] ?? null;
+  const activeCustom = customProviders.find((cp) => `cp:${cp.id}` === activeId) ?? null;
   // Heuristic proxy-unreachable hint: a refresh finished but every account came
   // back blank (no quota, not exhausted, not auth-failed) — almost always the
   // upstream proxy being wrong/down rather than a real per-account state.
@@ -60,7 +70,7 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
         </button>
       </header>
 
-      <SchedulerCard appState={appState} onSaveSettings={onSaveSettings} />
+      <SchedulerCard appState={appState} onSaveSettings={onSaveSettings} activeProviderId={active?.id ?? null} />
 
       {proxyUnreachable ? (
         <div className="state-banner state-banner--warn">
@@ -69,7 +79,7 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
         </div>
       ) : null}
 
-      {groups.length === 0 ? (
+      {groups.length === 0 && customProviders.length === 0 ? (
         <div className="state-banner state-banner--warn">
           <strong>{t("quota.empty.title")}</strong>
           <p>{t("quota.empty.desc")}</p>
@@ -78,7 +88,7 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
         <>
           <div className="quota-tabs" role="tablist">
             {groups.map((group) => {
-              const isActive = active?.id === group.id;
+              const isActive = active?.id === group.id && !activeCustom;
               return (
                 <button
                   key={group.id}
@@ -95,8 +105,32 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
                 </button>
               );
             })}
+            {customProviders.map((cp) => {
+              const tabId = `cp:${cp.id}`;
+              const isActive = activeId === tabId;
+              const color = cp.kind === "gemini" ? "#4285F4" : cp.kind === "claude" ? "#D97757" : "#10a37f";
+              const enabledCount = cp.keys.filter((k) => k.enabled).length;
+              return (
+                <button
+                  key={tabId}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  className={isActive ? "quota-tab quota-tab--active" : "quota-tab"}
+                  style={isActive ? { borderColor: `${color}59`, background: `${color}14` } : undefined}
+                  onClick={() => setActiveId(tabId)}
+                >
+                  <span className="quota-tab-dot" style={{ backgroundColor: color }} />
+                  <span className="quota-tab-name">{cp.name}</span>
+                  <span className="quota-tab-count">{enabledCount}/{cp.keys.length}</span>
+                </button>
+              );
+            })}
           </div>
 
+          {activeCustom ? (
+            <CustomProviderKeyPool provider={activeCustom} />
+          ) : (
           <div className="quota-accounts">
             {active?.accounts.map((account) => (
               <AccountQuotaCard
@@ -107,24 +141,37 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
               />
             ))}
           </div>
+          )}
         </>
       )}
     </section>
   );
 }
 
-/// 智能调度卡片:开关 + 当前选号状态。规则「临近刷新优先」——只让 5h 窗口
-/// 最快刷新的 Codex 账号进代理池,其余临时待命,窗口到点自动换号。
+/// 智能调度卡片:开关 + 当前选号状态。覆盖所有服务商。
 function SchedulerCard({
   appState,
   onSaveSettings,
+  activeProviderId,
 }: {
   appState: AppState;
   onSaveSettings: (settings: AppSettings) => void;
+  activeProviderId: string | null;
 }) {
   const t = useT();
   const scheduler = appState.scheduler;
   const schedulerOn = (appState.settings.scheduler_rule || "off") !== "off";
+
+  const providerEntry = useMemo(() => {
+    if (!activeProviderId || !scheduler?.providers) return null;
+    return scheduler.providers.find((e) => e.provider_id === activeProviderId) ?? null;
+  }, [activeProviderId, scheduler?.providers]);
+
+  const providerLabel = useMemo(() => {
+    if (!activeProviderId) return "";
+    const p = appState.providers.find((p) => p.id === activeProviderId);
+    return p?.display_name ?? activeProviderId;
+  }, [activeProviderId, appState.providers]);
 
   function toggleScheduler() {
     onSaveSettings({
@@ -134,10 +181,10 @@ function SchedulerCard({
     });
   }
 
-  // 5h 窗口刷新倒计时(给人看的粗粒度文本)。
   let resetText: string | null = null;
-  if (scheduler?.target_reset_at_unix) {
-    const secs = scheduler.target_reset_at_unix - Math.floor(Date.now() / 1000);
+  const resetAtUnix = providerEntry?.target_reset_at_unix ?? scheduler?.target_reset_at_unix;
+  if (resetAtUnix) {
+    const secs = resetAtUnix - Math.floor(Date.now() / 1000);
     if (secs > 0) {
       const hours = Math.floor(secs / 3600);
       const minutes = Math.max(1, Math.floor((secs % 3600) / 60));
@@ -145,30 +192,40 @@ function SchedulerCard({
     }
   }
 
+  const activeLabel = providerEntry?.target_label ?? scheduler?.target_label;
+  const activeStandby = providerEntry?.standby_count ?? scheduler?.standby_count ?? 0;
+  const totalScheduled = scheduler?.providers?.length ?? 0;
+
   let statusText: string;
   if (!schedulerOn) {
     statusText = t(
       "quota.scheduler.descOff",
-      "开启后只让「5h 窗口最快刷新」的 Codex 账号进代理池,其余临时待命;窗口到点自动换号,余量不浪费。",
+      "开启后只让「额度最快刷新」的账号进代理池,其余临时待命;到点自动换号,余量不浪费。",
     );
-  } else if (scheduler?.target_label) {
+  } else if (activeLabel) {
     const windowText = resetText
-      ? t("quota.scheduler.resetIn", "5h 窗口 {time} 后刷新").replace("{time}", resetText)
-      : t("quota.scheduler.idleWindow", "闲置窗口(使用后开新 5h 窗口)");
+      ? t("quota.scheduler.resetIn", "{time} 后刷新").replace("{time}", resetText)
+      : t("quota.scheduler.idleWindow", "闲置窗口(使用后开新窗口)");
     const standby = t("quota.scheduler.standby", "待命 {count} 个").replace(
       "{count}",
-      String(scheduler.standby_count),
+      String(activeStandby),
     );
-    statusText = `${t("quota.scheduler.current", "当前选中")}:${scheduler.target_label} · ${windowText} · ${standby}`;
+    statusText = `${t("quota.scheduler.current", "当前选中")}:${activeLabel} · ${windowText} · ${standby}`;
+  } else if (totalScheduled > 0) {
+    statusText = t("quota.scheduler.noProviderMatch", "此服务商账号不足 2 个,无需调度。");
   } else {
     statusText = t("quota.scheduler.pending", "已开启,等待下一次额度刷新后选号(可点右上角立即刷新)。");
   }
+
+  const tagText = schedulerOn && totalScheduled > 0
+    ? t("quota.scheduler.rule", "临近刷新优先") + (providerEntry ? ` · ${providerLabel}` : ` · ${totalScheduled} 个服务商`)
+    : t("quota.scheduler.ruleGeneric", "临近刷新优先");
 
   return (
     <div className="scheduler-block">
       <div className="scheduler-head">
         <strong>{t("quota.scheduler.title", "智能调度")}</strong>
-        <span className="scheduler-tag">{t("quota.scheduler.rule", "临近刷新优先 · 仅 Codex")}</span>
+        <span className="scheduler-tag">{tagText}</span>
         <div className="scheduler-switch">
           <Switch on={schedulerOn} onChange={toggleScheduler} label="scheduler" />
         </div>
@@ -354,6 +411,47 @@ function ModelQuotaRow({ model }: { model: QuotaModelUsage }) {
       </div>
       <div className="quota-bar">
         <div className={`quota-bar-fill quota-bar-fill--${tone}`} style={{ width: `${Math.max(0, Math.min(100, model.remaining_percent))}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function CustomProviderKeyPool({ provider }: { provider: CustomProviderBrief }) {
+  const enabledKeys = provider.keys.filter((k) => k.enabled);
+  const disabledKeys = provider.keys.filter((k) => !k.enabled);
+  function maskKey(key: string): string {
+    if (key.length <= 8) return "****";
+    return key.slice(0, 4) + "****" + key.slice(-4);
+  }
+  return (
+    <div className="quota-accounts">
+      <div className="panel cp-quota-panel">
+        <div className="panel-label">
+          <span className="eyebrow">{provider.name}</span>
+          <span className="count-pill">{enabledKeys.length}/{provider.keys.length} 启用</span>
+        </div>
+        {provider.keys.length === 0 ? (
+          <p className="empty-copy">该服务商暂无密钥。前往「服务商」页面添加。</p>
+        ) : (
+          <div className="cp-quota-key-list">
+            {enabledKeys.map((k) => (
+              <div className="cp-quota-key-row" key={k.id}>
+                <span className="cp-key-dot cp-key-dot--on" />
+                <span className="cp-quota-key-label">{k.label || "未命名"}</span>
+                <code className="cp-quota-key-value">{maskKey(k.api_key)}</code>
+                {k.weight !== 1 ? <span className="cp-quota-key-weight">权重 {k.weight}</span> : null}
+              </div>
+            ))}
+            {disabledKeys.map((k) => (
+              <div className="cp-quota-key-row cp-quota-key-row--disabled" key={k.id}>
+                <span className="cp-key-dot" />
+                <span className="cp-quota-key-label">{k.label || "未命名"}</span>
+                <code className="cp-quota-key-value">{maskKey(k.api_key)}</code>
+                <span className="cp-quota-key-badge">已禁用</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

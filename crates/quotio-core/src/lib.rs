@@ -3,7 +3,9 @@ pub mod agents;
 pub mod bridge;
 pub mod codex_launch;
 pub mod codex_session_visibility;
+pub mod kiro_sidecar;
 pub mod management;
+pub mod native_oauth;
 pub mod proxy_download;
 pub mod quota;
 pub mod scheduler;
@@ -25,7 +27,7 @@ use management::{ManagementApiClient, ManagementApiError};
 use quotio_types::{
     default_available_models, default_providers, mask_secret, AccountAuthHealth, AccountQuota,
     AccountSummaryRow, AgentBackupFile, AgentConfigMode, AgentConfigStorageOption,
-    AgentConfigurationRequest, AgentConfigurationResult, AgentSetupMode, ApiKeyEntry, AppSettings,
+    AgentConfigurationRequest, AgentConfigurationResult, AgentSetupMode, ApiKeyBinding, ApiKeyEntry, AppSettings,
     AppState, AuthFile, AvailableModel, ConnectionMode, CredentialStatus, FallbackConfigAction,
     FallbackConfiguration, FallbackEntry, FallbackEntryMoveDirection, FallbackRouteState,
     FallbackRuntimeState, ManagementSnapshot, MigrationPhase, ModelPrice, ModelSlot, PlatformInfo,
@@ -100,14 +102,16 @@ pub struct AppCore {
     /// 会话代数：每次启动 +1。监控的进程探测在锁外执行，
     /// 写回结果时校验代数，期间停止/重启过就丢弃这次探测。
     codex_session_generation: u64,
-    /// 智能调度当前选中的账号（auth 文件名, 选中时刻——最小保持时间从这里算）。
-    scheduler_current: Option<(String, Instant)>,
-    /// 当前选中账号的展示名 / 5h 窗口刷新时间 / 待命数（给状态快照与提前触发用）。
-    scheduler_target_label: Option<String>,
-    scheduler_current_reset_at: Option<i64>,
-    scheduler_standby_count: u32,
-    /// 上次因目标账号请求失败而触发重查的时刻（60s 冷却，防失败风暴反复全量拉配额）。
-    scheduler_failure_recheck_at: Option<Instant>,
+    /// 每个服务商的调度状态。
+    schedulers: std::collections::HashMap<String, ProviderSchedulerState>,
+}
+
+struct ProviderSchedulerState {
+    current: Option<(String, Instant)>,
+    target_label: Option<String>,
+    current_reset_at: Option<i64>,
+    standby_count: u32,
+    failure_recheck_at: Option<Instant>,
 }
 
 /// Codex 监控的进程探测目标。由 [`AppCore::codex_monitor_probe`] 在锁内产出，
@@ -159,11 +163,7 @@ impl Default for AppCore {
             credential_error,
             codex_session: None,
             codex_session_generation: 0,
-            scheduler_current: None,
-            scheduler_target_label: None,
-            scheduler_current_reset_at: None,
-            scheduler_standby_count: 0,
-            scheduler_failure_recheck_at: None,
+            schedulers: std::collections::HashMap::new(),
         }
     }
 }
@@ -268,6 +268,10 @@ impl AppCore {
         thread::sleep(Duration::from_millis(250));
         self.proxy.start(&self.settings)?;
         Ok(self.app_state())
+    }
+
+    pub fn rewrite_proxy_config(&self) {
+        let _ = self.proxy.write_config(&self.settings);
     }
 
     pub fn proxy_managed_binary_path(&self) -> PathBuf {
@@ -470,54 +474,71 @@ impl AppCore {
         let dir = quotio_platform::proxy_auth_dir();
         if self.settings.scheduler_rule != "reset_soonest" {
             let changed = scheduler::release_all_in(&dir);
-            self.scheduler_clear();
+            self.schedulers.clear();
             return changed;
         }
 
-        let pool = scheduler::read_pool(&dir);
+        let providers = scheduler::discover_schedulable_providers(&dir);
         let now_unix = now_unix_seconds() as i64;
-        let candidates = scheduler::build_candidates(&pool, &self.quotas, now_unix);
-        let current = self
-            .scheduler_current
-            .as_ref()
-            .map(|(file, since)| (file.as_str(), since.elapsed()));
         let min_hold = Duration::from_secs(self.settings.scheduler_min_hold_minutes as u64 * 60);
         let margin = self.settings.scheduler_switch_margin_minutes as i64 * 60;
+        let mut any_changed = false;
 
-        let Some(target) = scheduler::pick_target(&candidates, current, min_hold, margin) else {
-            // 没有任何可用账号：fail-open，恢复全池，退回代理默认策略。
-            let changed = scheduler::release_all_in(&dir);
-            self.scheduler_clear();
-            return changed;
-        };
+        // 清理已不存在的服务商。
+        self.schedulers.retain(|pid, _| providers.contains(pid));
 
-        let target_changed = self
-            .scheduler_current
-            .as_ref()
-            .map(|(file, _)| file != &target)
-            .unwrap_or(true);
-        if target_changed {
-            self.scheduler_current = Some((target.clone(), Instant::now()));
+        for provider_id in &providers {
+            let pool = scheduler::read_pool_for_provider(&dir, provider_id);
+            let candidates = scheduler::build_candidates(&pool, &self.quotas, now_unix, provider_id);
+
+            let state = self
+                .schedulers
+                .entry(provider_id.clone())
+                .or_insert_with(|| ProviderSchedulerState {
+                    current: None,
+                    target_label: None,
+                    current_reset_at: None,
+                    standby_count: 0,
+                    failure_recheck_at: None,
+                });
+
+            let current = state
+                .current
+                .as_ref()
+                .map(|(file, since)| (file.as_str(), since.elapsed()));
+
+            let Some(target) = scheduler::pick_target(&candidates, current, min_hold, margin)
+            else {
+                let changed = scheduler::release_provider_in(&dir, provider_id);
+                state.current = None;
+                state.target_label = None;
+                state.current_reset_at = None;
+                state.standby_count = 0;
+                any_changed |= changed;
+                continue;
+            };
+
+            let target_changed = state
+                .current
+                .as_ref()
+                .map(|(file, _)| file != &target)
+                .unwrap_or(true);
+            if target_changed {
+                state.current = Some((target.clone(), Instant::now()));
+            }
+            let (pool_changed, standby_count) = scheduler::apply_target_in(&dir, &pool, &target);
+
+            let picked = candidates.iter().find(|c| c.file_name == target);
+            state.target_label = picked.map(|c| c.label.clone());
+            state.current_reset_at = picked.and_then(|c| c.session_reset_at);
+            state.standby_count = standby_count;
+            any_changed |= target_changed || pool_changed;
         }
-        let (pool_changed, standby_count) = scheduler::apply_target_in(&dir, &pool, &target);
-
-        let picked = candidates.iter().find(|c| c.file_name == target);
-        self.scheduler_target_label = picked.map(|c| c.label.clone());
-        self.scheduler_current_reset_at = picked.and_then(|c| c.session_reset_at);
-        self.scheduler_standby_count = standby_count;
-        target_changed || pool_changed
+        any_changed
     }
 
-    fn scheduler_clear(&mut self) {
-        self.scheduler_current = None;
-        self.scheduler_target_label = None;
-        self.scheduler_current_reset_at = None;
-        self.scheduler_standby_count = 0;
-    }
-
-    /// 用量事件里出现了**当前目标账号**的失败请求（典型是 5h 额度耗尽后的 429）：
-    /// 返回 true 表示该立刻重拉配额重选，别等下一次 5 分钟轮询——期间池子里
-    /// 只有这个空号。带 60 秒冷却，连续失败风暴不会反复全量拉配额。纯内存判断。
+    /// 用量事件里出现了**当前目标账号**的失败请求：
+    /// 返回 true 表示该立刻重拉配额重选。带 60 秒冷却。
     pub fn scheduler_should_recheck_for_failures(
         &mut self,
         events: &[quotio_types::UsageEvent],
@@ -525,42 +546,62 @@ impl AppCore {
         if self.settings.scheduler_rule != "reset_soonest" {
             return false;
         }
-        let Some(label) = self.scheduler_target_label.as_deref() else {
-            return false;
-        };
-        let target_failed = events
-            .iter()
-            .any(|event| event.failed && event.source.as_deref() == Some(label));
-        if !target_failed {
-            return false;
-        }
-        if let Some(last) = self.scheduler_failure_recheck_at {
-            if last.elapsed() < Duration::from_secs(60) {
-                return false;
+        let mut should_recheck = false;
+        for state in self.schedulers.values_mut() {
+            let Some(label) = state.target_label.as_deref() else {
+                continue;
+            };
+            let target_failed = events
+                .iter()
+                .any(|event| event.failed && event.source.as_deref() == Some(label));
+            if !target_failed {
+                continue;
             }
+            if let Some(last) = state.failure_recheck_at {
+                if last.elapsed() < Duration::from_secs(60) {
+                    continue;
+                }
+            }
+            state.failure_recheck_at = Some(Instant::now());
+            should_recheck = true;
         }
-        self.scheduler_failure_recheck_at = Some(Instant::now());
-        true
+        should_recheck
     }
 
-    /// 当前选中账号的 5h 窗口是否已刷新（后台线程用：到点提前触发重评估，
-    /// 不必干等下一次 5 分钟配额轮询）。纯内存判断。
+    /// 任一服务商的选中账号额度是否已刷新（后台线程用：到点提前触发重评估）。
     pub fn scheduler_reset_due(&self) -> bool {
-        self.settings.scheduler_rule == "reset_soonest"
-            && self.scheduler_current.is_some()
-            && self
-                .scheduler_current_reset_at
-                .map(|reset| reset <= now_unix_seconds() as i64)
-                .unwrap_or(false)
+        if self.settings.scheduler_rule != "reset_soonest" {
+            return false;
+        }
+        let now = now_unix_seconds() as i64;
+        self.schedulers.values().any(|state| {
+            state.current.is_some()
+                && state
+                    .current_reset_at
+                    .map(|reset| reset <= now)
+                    .unwrap_or(false)
+        })
     }
 
     /// 调度状态快照（给前端展示）。
     fn scheduler_status(&self) -> quotio_types::SchedulerStatus {
+        let entries: Vec<quotio_types::ProviderSchedulerEntry> = self
+            .schedulers
+            .iter()
+            .map(|(pid, state)| quotio_types::ProviderSchedulerEntry {
+                provider_id: pid.clone(),
+                target_label: state.target_label.clone(),
+                target_reset_at_unix: state.current_reset_at,
+                standby_count: state.standby_count,
+            })
+            .collect();
+        let first = entries.first();
         quotio_types::SchedulerStatus {
             rule: self.settings.scheduler_rule.clone(),
-            target_label: self.scheduler_target_label.clone(),
-            target_reset_at_unix: self.scheduler_current_reset_at,
-            standby_count: self.scheduler_standby_count,
+            target_label: first.and_then(|e| e.target_label.clone()),
+            target_reset_at_unix: first.and_then(|e| e.target_reset_at_unix),
+            standby_count: entries.iter().map(|e| e.standby_count).sum(),
+            providers: entries,
         }
     }
 
@@ -575,19 +616,100 @@ impl AppCore {
         if !base.to_ascii_lowercase().ends_with(".json") {
             return Err("仅支持 .json 账号文件".to_string());
         }
-        serde_json::from_str::<serde_json::Value>(content)
+        let parsed: serde_json::Value = serde_json::from_str(content)
             .map_err(|_| "文件内容不是有效的 JSON".to_string())?;
         let dir = quotio_platform::proxy_auth_dir();
         std::fs::create_dir_all(&dir).map_err(|error| format!("创建 auth 目录失败：{}", error))?;
-        let target = dir.join(base);
 
-        std::fs::write(&target, content).map_err(|error| format!("写入账号文件失败：{}", error))?;
-        // De-duplicate by account identity (account_id, then email — robust to any
-        // file format, not just the flat CPA one). The just-written file is newest,
-        // so this keeps it and removes stale same-account files instead of leaving
-        // a duplicate in the routing pool; never touches the bound-login account.
+        // If the file is a JSON array (e.g. cpa-manager batch export), unpack
+        // each element into its own auth file with a proper provider-email name.
+        if let Some(arr) = parsed.as_array() {
+            if arr.is_empty() {
+                return Err("导入文件为空数组".to_string());
+            }
+            for item in arr {
+                if !item.is_object() {
+                    continue;
+                }
+                self.write_single_auth_import(&dir, item, base);
+            }
+        } else if parsed.is_object() {
+            self.write_single_auth_import(&dir, &parsed, base);
+        } else {
+            return Err("JSON 内容必须是对象或数组".to_string());
+        }
+
         dedup_codex_auth_keep_newest(&dir, &self.settings.codex_bound_account);
         Ok(self.app_state())
+    }
+
+    fn write_single_auth_import(
+        &self,
+        dir: &std::path::Path,
+        item: &serde_json::Value,
+        original_filename: &str,
+    ) {
+        let obj = match item.as_object() {
+            Some(o) => o,
+            None => return,
+        };
+
+        // Determine provider type from the object or filename.
+        let provider = obj
+            .get("type")
+            .or_else(|| obj.get("provider"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                // Guess from the "id" field: "kiro_xxx" → "kiro", "codex_xxx" → "codex"
+                obj.get("id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| id.split('_').next())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                // Last resort: filename prefix before first _ or -
+                let stem = original_filename.trim_end_matches(".json").trim_end_matches(".JSON");
+                stem.split(|c: char| c == '_' || c == '-')
+                    .next()
+                    .unwrap_or(stem)
+                    .to_string()
+            });
+
+        let email = obj
+            .get("email")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        // Build a clean auth object with `type` always set.
+        let mut output = item.clone();
+        if let Some(out_obj) = output.as_object_mut() {
+            out_obj
+                .entry("type".to_string())
+                .or_insert_with(|| serde_json::Value::String(provider.clone()));
+        }
+
+        let email_part = email
+            .map(|e| {
+                e.chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '@' || c == '.' || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let target_name = format!("{}-{}.json", provider, email_part);
+        let target = dir.join(&target_name);
+
+        if let Ok(json) = serde_json::to_string_pretty(&output) {
+            let _ = std::fs::write(&target, json);
+        }
     }
 
     /// De-duplicate codex auth files by account identity (keep bound / newest),
@@ -929,6 +1051,7 @@ impl AppCore {
             logs: self.usage_store.recent_events(500),
             agents: agents::detect_agents(),
             api_keys: api_key_entries(&get_api_keys()),
+            api_key_bindings: get_api_key_bindings(),
             request_stats: request_stats_from_management(&self.management_snapshot),
             fallback: self.fallback.clone(),
             fallback_runtime: self.fallback_runtime.clone(),
@@ -1061,6 +1184,48 @@ pub fn update_api_key(old: &str, replacement: String) -> Result<Vec<String>, Str
     }
     save_api_keys(&keys)?;
     Ok(keys)
+}
+
+// ── API Key → Provider binding ──────────────────────────────────────────
+
+fn api_key_bindings_path() -> PathBuf {
+    quotio_platform::app_config_dir().join("api-key-bindings.json")
+}
+
+pub fn get_api_key_bindings() -> Vec<ApiKeyBinding> {
+    std::fs::read_to_string(api_key_bindings_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_api_key_bindings(bindings: &[ApiKeyBinding]) -> Result<(), String> {
+    let path = api_key_bindings_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string_pretty(bindings).map_err(|e| e.to_string())?;
+    std::fs::write(&path, body).map_err(|e| e.to_string())
+}
+
+pub fn set_api_key_binding(api_key: String, provider_id: String) -> Result<Vec<ApiKeyBinding>, String> {
+    let mut bindings = get_api_key_bindings();
+    bindings.retain(|b| b.api_key != api_key);
+    if !provider_id.is_empty() {
+        bindings.push(ApiKeyBinding {
+            api_key,
+            provider_id,
+        });
+    }
+    save_api_key_bindings(&bindings)?;
+    Ok(bindings)
+}
+
+pub fn remove_api_key_binding(api_key: &str) -> Result<Vec<ApiKeyBinding>, String> {
+    let mut bindings = get_api_key_bindings();
+    bindings.retain(|b| b.api_key != api_key);
+    save_api_key_bindings(&bindings)?;
+    Ok(bindings)
 }
 
 fn load_or_create_local_management_key() -> (String, Option<String>) {
@@ -1660,16 +1825,73 @@ fn enrich_auth_files_with_local_markers(files: &mut [AuthFile], local_accounts: 
     }
 }
 
+/// A single API key inside a custom provider's key pool.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProviderKey {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    pub api_key: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_true() -> bool { true }
+fn default_weight() -> u32 { 1 }
+
 /// A user-defined third-party provider (OpenAI/Gemini-compatible endpoint).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CustomProvider {
     pub id: String,
     pub name: String,
     pub base_url: String,
+    /// Legacy single key — kept for backward compat. On load, migrated to `keys`.
+    #[serde(default)]
     pub api_key: String,
     pub kind: String,
     #[serde(default)]
     pub prefix: String,
+    /// Key pool. If empty on load but `api_key` is set, auto-migrated.
+    #[serde(default)]
+    pub keys: Vec<ProviderKey>,
+    #[serde(default)]
+    pub default_model: String,
+    /// Models this provider serves. REQUIRED for routing: CLIProxyAPI registers
+    /// zero models for an api-key provider with an empty list, making it
+    /// unroutable (no candidate for any model request). User-entered.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// How this provider reaches its upstream. "" / "inherit" → use the global
+    /// proxy-url (settings proxy). "direct" → bypass it (emits per-entry
+    /// `proxy-url: 'direct'`, CLIProxyAPI ModeDirect). Lets a domestic interface
+    /// (e.g. anyrouter) go direct while OpenAI/Anthropic still use the proxy.
+    #[serde(default)]
+    pub proxy_mode: String,
+}
+
+/// Parse a user-entered model list (comma / whitespace / newline separated) into
+/// a trimmed, deduped Vec. Model ids never contain whitespace, so splitting on
+/// any of those separators is safe.
+fn parse_model_list(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for token in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        let m = token.trim();
+        if !m.is_empty() && !out.iter().any(|existing| existing == m) {
+            out.push(m.to_string());
+        }
+    }
+    out
+}
+
+/// Normalize the per-provider connection mode. "direct"/"none" → "direct"
+/// (bypass the global proxy); anything else → "" (inherit the global proxy).
+fn normalize_proxy_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "direct" | "none" => "direct".to_string(),
+        _ => String::new(),
+    }
 }
 
 fn custom_providers_path() -> PathBuf {
@@ -1677,10 +1899,29 @@ fn custom_providers_path() -> PathBuf {
 }
 
 pub fn list_custom_providers() -> Vec<CustomProvider> {
-    std::fs::read_to_string(custom_providers_path())
+    let mut list: Vec<CustomProvider> = std::fs::read_to_string(custom_providers_path())
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Migrate legacy single api_key → keys pool.
+    let mut migrated = false;
+    for provider in &mut list {
+        if provider.keys.is_empty() && !provider.api_key.is_empty() {
+            provider.keys.push(ProviderKey {
+                id: Uuid::new_v4().to_string(),
+                label: "默认".to_string(),
+                api_key: provider.api_key.clone(),
+                enabled: true,
+                weight: 1,
+            });
+            provider.api_key.clear();
+            migrated = true;
+        }
+    }
+    if migrated {
+        let _ = save_custom_providers(&list);
+    }
+    list
 }
 
 fn save_custom_providers(list: &[CustomProvider]) -> Result<(), String> {
@@ -1699,6 +1940,8 @@ pub fn add_custom_provider(
     api_key: String,
     kind: String,
     prefix: String,
+    models: String,
+    proxy_mode: String,
 ) -> Result<Vec<CustomProvider>, String> {
     let name = name.trim();
     let base_url = base_url.trim();
@@ -1706,18 +1949,34 @@ pub fn add_custom_provider(
         return Err("名称和 Base URL 必填。".to_string());
     }
     let kind = kind.trim();
+    let trimmed_key = api_key.trim();
+    let keys = if trimmed_key.is_empty() {
+        vec![]
+    } else {
+        vec![ProviderKey {
+            id: Uuid::new_v4().to_string(),
+            label: "默认".to_string(),
+            api_key: trimmed_key.to_string(),
+            enabled: true,
+            weight: 1,
+        }]
+    };
     let mut list = list_custom_providers();
     list.push(CustomProvider {
         id: Uuid::new_v4().to_string(),
         name: name.to_string(),
         base_url: base_url.to_string(),
-        api_key: api_key.trim().to_string(),
+        api_key: String::new(),
         kind: if kind.is_empty() {
             "openai".to_string()
         } else {
             kind.to_string()
         },
         prefix: prefix.trim().to_string(),
+        keys,
+        default_model: String::new(),
+        models: parse_model_list(&models),
+        proxy_mode: normalize_proxy_mode(&proxy_mode),
     });
     save_custom_providers(&list)?;
     Ok(list)
@@ -1737,6 +1996,8 @@ pub fn update_custom_provider(
     api_key: String,
     kind: String,
     prefix: String,
+    models: String,
+    proxy_mode: String,
 ) -> Result<Vec<CustomProvider>, String> {
     let name = name.trim();
     let base_url = base_url.trim();
@@ -1750,13 +2011,78 @@ pub fn update_custom_provider(
     };
     provider.name = name.to_string();
     provider.base_url = base_url.to_string();
-    provider.api_key = api_key.trim().to_string();
+    // Don't overwrite key pool with legacy api_key — only set if pool is empty
+    if provider.keys.is_empty() && !api_key.trim().is_empty() {
+        provider.keys.push(ProviderKey {
+            id: Uuid::new_v4().to_string(),
+            label: "默认".to_string(),
+            api_key: api_key.trim().to_string(),
+            enabled: true,
+            weight: 1,
+        });
+    }
+    provider.api_key.clear();
     provider.kind = if kind.is_empty() {
         "openai".to_string()
     } else {
         kind.to_string()
     };
     provider.prefix = prefix.trim().to_string();
+    provider.models = parse_model_list(&models);
+    provider.proxy_mode = normalize_proxy_mode(&proxy_mode);
+    save_custom_providers(&list)?;
+    Ok(list)
+}
+
+pub fn add_provider_key(
+    provider_id: &str,
+    label: String,
+    api_key: String,
+) -> Result<Vec<CustomProvider>, String> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("API Key 不能为空。".to_string());
+    }
+    let mut list = list_custom_providers();
+    let Some(provider) = list.iter_mut().find(|p| p.id == provider_id) else {
+        return Err("未找到服务商。".to_string());
+    };
+    provider.keys.push(ProviderKey {
+        id: Uuid::new_v4().to_string(),
+        label: label.trim().to_string(),
+        api_key: api_key.to_string(),
+        enabled: true,
+        weight: 1,
+    });
+    save_custom_providers(&list)?;
+    Ok(list)
+}
+
+pub fn remove_provider_key(
+    provider_id: &str,
+    key_id: &str,
+) -> Result<Vec<CustomProvider>, String> {
+    let mut list = list_custom_providers();
+    let Some(provider) = list.iter_mut().find(|p| p.id == provider_id) else {
+        return Err("未找到服务商。".to_string());
+    };
+    provider.keys.retain(|k| k.id != key_id);
+    save_custom_providers(&list)?;
+    Ok(list)
+}
+
+pub fn toggle_provider_key(
+    provider_id: &str,
+    key_id: &str,
+) -> Result<Vec<CustomProvider>, String> {
+    let mut list = list_custom_providers();
+    let Some(provider) = list.iter_mut().find(|p| p.id == provider_id) else {
+        return Err("未找到服务商。".to_string());
+    };
+    let Some(key) = provider.keys.iter_mut().find(|k| k.id == key_id) else {
+        return Err("未找到该密钥。".to_string());
+    };
+    key.enabled = !key.enabled;
     save_custom_providers(&list)?;
     Ok(list)
 }
@@ -1768,6 +2094,7 @@ fn custom_providers_yaml() -> String {
     if providers.is_empty() {
         return String::new();
     }
+    let bindings = get_api_key_bindings();
     let mut by_type: std::collections::BTreeMap<String, Vec<&CustomProvider>> =
         std::collections::BTreeMap::new();
     for provider in &providers {
@@ -1781,32 +2108,154 @@ fn custom_providers_yaml() -> String {
         out.push_str(section);
         out.push_str(":\n");
         for provider in list {
-            // Single-quoted YAML via yaml_quote (safe for backslashes, quotes,
-            // colons). The old double-quoted form only did `"`→`'` and so
-            // mis-escaped backslashes / corrupted embedded quotes, which could
-            // make CLIProxyAPI fail to parse config.yaml and crash on start.
+            let enabled_keys: Vec<&ProviderKey> =
+                provider.keys.iter().filter(|k| k.enabled).collect();
+            let bound_client_keys: Vec<&str> = bindings
+                .iter()
+                .filter(|b| b.provider_id == provider.id)
+                .map(|b| b.api_key.as_str())
+                .collect();
             if section == "openai-compatibility" {
                 out.push_str(&format!("  - name: {}\n", yaml_quote(&provider.name)));
                 out.push_str(&format!("    base-url: {}\n", yaml_quote(&provider.base_url)));
                 if !provider.prefix.is_empty() {
                     out.push_str(&format!("    prefix: {}\n", yaml_quote(&provider.prefix)));
                 }
-                if !provider.api_key.is_empty() {
+                // REQUIRED for routing: an empty models list registers zero models
+                // (CLIProxyAPI buildOpenAICompatibilityConfigModels → nil), leaving
+                // the provider unroutable — no candidate for any model request.
+                if !provider.models.is_empty() {
+                    out.push_str("    models:\n");
+                    for model in &provider.models {
+                        out.push_str(&format!("      - name: {}\n", yaml_quote(model)));
+                    }
+                }
+                if !bound_client_keys.is_empty() {
+                    out.push_str("    allowed-api-keys:\n");
+                    for client_key in &bound_client_keys {
+                        out.push_str(&format!("      - {}\n", yaml_quote(client_key)));
+                    }
+                }
+                if !enabled_keys.is_empty() {
                     out.push_str("    api-key-entries:\n");
-                    out.push_str(&format!("      - api-key: {}\n", yaml_quote(&provider.api_key)));
+                    for key in &enabled_keys {
+                        out.push_str(&format!("      - api-key: {}\n", yaml_quote(&key.api_key)));
+                        // "direct" bypasses the global proxy-url for this upstream
+                        // (CLIProxyAPI ModeDirect); empty inherits the global proxy.
+                        if provider.proxy_mode == "direct" {
+                            out.push_str("        proxy-url: 'direct'\n");
+                        }
+                    }
                 }
             } else {
-                out.push_str(&format!("  - api-key: {}\n", yaml_quote(&provider.api_key)));
-                if !provider.base_url.is_empty() {
-                    out.push_str(&format!("    base-url: {}\n", yaml_quote(&provider.base_url)));
-                }
-                if !provider.prefix.is_empty() {
-                    out.push_str(&format!("    prefix: {}\n", yaml_quote(&provider.prefix)));
+                // Non-openai types: each enabled key becomes a separate entry.
+                for key in &enabled_keys {
+                    out.push_str(&format!("  - api-key: {}\n", yaml_quote(&key.api_key)));
+                    if !provider.base_url.is_empty() {
+                        out.push_str(&format!("    base-url: {}\n", yaml_quote(&provider.base_url)));
+                    }
+                    // "direct" bypasses the global proxy-url for this upstream.
+                    if provider.proxy_mode == "direct" {
+                        out.push_str("    proxy-url: 'direct'\n");
+                    }
+                    if !provider.prefix.is_empty() {
+                        out.push_str(&format!("    prefix: {}\n", yaml_quote(&provider.prefix)));
+                    }
+                    // REQUIRED for routing — empty models ⇒ zero registered models
+                    // ⇒ unroutable (same as the openai-compatibility branch).
+                    if !provider.models.is_empty() {
+                        out.push_str("    models:\n");
+                        for model in &provider.models {
+                            out.push_str(&format!("      - name: {}\n", yaml_quote(model)));
+                        }
+                    }
+                    if !bound_client_keys.is_empty() {
+                        out.push_str("    allowed-api-keys:\n");
+                        for client_key in &bound_client_keys {
+                            out.push_str(&format!("      - {}\n", yaml_quote(client_key)));
+                        }
+                    }
                 }
             }
         }
     }
     out
+}
+
+/// Plugin id of the per-key router — must equal its dll filename stem, which is
+/// how CLIProxyAPI derives the id it matches against `plugins.configs.<id>`.
+const KEY_ROUTER_PLUGIN_ID: &str = "quotio-key-router";
+
+/// Host (+ port) of a base-url, used to match a custom pool's candidate by its
+/// `base_url` attribute. `https://anyrouter.top/v1` → `anyrouter.top`.
+fn base_url_host(base_url: &str) -> String {
+    base_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(base_url)
+        .to_string()
+}
+
+/// Render the `plugins:` section that loads the quotio-key-router scheduler
+/// plugin and maps each bound api-key to the pool it's allowed to use. Empty when
+/// the plugin binary isn't staged or no api-keys are bound. `strict: true` denies
+/// any unmapped key — the secure posture for an exposed/shared proxy link.
+fn key_router_plugins_yaml(proxy_dir: &Path) -> String {
+    let plugins_dir = proxy_dir.join("plugins");
+    let dll_name = if cfg!(windows) {
+        "quotio-key-router.dll"
+    } else {
+        "quotio-key-router.so"
+    };
+    if !plugins_dir.join(dll_name).is_file() {
+        return String::new();
+    }
+    let bindings = get_api_key_bindings();
+    if bindings.is_empty() {
+        return String::new();
+    }
+
+    let customs = list_custom_providers();
+    let mut routes = String::new();
+    for binding in &bindings {
+        let key = yaml_quote(&binding.api_key);
+        if binding.provider_id == kiro_sidecar::KIRO_PROVIDER_ID {
+            // Kiro is served by a claude-api-key provider (CLIProxyAPI Provider
+            // "claude") that points at the kiro-rs sidecar — pin it by base-url so
+            // it's distinct from a real Anthropic pool.
+            routes.push_str(&format!(
+                "        - key: {key}\n          provider: 'claude'\n          base_url_contains: '{}'\n",
+                kiro_sidecar::KIRO_SIDECAR_PORT
+            ));
+        } else if let Some(custom) = customs.iter().find(|c| c.id == binding.provider_id) {
+            // A custom provider's id is an internal UUID, but CLIProxyAPI tags its
+            // candidate by TYPE (e.g. "openai"), not the UUID — so match on the
+            // base-url host instead, which uniquely identifies this pool.
+            routes.push_str(&format!(
+                "        - key: {key}\n          base_url_contains: {}\n",
+                yaml_quote(&base_url_host(&custom.base_url))
+            ));
+        } else {
+            // Built-in pools: Quotio's provider_id equals the CLIProxyAPI provider
+            // type (codex, gemini, …).
+            routes.push_str(&format!(
+                "        - key: {key}\n          provider: {}\n",
+                yaml_quote(&binding.provider_id)
+            ));
+        }
+    }
+
+    format!(
+        "\n# Per-key pool gating (managed by Quotio — quotio-key-router plugin)\n\
+         plugins:\n  enabled: true\n  dir: {}\n  configs:\n    {}:\n      \
+         enabled: true\n      priority: 1\n      strict: true\n      routes:\n{}",
+        yaml_quote(&plugins_dir.display().to_string()),
+        KEY_ROUTER_PLUGIN_ID,
+        routes
+    )
 }
 
 fn custom_provider_yaml_type(kind: &str) -> String {
@@ -1892,6 +2341,9 @@ struct ProxyLifecycle {
     port_listener_cache: Option<(Instant, Option<(String, String)>)>,
     /// 当前状态是否是「端口被其它程序占用」：占用解除后用它把状态收回 Stopped。
     port_conflict: bool,
+    /// Kiro routes through a kiro-rs sidecar (CLIProxyAPI can't speak
+    /// CodeWhisperer); started/stopped together with the core.
+    kiro_sidecar: kiro_sidecar::KiroSidecar,
 }
 
 impl ProxyLifecycle {
@@ -1923,6 +2375,7 @@ impl ProxyLifecycle {
             bridge: None,
             port_listener_cache: None,
             port_conflict: false,
+            kiro_sidecar: kiro_sidecar::KiroSidecar::default(),
         }
     }
 
@@ -2004,6 +2457,10 @@ impl ProxyLifecycle {
 
         self.write_config(settings)
             .map_err(|error| io_error("无法写入代理配置", error))?;
+
+        // Bring up the Kiro sidecar (no-op unless ≥1 Kiro account); CLIProxyAPI's
+        // config.yaml already references it as a claude-api-key provider.
+        self.kiro_sidecar.sync_and_start(&self.paths.auth_dir);
 
         // Pre-flight: if proxy_port is already taken, only reclaim it when the
         // holder is OUR own orphaned proxy. A foreign process is never killed —
@@ -2163,6 +2620,9 @@ impl ProxyLifecycle {
         self.port_listener_cache = None;
         self.port_conflict = false;
 
+        // Tear down the Kiro sidecar alongside the core.
+        self.kiro_sidecar.stop();
+
         if let Some(mut bridge) = self.bridge.take() {
             bridge.stop();
         }
@@ -2224,6 +2684,7 @@ impl ProxyLifecycle {
     }
 
     fn shutdown(&mut self, settings: &AppSettings) {
+        self.kiro_sidecar.stop();
         if let Some(mut bridge) = self.bridge.take() {
             bridge.stop();
         }
@@ -2396,6 +2857,8 @@ impl ProxyLifecycle {
         fs::create_dir_all(&self.paths.proxy_dir)?;
         fs::create_dir_all(&self.paths.auth_dir)?;
 
+        let kiro_active = kiro_sidecar::kiro_account_count(&self.paths.auth_dir) > 0;
+
         let mut config = render_proxy_config(
             settings,
             &self.paths,
@@ -2403,6 +2866,22 @@ impl ProxyLifecycle {
             &self.local_api_key,
         );
         config.push_str(&custom_providers_yaml());
+        // Kiro (CodeWhisperer) isn't a CLIProxyAPI provider; route it through the
+        // kiro-rs sidecar, registered here as a claude-api-key provider.
+        if kiro_active {
+            let bound_keys: Vec<String> = get_api_key_bindings()
+                .into_iter()
+                .filter(|binding| binding.provider_id == kiro_sidecar::KIRO_PROVIDER_ID)
+                .map(|binding| binding.api_key)
+                .collect();
+            config.push_str(&kiro_sidecar::provider_yaml(
+                &kiro_sidecar::current_api_key(),
+                &bound_keys,
+            ));
+        }
+        // Per-key→pool gating: when api-keys are bound to pools, load the
+        // quotio-key-router scheduler plugin so each key can only reach its pool.
+        config.push_str(&key_router_plugins_yaml(&self.paths.proxy_dir));
         fs::write(&self.paths.config_path, config)
     }
 }
@@ -3064,6 +3543,16 @@ mod tests {
             "all-blank refresh stores as-is so the proxy-unreachable banner can fire"
         );
     }
+    #[test]
+    fn parse_model_list_splits_dedups_and_trims() {
+        // Comma, whitespace, and newline separators all work; blanks dropped;
+        // first-seen order preserved; duplicates removed.
+        let got = parse_model_list("gpt-5.5, claude-sonnet-4-5\n  gpt-5.5\tkimi-k2 ,");
+        assert_eq!(got, vec!["gpt-5.5", "claude-sonnet-4-5", "kimi-k2"]);
+        // A list of only separators/blanks yields nothing (provider stays unroutable).
+        assert!(parse_model_list("   \n , \t ").is_empty());
+    }
+
     use std::{
         net::{TcpListener, TcpStream},
         sync::{Arc, Mutex},
@@ -3160,8 +3649,16 @@ mod tests {
     fn scheduler_rechecks_on_target_failures_with_cooldown() {
         let mut core = AppCore::default();
         core.settings.scheduler_rule = "reset_soonest".to_string();
-        core.scheduler_current = Some(("codex-a.json".to_string(), Instant::now()));
-        core.scheduler_target_label = Some("a@example.com".to_string());
+        core.schedulers.insert(
+            "codex".to_string(),
+            ProviderSchedulerState {
+                current: Some(("codex-a.json".to_string(), Instant::now())),
+                target_label: Some("a@example.com".to_string()),
+                current_reset_at: None,
+                standby_count: 0,
+                failure_recheck_at: None,
+            },
+        );
 
         // 别的账号失败 / 目标成功:不触发。
         assert!(!core.scheduler_should_recheck_for_failures(&[
@@ -3177,7 +3674,7 @@ mod tests {
 
         // 规则关闭:永不触发。
         core.settings.scheduler_rule = "off".to_string();
-        core.scheduler_failure_recheck_at = None;
+        core.schedulers.get_mut("codex").unwrap().failure_recheck_at = None;
         assert!(!core
             .scheduler_should_recheck_for_failures(&[usage_event_for_test("a@example.com", true)]));
     }

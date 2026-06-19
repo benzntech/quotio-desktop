@@ -5,8 +5,10 @@ import { PlusIcon, RefreshIcon, TrashIcon } from "../icons";
 import { useT } from "../../i18n";
 import { invoke } from "../../lib/tauri";
 import { Select } from "../Select";
+import { AddAccountModal } from "../AddAccountModal";
 
-type CustomProvider = { id: string; name: string; base_url: string; api_key: string; kind: string; prefix?: string };
+type ProviderKey = { id: string; label: string; api_key: string; enabled: boolean; weight: number };
+type CustomProvider = { id: string; name: string; base_url: string; api_key: string; kind: string; prefix?: string; keys: ProviderKey[]; default_model?: string; models?: string[]; proxy_mode?: string };
 
 type ProvidersScreenProps = {
   appState: AppState;
@@ -19,14 +21,6 @@ type ProvidersScreenProps = {
   onPollOAuth: (token: string) => Promise<OAuthStatusResponse | null>;
 };
 
-type OAuthSession = {
-  providerName: string;
-  url: string | null;
-  state: string | null;
-  status: string;
-  error: string | null;
-};
-
 type AccountGroupData = {
   id: string;
   label: string;
@@ -34,10 +28,223 @@ type AccountGroupData = {
   accounts: AuthFile[];
 };
 
+function GlobalActionsMenu({
+  oauthProviders, authFiles, isManagementBusy, exportState,
+  confirmClearAll, setConfirmClearAll,
+  onImportFiles, onExportAccounts, onClearAll, onSelectProvider, t,
+}: {
+  oauthProviders: ProviderSummary[];
+  authFiles: AuthFile[];
+  isManagementBusy: boolean;
+  exportState: string;
+  confirmClearAll: boolean;
+  setConfirmClearAll: (v: boolean) => void;
+  onImportFiles: (e: ChangeEvent<HTMLInputElement>) => void;
+  onExportAccounts: () => Promise<void>;
+  onClearAll: () => void;
+  onSelectProvider: (provider: ProviderSummary) => void;
+  t: (key: string) => string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function close(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+
+  return (
+    <div className="pv-card-menu-anchor" ref={ref}>
+      <button className="pv-card-more pv-global-more" type="button" onClick={() => setOpen((v) => !v)} aria-label="批量操作">
+        <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><circle cx="3" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="13" cy="8" r="1.3"/></svg>
+      </button>
+      {open ? (
+        <div className="pv-card-dropdown pv-global-dropdown">
+          {oauthProviders.map((p) => (
+            <button key={p.id} type="button" onClick={() => { onSelectProvider(p); setOpen(false); }}>
+              添加 {p.display_name} 账号
+            </button>
+          ))}
+          <label className="pv-dropdown-label">
+            {t("import.button")}
+            <input type="file" accept=".json,application/json" multiple hidden disabled={isManagementBusy} onChange={(e) => { onImportFiles(e); setOpen(false); }} />
+          </label>
+          {authFiles.length > 0 ? (
+            <button type="button" disabled={isManagementBusy || exportState === "busy"} onClick={() => { void onExportAccounts(); setOpen(false); }}>
+              {exportState === "busy" ? "导出中…" : exportState === "done" ? "已导出 ✓" : "导出所有账号"}
+            </button>
+          ) : null}
+          {authFiles.length > 0 ? (
+            <button
+              type="button"
+              className={confirmClearAll ? "pv-dropdown-danger" : ""}
+              disabled={isManagementBusy}
+              onClick={() => {
+                if (confirmClearAll) { setConfirmClearAll(false); onClearAll(); setOpen(false); }
+                else { setConfirmClearAll(true); window.setTimeout(() => setConfirmClearAll(false), 4000); }
+              }}
+            >
+              {confirmClearAll ? `确认清空全部 ${authFiles.length} 个？` : "清空所有账号"}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CustomProviderCard({
+  provider,
+  boundKeys,
+  onEdit,
+  onDelete,
+  onAddKey,
+  onRemoveKey,
+  onToggleKey,
+}: {
+  provider: CustomProvider;
+  boundKeys: { masked: string }[];
+  onEdit: () => void;
+  onDelete: () => void;
+  onAddKey: (label: string, apiKey: string) => void;
+  onRemoveKey: (keyId: string) => void;
+  onToggleKey: (keyId: string) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [addingKey, setAddingKey] = useState(false);
+  const [newKeyLabel, setNewKeyLabel] = useState("");
+  const [newKeyValue, setNewKeyValue] = useState("");
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function close(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+        setConfirmDelete(false);
+      }
+    }
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [menuOpen]);
+
+  const kindColor = provider.kind === "gemini" ? "#4285F4" : provider.kind === "claude" ? "#D97757" : "#10a37f";
+  const enabledCount = provider.keys.filter((k) => k.enabled).length;
+
+  return (
+    <div className="pv-card cp-card">
+      <div className="pv-card-header">
+        <span className="cp-icon" style={{ background: kindColor + "22", color: kindColor }}>
+          {provider.name.charAt(0).toUpperCase()}
+        </span>
+        <span className="pv-card-title">{provider.name}</span>
+        <span className="cp-kind-badge">{provider.kind}</span>
+        {provider.proxy_mode === "direct" ? (
+          <span className="cp-kind-badge" title="此接口绕过全局代理直连" style={{ color: "var(--accent, #10a37f)", borderColor: "var(--accent, #10a37f)" }}>直连</span>
+        ) : null}
+        <button className="pv-card-more" type="button" onClick={() => setAddingKey(true)} aria-label="添加密钥" title="添加密钥">
+          <PlusIcon />
+        </button>
+        <div className="pv-card-menu-anchor" ref={menuRef}>
+          <button className="pv-card-more" type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="更多">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><circle cx="8" cy="3" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="8" cy="13" r="1.3"/></svg>
+          </button>
+          {menuOpen ? (
+            <div className="pv-card-dropdown">
+              <button type="button" onClick={() => { onEdit(); setMenuOpen(false); }}>编辑接口</button>
+              <button
+                type="button"
+                className={confirmDelete ? "pv-dropdown-danger" : ""}
+                onClick={() => {
+                  if (confirmDelete) { onDelete(); setMenuOpen(false); }
+                  else { setConfirmDelete(true); window.setTimeout(() => setConfirmDelete(false), 3000); }
+                }}
+              >
+                {confirmDelete ? "确认删除？" : "删除接口"}
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="cp-card-meta">
+        <span className="cp-url-text" title={provider.base_url}>{provider.base_url}</span>
+        {provider.models && provider.models.length > 0 ? (
+          <>
+            {provider.models.slice(0, 4).map((m) => <code key={m} className="cp-model-pill">{m}</code>)}
+            {provider.models.length > 4 ? <code className="cp-model-pill">+{provider.models.length - 4}</code> : null}
+          </>
+        ) : (
+          <code className="cp-model-pill" style={{ color: "var(--danger, #d9534f)", borderColor: "var(--danger, #d9534f)" }} title="未配置模型，代理无法路由到此接口（请点编辑补充模型名）">
+            ⚠ 未配置模型
+          </code>
+        )}
+      </div>
+
+      <div className="cp-key-pool">
+        <div className="cp-key-pool-header">
+          <span>密钥池</span>
+          <span className="pv-count-badge">{enabledCount}/{provider.keys.length} 启用</span>
+        </div>
+        {provider.keys.length === 0 ? (
+          <p className="cp-key-empty">暂无密钥。点击 + 添加。</p>
+        ) : (
+          <div className="cp-key-list">
+            {provider.keys.map((k) => (
+              <div className={`cp-key-row${k.enabled ? "" : " cp-key-disabled"}`} key={k.id}>
+                <button className="cp-key-toggle" type="button" onClick={() => onToggleKey(k.id)} title={k.enabled ? "禁用" : "启用"}>
+                  <span className={`cp-key-dot${k.enabled ? " cp-key-dot--on" : ""}`} />
+                </button>
+                <span className="cp-key-label">{k.label || "未命名"}</span>
+                <span className="cp-key-masked">{maskKey(k.api_key)}</span>
+                <button className="row-icon-btn row-icon-btn--danger cp-key-del" type="button" onClick={() => onRemoveKey(k.id)} title="删除密钥" aria-label="删除密钥">
+                  <TrashIcon />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {boundKeys.length > 0 ? (
+        <div className="cp-bound-keys">
+          <span className="cp-bound-keys-label">绑定的客户端密钥</span>
+          {boundKeys.map((bk, i) => (
+            <code className="cp-bound-key-tag" key={i}>{bk.masked}</code>
+          ))}
+        </div>
+      ) : null}
+
+      {addingKey ? (
+        <div className="cp-add-key-form">
+          <input placeholder="标签（可选）" value={newKeyLabel} onChange={(e) => setNewKeyLabel(e.target.value)} />
+          <input placeholder="API Key" type="password" value={newKeyValue} onChange={(e) => setNewKeyValue(e.target.value)} />
+          <div className="cp-add-key-actions">
+            <button type="button" className="primary-action" disabled={!newKeyValue.trim()} onClick={() => { onAddKey(newKeyLabel, newKeyValue); setNewKeyLabel(""); setNewKeyValue(""); setAddingKey(false); }}>
+              添加
+            </button>
+            <button type="button" onClick={() => { setAddingKey(false); setNewKeyLabel(""); setNewKeyValue(""); }}>取消</button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function maskKey(key: string): string {
+  if (key.length <= 8) return "****";
+  return key.slice(0, 4) + "****" + key.slice(-4);
+}
+
 export function ProvidersScreen({
   appState,
   isManagementBusy,
-  managementAction,
+  managementAction: _managementAction,
   onRefreshManagement,
   onRefreshQuotas,
   onRunManagementStateAction,
@@ -53,7 +260,13 @@ export function ProvidersScreen({
     if (!("__TAURI_INTERNALS__" in window)) return;
     void invoke<AuthFile[]>("list_local_accounts").then(setLocalAccounts).catch(() => {});
   }, [appState.management.auth_files]);
-  const authFiles = proxyAuthFiles.length > 0 ? proxyAuthFiles : localAccounts;
+  const authFiles = useMemo(() => {
+    if (proxyAuthFiles.length === 0) return localAccounts;
+    if (localAccounts.length === 0) return proxyAuthFiles;
+    const proxyNames = new Set(proxyAuthFiles.map((f) => f.name));
+    const extra = localAccounts.filter((f) => !proxyNames.has(f.name));
+    return extra.length > 0 ? [...proxyAuthFiles, ...extra] : proxyAuthFiles;
+  }, [proxyAuthFiles, localAccounts]);
   const groups = useMemo(() => groupAccounts(authFiles, appState.providers), [authFiles, appState.providers]);
   // Accounts whose quota fetch hit an unrecoverable 401 are flagged "auth_failed"
   // by the backend. Unlike the proxy's recent-request health (which resets on
@@ -84,144 +297,35 @@ export function ProvidersScreen({
       })
       .catch(() => {});
   }, [appState.management.auth_files, appState.quotas]);
-  const oauthProviders = appState.providers.filter((provider) => provider.oauth_endpoint);
-  const vertexProvider = appState.providers.find((provider) => provider.id === "vertex");
+  const oauthProviders = appState.providers.filter((provider) => provider.native_oauth || provider.oauth_endpoint || provider.supports_manual_auth);
 
-  const [showAdd, setShowAdd] = useState(false);
-  // Two-step confirm for the destructive "clear all accounts" action.
+  const [addAccountProvider, setAddAccountProvider] = useState<ProviderSummary | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
-  // Transient feedback for the "export accounts" button.
   const [exportState, setExportState] = useState<"idle" | "busy" | "done" | "error">("idle");
-  const [projectId, setProjectId] = useState("");
-  const [oauthSession, setOAuthSession] = useState<OAuthSession | null>(null);
-  const [vertexJson, setVertexJson] = useState("");
-  const [vertexError, setVertexError] = useState<string | null>(null);
+  const [projectId] = useState("");
   const [showAddCustom, setShowAddCustom] = useState(false);
   const [editingCustomId, setEditingCustomId] = useState<string | null>(null);
-  const [customForm, setCustomForm] = useState({ name: "", base_url: "", api_key: "", kind: "openai", prefix: "" });
+  const [customForm, setCustomForm] = useState({ name: "", base_url: "", api_key: "", kind: "openai", prefix: "", models: "", proxy_mode: "inherit" });
+  const [formKeys, setFormKeys] = useState<{ label: string; api_key: string }[]>([{ label: "", api_key: "" }]);
+  const [customFormError, setCustomFormError] = useState<string | null>(null);
   const [customProviders, setCustomProviders] = useState<CustomProvider[]>([]);
   useEffect(() => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
     void invoke<CustomProvider[]>("list_custom_providers").then(setCustomProviders).catch(() => {});
   }, []);
 
-  // Tracks the OAuth `state` currently being auto-polled, so starting a new
-  // authorization (or unmounting) cancels the previous polling loop.
-  const pollRef = useRef<string | null>(null);
-  useEffect(
-    () => () => {
-      pollRef.current = null;
-    },
-    [],
-  );
-
-  // Open the authorization URL in the system browser (Tauri opener, falling back
-  // to window.open), mirroring the macOS reference app's auto-open behavior.
-  async function openAuthUrl(url: string) {
-    try {
-      if ("__TAURI_INTERNALS__" in window) {
-        const { openUrl } = await import("@tauri-apps/plugin-opener");
-        await openUrl(url);
-        return;
-      }
-    } catch {
-      /* fall back to window.open below */
-    }
-    window.open(url, "_blank", "noreferrer");
-  }
-
-  // Auto-poll the OAuth status (mirrors the macOS reference app's pollOAuthStatus):
-  // every 2s, up to ~2 min, until the proxy reports "ok" (success) or "error".
-  // onPollOAuth refreshes the management snapshot on success, so the new account
-  // appears without the user clicking "poll" manually.
-  async function autoPollOAuth(state: string) {
-    pollRef.current = state;
-    let consecutiveFailures = 0;
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      // Poll once immediately, then wait between polls — a fast authorization is
-      // detected without an upfront 2s delay (mirrors the reference app).
-      if (attempt > 0) {
-        await new Promise((resolve) => window.setTimeout(resolve, 2000));
-      }
-      if (pollRef.current !== state) return; // superseded by a new auth, or unmounted
-      const response = await onPollOAuth(state);
-      if (pollRef.current !== state) return;
-      if (!response) {
-        // The status call itself failed (proxy down / bad management key). Tolerate
-        // a few transient blips, but don't silently retry for the full 2 minutes.
-        consecutiveFailures += 1;
-        if (consecutiveFailures >= 3) {
-          setOAuthSession((current) =>
-            current && current.state === state
-              ? { ...current, status: "error", error: "无法获取授权状态（代理无响应或管理密钥不对），请重试。" }
-              : current,
-          );
-          pollRef.current = null;
-          return;
-        }
-        continue;
-      }
-      consecutiveFailures = 0;
-      setOAuthSession((current) =>
-        current && current.state === state ? { ...current, status: response.status, error: response.error } : current,
-      );
-      if (["ok", "success", "completed"].includes(response.status)) {
-        pollRef.current = null;
-        // Re-authorized — re-probe quotas so the account's "needs re-auth" marker
-        // clears (and the new account shows) without waiting for the auto-poll.
-        onRefreshQuotas();
-        // This session's :1455 callback listener is now closed, so the auth link is
-        // dead. Clear it so the user can't copy a stale link — adding another
-        // account means clicking a provider again (which mints a fresh link + a
-        // fresh :1455 listener). Reusing the old link is the #1 multi-account trap.
-        setOAuthSession((current) =>
-          current && current.state === state ? { ...current, url: null } : current,
-        );
-        return;
-      }
-      if (response.status === "error") {
-        pollRef.current = null;
-        return;
-      }
-    }
-    setOAuthSession((current) =>
-      current && current.state === state ? { ...current, status: "error", error: "OAuth 授权超时，请重试。" } : current,
-    );
-    pollRef.current = null;
-  }
-
-  // Start OAuth for a provider (shared by the chip grid and per-account re-auth).
-  async function startProviderOAuth(provider: ProviderSummary) {
-    setShowAdd(true);
-    // is_webui=true is the mode that makes CLIProxyAPI bind its local Codex
-    // callback listener on :1455 (verified directly: is_webui=false does NOT bind
-    // it). The browser's redirect to localhost:1455 then lands on the proxy, which
-    // performs the token exchange itself — the same flow the official Web UI uses.
-    const response = await onStartOAuth(provider.oauth_endpoint ?? "", projectId, true);
-    if (!response) return;
-    setOAuthSession({
-      providerName: provider.display_name,
-      url: response.url,
-      state: response.state,
-      status: response.status,
-      error: response.error,
-    });
-    if (response.url) void openAuthUrl(response.url);
-    if (response.state && !response.error) void autoPollOAuth(response.state);
-  }
-
-  // Re-authorize a specific account by re-running its provider's OAuth login.
   function reauthAccount(account: AuthFile) {
     const provider = appState.providers.find(
       (item) => item.id === account.provider || item.id.includes(account.provider) || account.provider.includes(item.id),
     );
-    if (provider?.oauth_endpoint) void startProviderOAuth(provider);
+    if (provider) setAddAccountProvider(provider);
   }
 
   function resetCustomForm() {
-    setCustomForm({ name: "", base_url: "", api_key: "", kind: "openai", prefix: "" });
+    setCustomForm({ name: "", base_url: "", api_key: "", kind: "openai", prefix: "", models: "", proxy_mode: "inherit" });
+    setFormKeys([{ label: "", api_key: "" }]);
     setEditingCustomId(null);
     setShowAddCustom(false);
+    setCustomFormError(null);
   }
 
   function startEditCustom(provider: CustomProvider) {
@@ -231,6 +335,8 @@ export function ProvidersScreen({
       api_key: provider.api_key,
       kind: provider.kind || "openai",
       prefix: provider.prefix ?? "",
+      models: (provider.models ?? []).join("\n"),
+      proxy_mode: provider.proxy_mode === "direct" ? "direct" : "inherit",
     });
     setEditingCustomId(provider.id);
     setShowAddCustom(true);
@@ -238,13 +344,30 @@ export function ProvidersScreen({
 
   async function submitCustomProvider() {
     if (!customForm.name.trim() || !customForm.base_url.trim()) return;
+    setCustomFormError(null);
+    // Tauri individual-arg commands expect camelCase keys (baseUrl/apiKey) — the
+    // snake_case fields on customForm don't map, so spreading it silently fails.
+    const base = { name: customForm.name, baseUrl: customForm.base_url, kind: customForm.kind, prefix: customForm.prefix, models: customForm.models, proxyMode: customForm.proxy_mode };
     try {
-      const command = editingCustomId ? "update_custom_provider" : "add_custom_provider";
-      const args = editingCustomId ? { id: editingCustomId, ...customForm } : customForm;
-      setCustomProviders(await invoke<CustomProvider[]>(command, args));
+      if (editingCustomId) {
+        setCustomProviders(await invoke<CustomProvider[]>("update_custom_provider", { id: editingCustomId, ...base, apiKey: customForm.api_key }));
+      } else {
+        const validKeys = formKeys.filter((k) => k.api_key.trim());
+        const firstKey = validKeys[0]?.api_key ?? "";
+        let result = await invoke<CustomProvider[]>("add_custom_provider", { ...base, apiKey: firstKey });
+        if (validKeys.length > 1) {
+          const newProvider = result.find((p) => p.name === customForm.name.trim());
+          if (newProvider) {
+            for (const k of validKeys.slice(1)) {
+              result = await invoke<CustomProvider[]>("add_provider_key", { providerId: newProvider.id, label: k.label, apiKey: k.api_key });
+            }
+          }
+        }
+        setCustomProviders(result);
+      }
       resetCustomForm();
-    } catch {
-      /* surfaced elsewhere */
+    } catch (error) {
+      setCustomFormError(typeof error === "string" ? error : "添加失败,请检查名称/Base URL/密钥后重试。");
     }
   }
 
@@ -255,6 +378,24 @@ export function ProvidersScreen({
     } catch {
       /* ignore */
     }
+  }
+
+  async function addKeyToProvider(providerId: string, label: string, apiKey: string) {
+    try {
+      setCustomProviders(await invoke<CustomProvider[]>("add_provider_key", { providerId, label, apiKey }));
+    } catch { /* ignore */ }
+  }
+
+  async function removeKeyFromProvider(providerId: string, keyId: string) {
+    try {
+      setCustomProviders(await invoke<CustomProvider[]>("remove_provider_key", { providerId, keyId }));
+    } catch { /* ignore */ }
+  }
+
+  async function toggleKeyInProvider(providerId: string, keyId: string) {
+    try {
+      setCustomProviders(await invoke<CustomProvider[]>("toggle_provider_key", { providerId, keyId }));
+    } catch { /* ignore */ }
   }
 
   async function onImportFiles(event: ChangeEvent<HTMLInputElement>) {
@@ -293,7 +434,7 @@ export function ProvidersScreen({
         : emails.length > 1
           ? `${emails[0]}+${emails.length - 1}`
           : `${authFiles.length}accounts`;
-    const defaultName = `quotio_${base.replace(/[<>:"\\|?* -]/g, "-")}_${stamp}.zip`;
+    const defaultName = `quotio_${base.replace(/[<>:"\\|?*\x00-\x1f]/g, "-")}_${stamp}.zip`;
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const target = await save({
@@ -334,240 +475,211 @@ export function ProvidersScreen({
         </div>
       </header>
 
-      {showAdd ? (
-        <section className="section-grid providers-add-grid">
-          <OAuthPanel
-            providers={oauthProviders}
-            projectId={projectId}
-            oauthSession={oauthSession}
-            isBusy={isManagementBusy}
-            managementAction={managementAction}
-            onProjectIdChange={setProjectId}
-            onStartOAuth={(provider) => void startProviderOAuth(provider)}
-            onPollOAuth={async () => {
-              if (!oauthSession?.state) return;
-              const response = await onPollOAuth(oauthSession.state);
-              if (!response) return;
-              setOAuthSession({ ...oauthSession, status: response.status, error: response.error });
-            }}
-            onCancel={() => {
-              pollRef.current = null;
-              setOAuthSession(null);
-            }}
-          />
-
-          <VertexImportPanel
-            provider={vertexProvider}
-            value={vertexJson}
-            error={vertexError}
-            isBusy={isManagementBusy}
-            onChange={(value) => {
-              setVertexJson(value);
-              setVertexError(null);
-            }}
-            onImport={() => {
-              const value = vertexJson.trim();
-              if (!value) return;
-              try {
-                JSON.parse(value);
-              } catch {
-                setVertexError("JSON 格式不合法。");
-                return;
-              }
-              onRunManagementStateAction("import_management_vertex_service_account", { json: value });
-              setVertexJson("");
-            }}
-          />
-        </section>
+      {addAccountProvider ? (
+        <AddAccountModal
+          provider={addAccountProvider}
+          projectId={projectId}
+          onClose={() => setAddAccountProvider(null)}
+          onStartOAuth={onStartOAuth}
+          onPollOAuth={onPollOAuth}
+          onRefreshQuotas={() => { onRefreshQuotas(); onRefreshManagement(); }}
+          onImportFile={onImportFiles}
+        />
       ) : null}
 
-      <article className="panel accounts-panel">
-        <div className="panel-label">
-          <span className="eyebrow">{t("providers.yourAccounts")}</span>
-          <span className="accounts-panel-right">
-            <button
-              className={showAdd ? "ghost-action ghost-action--active" : "ghost-action"}
-              type="button"
-              onClick={() => setShowAdd((value) => !value)}
-            >
-              {showAdd ? t("providers.closeOAuth") : t("providers.openOAuth")}
-            </button>
-            <label className="ghost-action import-pick" title={t("import.desc")}>
-              {t("import.button")}
-              <input
-                type="file"
-                accept=".json,application/json"
-                multiple
-                hidden
-                disabled={isManagementBusy}
-                onChange={onImportFiles}
-              />
-            </label>
-            {authFiles.length > 0 ? (
-              <button
-                className="ghost-action"
-                type="button"
-                disabled={isManagementBusy || exportState === "busy"}
-                title="把所有 CPA 账号凭证打包导出为 zip(内含登录令牌,妥善保管)"
-                onClick={() => void onExportAccounts()}
-              >
-                {exportState === "busy"
-                  ? "导出中…"
-                  : exportState === "done"
-                    ? "已导出 ✓"
-                    : exportState === "error"
-                      ? "导出失败"
-                      : "导出"}
-              </button>
-            ) : null}
-            {authFiles.length > 0 ? (
-              <button
-                className="ghost-action"
-                type="button"
-                disabled={isManagementBusy}
-                style={confirmClearAll ? { color: "#dc2626", fontWeight: 600 } : undefined}
-                title="清空全部账号"
-                onClick={() => {
-                  if (confirmClearAll) {
-                    setConfirmClearAll(false);
-                    onRunManagementStateAction("delete_all_management_auth_files");
-                  } else {
-                    setConfirmClearAll(true);
-                    window.setTimeout(() => setConfirmClearAll(false), 4000);
+      {/* ── Connected providers: card grid ── */}
+      <div className="pv-section-header">
+        <h2 className="pv-section-title">已连接服务商</h2>
+        <span className="pv-section-actions">
+          <span className="pv-count-badge">共 {groups.length} 个服务商</span>
+          <GlobalActionsMenu
+            oauthProviders={oauthProviders}
+            authFiles={authFiles}
+            isManagementBusy={isManagementBusy}
+            exportState={exportState}
+            confirmClearAll={confirmClearAll}
+            setConfirmClearAll={setConfirmClearAll}
+            onImportFiles={onImportFiles}
+            onExportAccounts={onExportAccounts}
+            onClearAll={() => onRunManagementStateAction("delete_all_management_auth_files")}
+            onSelectProvider={setAddAccountProvider}
+            t={t}
+          />
+        </span>
+      </div>
+
+      {groups.length === 0 ? (
+        <p className="empty-copy" style={{ padding: "24px 0" }}>暂无账号。点击卡片上的 + 授权或通过右上角 ⋯ 导入。</p>
+      ) : (
+        <div className="pv-card-grid">
+          {groups.map((group) => (
+            <ProviderCard
+              key={group.id}
+              group={group}
+              isBusy={isManagementBusy}
+              authFailedNames={authFailedNames}
+              authHealth={authHealth}
+              onDelete={(account) => onRunManagementStateAction("delete_management_auth_file", { name: account.name })}
+              onReauth={reauthAccount}
+              onAddAccount={() => {
+                const provider = appState.providers.find((p) => p.id === group.id || p.id.includes(group.id) || group.id.includes(p.id));
+                if (provider) setAddAccountProvider(provider);
+              }}
+              onDeleteAll={() => {
+                for (const account of group.accounts) {
+                  onRunManagementStateAction("delete_management_auth_file", { name: account.name });
+                }
+              }}
+              onToggleDisableAll={() => {
+                const allDisabled = group.accounts.every((a) => a.disabled);
+                for (const account of group.accounts) {
+                  if (allDisabled && account.disabled) {
+                    onRunManagementStateAction("enable_management_auth_file", { name: account.name });
+                  } else if (!allDisabled && !account.disabled) {
+                    onRunManagementStateAction("disable_management_auth_file", { name: account.name });
                   }
-                }}
-              >
-                {confirmClearAll ? `确认清空 ${authFiles.length} 个？` : "清空"}
-              </button>
-            ) : null}
-            <span className="count-pill">{authFiles.length}</span>
-          </span>
+                }
+              }}
+            />
+          ))}
         </div>
+      )}
 
-        {groups.length === 0 ? (
-          <p className="empty-copy">暂无账号快照。点击右上角 + 通过 OAuth 授权或导入 Service Account 添加账号。</p>
-        ) : (
-          <div className="account-groups">
-            {groups.map((group) => (
-              <AccountGroup
-                key={group.id}
-                group={group}
-                isBusy={isManagementBusy}
-                authFailedNames={authFailedNames}
-                authHealth={authHealth}
-                onDelete={(account) => onRunManagementStateAction("delete_management_auth_file", { name: account.name })}
-                onReauth={reauthAccount}
-              />
-            ))}
-          </div>
-        )}
-      </article>
+      {/* ── Custom API management: table ── */}
+      <div className="pv-section-header" style={{ marginTop: 28 }}>
+        <h2 className="pv-section-title">自定义接口管理</h2>
+        <button className="pv-add-btn" type="button" onClick={() => (showAddCustom ? resetCustomForm() : setShowAddCustom(true))}>
+          <PlusIcon /> 添加接口
+        </button>
+      </div>
 
-      <article className="panel">
-        <div className="panel-label">
-          <span className="eyebrow">{t("providers.customProviders")}</span>
-          <button
-            className={showAddCustom ? "icon-button icon-button--active" : "icon-button"}
-            type="button"
-            onClick={() => (showAddCustom ? resetCustomForm() : setShowAddCustom(true))}
-            title={t("providers.addCustom")}
-            aria-label={t("providers.addCustom")}
-          >
-            <PlusIcon />
-          </button>
-        </div>
-
-        {showAddCustom ? (
+      {showAddCustom ? (
+        <article className="panel" style={{ marginBottom: 12 }}>
           <div className="stacked-form custom-provider-form">
             <label>
               {t("providers.cpName")}
-              <input
-                value={customForm.name}
-                onChange={(event) => setCustomForm({ ...customForm, name: event.target.value })}
-                placeholder="My Provider"
-              />
+              <input value={customForm.name} onChange={(e) => setCustomForm({ ...customForm, name: e.target.value })} placeholder="My Provider" />
             </label>
             <label>
               {t("providers.cpBaseUrl")}
-              <input
-                value={customForm.base_url}
-                onChange={(event) => setCustomForm({ ...customForm, base_url: event.target.value })}
-                placeholder="https://api.example.com/v1"
+              <input value={customForm.base_url} onChange={(e) => setCustomForm({ ...customForm, base_url: e.target.value })} placeholder="https://api.example.com/v1" />
+            </label>
+            {editingCustomId ? (
+              <p className="cp-form-hint">密钥在卡片上管理，编辑模式不显示密钥字段。</p>
+            ) : (
+              <div className="cp-form-keys">
+                <div className="cp-form-keys-header">
+                  <span>API 密钥</span>
+                  <button type="button" className="cp-form-keys-add" onClick={() => setFormKeys([...formKeys, { label: "", api_key: "" }])}>
+                    <PlusIcon /> 添加密钥
+                  </button>
+                </div>
+                {formKeys.map((fk, i) => (
+                  <div className="cp-form-key-row" key={i}>
+                    <input
+                      placeholder="标签（可选）"
+                      value={fk.label}
+                      onChange={(e) => { const next = [...formKeys]; next[i] = { ...fk, label: e.target.value }; setFormKeys(next); }}
+                    />
+                    <input
+                      type="password"
+                      placeholder="sk-..."
+                      value={fk.api_key}
+                      onChange={(e) => { const next = [...formKeys]; next[i] = { ...fk, api_key: e.target.value }; setFormKeys(next); }}
+                    />
+                    {formKeys.length > 1 ? (
+                      <button type="button" className="row-icon-btn row-icon-btn--danger" onClick={() => setFormKeys(formKeys.filter((_, j) => j !== i))} title="移除" aria-label="移除">
+                        <TrashIcon />
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <label>
+                {t("providers.cpKind")}
+                <Select
+                  value={customForm.kind}
+                  options={[
+                    { value: "openai", label: "OpenAI" },
+                    { value: "gemini", label: "Gemini" },
+                    { value: "claude", label: "Claude" },
+                  ]}
+                  onChange={(value) => setCustomForm({ ...customForm, kind: value })}
+                />
+              </label>
+              <label>
+                {t("providers.cpPrefix")}
+                <input value={customForm.prefix} onChange={(e) => setCustomForm({ ...customForm, prefix: e.target.value })} placeholder="myprovider" />
+              </label>
+            </div>
+            <label>
+              模型列表（每行一个，路由必填）
+              <textarea
+                value={customForm.models}
+                onChange={(e) => setCustomForm({ ...customForm, models: e.target.value })}
+                placeholder={"gpt-5.5\nclaude-sonnet-4-5-20250929"}
+                rows={3}
+                spellCheck={false}
+                style={{ fontFamily: "var(--font-mono, monospace)", resize: "vertical" }}
               />
             </label>
+            <p className="cp-form-hint">
+              必须填写此接口实际提供的模型名，否则代理无法路由到它（会返回额度/线路错误）。逗号、空格或换行分隔均可。
+            </p>
             <label>
-              {t("providers.cpApiKey")}
-              <input
-                type="password"
-                value={customForm.api_key}
-                onChange={(event) => setCustomForm({ ...customForm, api_key: event.target.value })}
-                placeholder="sk-..."
-              />
-            </label>
-            <label>
-              {t("providers.cpKind")}
+              连接方式
               <Select
-                value={customForm.kind}
+                value={customForm.proxy_mode}
                 options={[
-                  { value: "openai", label: "OpenAI" },
-                  { value: "gemini", label: "Gemini" },
+                  { value: "inherit", label: "走代理（跟随全局设置）" },
+                  { value: "direct", label: "直连（绕过代理）" },
                 ]}
-                onChange={(value) => setCustomForm({ ...customForm, kind: value })}
+                onChange={(value) => setCustomForm({ ...customForm, proxy_mode: value })}
               />
             </label>
-            <label>
-              {t("providers.cpPrefix")}
-              <input
-                value={customForm.prefix}
-                onChange={(event) => setCustomForm({ ...customForm, prefix: event.target.value })}
-                placeholder="myprovider"
-              />
-            </label>
-            <button
-              className="primary-action"
-              type="button"
-              onClick={() => void submitCustomProvider()}
-              disabled={!customForm.name.trim() || !customForm.base_url.trim()}
-            >
+            <p className="cp-form-hint">
+              「直连」让此接口绕过全局代理直接访问（国内中转站常需直连）；「走代理」沿用设置里的全局代理（OpenAI/Anthropic 等被墙服务需要）。
+            </p>
+            {customFormError ? (
+              <p className="cp-form-hint" style={{ color: "var(--danger, #d9534f)" }}>{customFormError}</p>
+            ) : null}
+            <button className="primary-action" type="button" onClick={() => void submitCustomProvider()} disabled={!customForm.name.trim() || !customForm.base_url.trim()}>
               {editingCustomId ? t("providers.cpSave") : t("providers.cpAdd")}
             </button>
           </div>
-        ) : null}
+        </article>
+      ) : null}
 
-        {customProviders.length === 0 ? (
-          <p className="empty-copy">导入自定义 OpenAI / Gemini 兼容端点。点击右上角 + 添加。</p>
-        ) : (
-          <div className="custom-provider-list">
-            {customProviders.map((provider) => (
-              <div className="custom-provider-row" key={provider.id}>
-                <div className="custom-provider-info">
-                  <strong>{provider.name}</strong>
-                  <small>{provider.base_url}</small>
-                </div>
-                <span className="custom-provider-kind">{provider.kind}</span>
-                <button
-                  className="row-icon-btn"
-                  type="button"
-                  onClick={() => startEditCustom(provider)}
-                  title={t("providers.cpEdit")}
-                  aria-label={t("providers.cpEdit")}
-                >
-                  ✎
-                </button>
-                <button
-                  className="row-icon-btn row-icon-btn--danger"
-                  type="button"
-                  onClick={() => void removeCustomProvider(provider.id)}
-                  title="删除"
-                  aria-label="删除"
-                >
-                  <TrashIcon />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </article>
+      {customProviders.length === 0 ? (
+        <p className="empty-copy" style={{ padding: "16px 0" }}>暂无自定义接口。点击「添加接口」导入 OpenAI / Gemini / Claude 兼容端点。</p>
+      ) : (
+        <div className="pv-card-grid">
+          {customProviders.map((cp) => {
+            const bindings = appState.api_key_bindings ?? [];
+            const apiKeys = appState.api_keys;
+            const boundKeys = bindings
+              .filter((b) => b.provider_id === cp.id)
+              .map((b) => {
+                const entry = apiKeys.find((k) => k.value === b.api_key);
+                return { masked: entry?.masked_value ?? maskKey(b.api_key) };
+              });
+            return (
+              <CustomProviderCard
+                key={cp.id}
+                provider={cp}
+                boundKeys={boundKeys}
+                onEdit={() => startEditCustom(cp)}
+                onDelete={() => void removeCustomProvider(cp.id)}
+                onAddKey={(label, apiKey) => void addKeyToProvider(cp.id, label, apiKey)}
+                onRemoveKey={(keyId) => void removeKeyFromProvider(cp.id, keyId)}
+                onToggleKey={(keyId) => void toggleKeyInProvider(cp.id, keyId)}
+              />
+            );
+          })}
+        </div>
+      )}
     </section>
   );
 }
@@ -641,13 +753,16 @@ function accountState(
   return { tone: "good", key: "providers.stateActive", fallback: "正常", needsReauth: false };
 }
 
-function AccountGroup({
+function ProviderCard({
   group,
   isBusy,
   authFailedNames,
   authHealth,
   onDelete,
   onReauth,
+  onAddAccount,
+  onDeleteAll,
+  onToggleDisableAll,
 }: {
   group: AccountGroupData;
   isBusy: boolean;
@@ -655,11 +770,15 @@ function AccountGroup({
   authHealth: Map<string, AccountAuthHealth>;
   onDelete: (account: AuthFile) => void;
   onReauth: (account: AuthFile) => void;
+  onAddAccount: () => void;
+  onDeleteAll: () => void;
+  onToggleDisableAll: () => void;
 }) {
-  const [open, setOpen] = useState(true);
+  const [expanded, setExpanded] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
   const initial = group.label.trim().charAt(0).toUpperCase() || "?";
-  // Float accounts needing re-auth to the top so they're easy to spot/fix.
-  // Compute each account's state once (not twice per comparison) before sorting.
   const accounts = group.accounts
     .map((account) => ({
       account,
@@ -668,34 +787,99 @@ function AccountGroup({
     .sort((a, b) => Number(b.needsReauth) - Number(a.needsReauth))
     .map((entry) => entry.account);
 
+  const goodCount = accounts.filter((a) => {
+    const s = accountState(a, authFailedNames.has(a.name), healthFor(a, authHealth));
+    return s.tone === "good";
+  }).length;
+  const badCount = accounts.filter((a) => {
+    const s = accountState(a, authFailedNames.has(a.name), healthFor(a, authHealth));
+    return s.tone === "bad" || s.needsReauth;
+  }).length;
+  const allDisabled = accounts.length > 0 && accounts.every((a) => a.disabled);
+
+  const cardStatus = badCount > 0 ? "warn" : accounts.length === 0 ? "muted" : "good";
+  const statusLabel = badCount > 0 ? `${badCount} 个异常` : allDisabled ? "已禁用" : goodCount === accounts.length ? "正常" : "多闲";
+
+  const PREVIEW_COUNT = 3;
+  const previewAccounts = expanded ? accounts : accounts.slice(0, PREVIEW_COUNT);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function close(e: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    }
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [menuOpen]);
+
   return (
-    <div className="account-group">
-      <button className="account-group-head" type="button" onClick={() => setOpen((value) => !value)}>
-        <span className={open ? "group-chevron group-chevron--open" : "group-chevron"} aria-hidden="true">
-          ›
-        </span>
-        <span className="account-logo" style={{ color: `#${group.colorHex}`, background: `#${group.colorHex}22` }} aria-hidden="true">
+    <div className="pv-card">
+      <div className="pv-card-head">
+        <span className="pv-card-logo" style={{ color: `#${group.colorHex}`, background: `#${group.colorHex}18` }}>
           {initial}
         </span>
-        <span className="account-group-name">{group.label}</span>
-        <span className="account-group-count">{group.accounts.length}</span>
-      </button>
-
-      {open ? (
-        <div className="account-rows">
-          {accounts.map((account) => (
-            <AccountRow
-              key={account.id}
-              account={account}
-              colorHex={group.colorHex}
-              isBusy={isBusy}
-              authFailed={authFailedNames.has(account.name)}
-              health={healthFor(account, authHealth)}
-              onDelete={() => onDelete(account)}
-              onReauth={() => onReauth(account)}
-            />
-          ))}
+        <div className="pv-card-title-area">
+          <strong className="pv-card-name">{group.label}</strong>
+          <span className={`pv-card-status pv-card-status--${cardStatus}`}>{statusLabel}</span>
         </div>
+        <button className="pv-card-add" type="button" onClick={onAddAccount} disabled={isBusy} title="添加账号" aria-label="添加账号">
+          <PlusIcon />
+        </button>
+        <div className="pv-card-menu-anchor" ref={menuRef}>
+          <button className="pv-card-more" type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="更多操作">
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><circle cx="8" cy="3" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="8" cy="13" r="1.3"/></svg>
+          </button>
+          {menuOpen ? (
+            <div className="pv-card-dropdown">
+              <button type="button" onClick={() => { onAddAccount(); setMenuOpen(false); }}>
+                <PlusIcon /> 添加账号
+              </button>
+              {accounts.length > 0 ? (
+                <button type="button" onClick={() => { onToggleDisableAll(); setMenuOpen(false); }}>
+                  {allDisabled ? "✦ 全部启用" : "⏸ 全部禁用"}
+                </button>
+              ) : null}
+              {accounts.length > 0 ? (
+                <button
+                  type="button"
+                  className={confirmDelete ? "pv-dropdown-danger" : ""}
+                  onClick={() => {
+                    if (confirmDelete) { onDeleteAll(); setMenuOpen(false); setConfirmDelete(false); }
+                    else { setConfirmDelete(true); window.setTimeout(() => setConfirmDelete(false), 3000); }
+                  }}
+                >
+                  <TrashIcon /> {confirmDelete ? `确认删除 ${accounts.length} 个？` : "删除所有账号"}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <span className="pv-card-meta">{group.accounts.length} 个账户</span>
+
+      <div className="pv-card-accounts">
+        {previewAccounts.map((account) => (
+          <AccountRow
+            key={account.id}
+            account={account}
+            colorHex={group.colorHex}
+            isBusy={isBusy}
+            authFailed={authFailedNames.has(account.name)}
+            health={healthFor(account, authHealth)}
+            onDelete={() => onDelete(account)}
+            onReauth={() => onReauth(account)}
+          />
+        ))}
+      </div>
+
+      {accounts.length > PREVIEW_COUNT ? (
+        <button className="pv-card-toggle" type="button" onClick={() => setExpanded((v) => !v)}>
+          {expanded ? "收起" : `查看全部 ${accounts.length} 个`}{" "}
+            <svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", transition: "transform 0.2s", transform: expanded ? "rotate(180deg)" : "rotate(0)" }}>
+              <path d="M2.5 4.5 6 8l3.5-3.5" />
+            </svg>
+        </button>
       ) : null}
     </div>
   );
@@ -815,210 +999,3 @@ function groupAccounts(authFiles: AuthFile[], providers: ProviderSummary[]): Acc
   return groups;
 }
 
-function OAuthPanel({
-  providers,
-  projectId,
-  oauthSession,
-  isBusy,
-  managementAction,
-  onProjectIdChange,
-  onStartOAuth,
-  onPollOAuth,
-  onCancel,
-}: {
-  providers: ProviderSummary[];
-  projectId: string;
-  oauthSession: OAuthSession | null;
-  isBusy: boolean;
-  managementAction: string | null;
-  onProjectIdChange: (value: string) => void;
-  onStartOAuth: (provider: ProviderSummary) => void;
-  onPollOAuth: () => void;
-  onCancel?: () => void;
-}) {
-  const [copied, setCopied] = useState(false);
-  const [manualCallback, setManualCallback] = useState("");
-  const [callbackBusy, setCallbackBusy] = useState(false);
-  const [callbackError, setCallbackError] = useState<string | null>(null);
-  async function copyAuthUrl(url: string) {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      /* clipboard unavailable (e.g. non-secure context) — user can still open it */
-    }
-  }
-  async function submitManualCallback() {
-    const value = manualCallback.trim();
-    if (!value) return;
-    setCallbackBusy(true);
-    setCallbackError(null);
-    try {
-      await invoke("submit_oauth_callback", { url: value });
-      setManualCallback("");
-      onPollOAuth(); // re-check status now that the proxy received the code
-    } catch (error) {
-      setCallbackError(String(error));
-    } finally {
-      setCallbackBusy(false);
-    }
-  }
-  return (
-    <article className="panel section-panel">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow">OAuth</p>
-          <h2>授权入口</h2>
-        </div>
-        <span className="count-pill">{providers.length} providers</span>
-      </div>
-
-      <div className="stacked-form">
-        <label>
-          Project ID，可选
-          <input value={projectId} onChange={(event) => onProjectIdChange(event.target.value)} placeholder="Google / Vertex project id" />
-        </label>
-      </div>
-
-      <div className="provider-chip-grid">
-        {providers.map((provider) => (
-          <button
-            className="provider-chip provider-chip--button"
-            key={provider.id}
-            type="button"
-            onClick={() => onStartOAuth(provider)}
-            disabled={isBusy || !provider.oauth_endpoint}
-          >
-            <span className="provider-dot" style={{ backgroundColor: `#${provider.color_hex}` }} />
-            <span>
-              <strong>{provider.display_name}</strong>
-              <small>{provider.oauth_endpoint}</small>
-            </span>
-          </button>
-        ))}
-      </div>
-
-      {oauthSession ? (
-        <div className="oauth-session-card">
-          <div className="oauth-session-head">
-            <strong>{oauthSession.providerName}</strong>
-            <span className={`oauth-status oauth-status--${oauthSession.status}`}>{oauthSession.status}</span>
-          </div>
-          {["ok", "success", "completed"].includes(oauthSession.status) ? (
-            <p style={{ margin: "4px 0 8px", fontSize: 13, color: "#16a34a", lineHeight: 1.5 }}>
-              ✅ 账号已添加。再加一个号:点上方 provider <strong>重新授权</strong>(会生成新链接);不同账号请用<strong>隐身窗口</strong>登录,避免串号。
-            </p>
-          ) : null}
-          {oauthSession.error ? <p className="inline-error">{oauthSession.error}</p> : null}
-          {oauthSession.url ? (
-            <div className="oauth-url-row" style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
-              <input
-                className="oauth-url-input"
-                type="text"
-                readOnly
-                value={oauthSession.url}
-                onFocus={(event) => event.currentTarget.select()}
-                style={{ flex: 1, minWidth: 0 }}
-              />
-              <button
-                className="secondary-action"
-                type="button"
-                onClick={() => void copyAuthUrl(oauthSession.url!)}
-                title="复制授权链接（可粘到隐身窗口用其它账号登录）"
-              >
-                {copied ? "已复制" : "复制链接"}
-              </button>
-            </div>
-          ) : null}
-          {oauthSession.url ? (
-            <p style={{ margin: "0 0 8px", fontSize: 12, opacity: 0.72, lineHeight: 1.5 }}>
-              💡 添加<strong>其它账号</strong>时:点"复制链接",在浏览器的<strong>隐身/无痕窗口</strong>打开并登录该账号——否则会复用当前已登录的账号,导致串号。
-            </p>
-          ) : null}
-          {oauthSession.state ? <code className="oauth-token">{oauthSession.state}</code> : null}
-          <div className="oauth-session-actions">
-            {oauthSession.url ? (
-              <a className="secondary-action" href={oauthSession.url} target="_blank" rel="noreferrer">
-                在浏览器中打开
-              </a>
-            ) : null}
-            <button className="primary-action" type="button" onClick={onPollOAuth} disabled={isBusy || !oauthSession.state}>
-              {managementAction === "poll_management_oauth" ? "轮询中..." : "轮询授权状态"}
-            </button>
-            <button className="secondary-action" type="button" onClick={() => onCancel?.()}>
-              取消
-            </button>
-          </div>
-          <div className="oauth-manual-callback" style={{ marginTop: 10 }}>
-            <p style={{ margin: "0 0 6px", fontSize: 12, opacity: 0.75 }}>
-              自动回调没完成？把浏览器里的回调地址（http://localhost:1455/...&amp;code=...）粘到这里手动完成：
-            </p>
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input
-                type="text"
-                placeholder="http://localhost:1455/auth/callback?code=...&amp;state=..."
-                value={manualCallback}
-                onChange={(event) => setManualCallback(event.target.value)}
-                style={{ flex: 1, minWidth: 0 }}
-              />
-              <button
-                className="secondary-action"
-                type="button"
-                disabled={isBusy || callbackBusy || manualCallback.trim().length === 0}
-                onClick={() => void submitManualCallback()}
-              >
-                {callbackBusy ? "提交中..." : "我已授权，提交"}
-              </button>
-            </div>
-            {callbackError ? <p className="inline-error" style={{ marginTop: 6 }}>{callbackError}</p> : null}
-          </div>
-        </div>
-      ) : null}
-    </article>
-  );
-}
-
-function VertexImportPanel({
-  provider,
-  value,
-  error,
-  isBusy,
-  onChange,
-  onImport,
-}: {
-  provider: ProviderSummary | undefined;
-  value: string;
-  error: string | null;
-  isBusy: boolean;
-  onChange: (value: string) => void;
-  onImport: () => void;
-}) {
-  return (
-    <article className="panel section-panel">
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow">Vertex</p>
-          <h2>Service Account 导入</h2>
-        </div>
-        <span className="count-pill">{provider?.display_name ?? "Vertex AI"}</span>
-      </div>
-
-      <div className="stacked-form">
-        <label>
-          Service account JSON
-          <textarea
-            value={value}
-            onChange={(event) => onChange(event.target.value)}
-            placeholder='{"type":"service_account",...}'
-            rows={9}
-          />
-        </label>
-        {error ? <p className="inline-error">{error}</p> : null}
-        <button className="secondary-action" type="button" onClick={onImport} disabled={isBusy || value.trim().length === 0}>
-          导入 Vertex JSON
-        </button>
-      </div>
-    </article>
-  );
-}

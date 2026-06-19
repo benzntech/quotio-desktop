@@ -52,12 +52,20 @@ export type AppSettings = {
   scheduler_switch_margin_minutes: number;
 };
 
+export type ProviderSchedulerEntry = {
+  provider_id: string;
+  target_label: string | null;
+  target_reset_at_unix: number | null;
+  standby_count: number;
+};
+
 // Mirrors crates/quotio-types `SchedulerStatus`(智能账号调度状态).
 export type SchedulerStatus = {
   rule: string;
   target_label: string | null;
   target_reset_at_unix: number | null;
   standby_count: number;
+  providers?: ProviderSchedulerEntry[];
 };
 
 export type CodexAccountRef = {
@@ -120,6 +128,23 @@ export type ProviderSummary = {
   uses_cli_quota: boolean;
   uses_api_key_auth: boolean;
   enabled: boolean;
+  native_oauth?: boolean;
+};
+
+export type NativeOAuthStartResponse = {
+  login_id: string;
+  auth_url: string;
+  user_code: string;
+  verification_uri: string;
+  provider_id: string;
+  flow: "authorization_code" | "device_code";
+};
+
+export type NativeOAuthCompleteResponse = {
+  status: string;
+  error: string | null;
+  provider_id: string;
+  account_email: string | null;
 };
 
 export type RecentRequestBucket = {
@@ -301,6 +326,11 @@ export type ApiKeyEntry = {
   value: string;
   masked_value: string;
   source: string;
+};
+
+export type ApiKeyBinding = {
+  api_key: string;
+  provider_id: string;
 };
 
 export type FallbackEntry = {
@@ -557,6 +587,7 @@ export type AppState = {
   logs: RequestLogEntry[];
   agents: AgentStatus[];
   api_keys: ApiKeyEntry[];
+  api_key_bindings?: ApiKeyBinding[];
   request_stats: RequestStats | null;
   fallback: FallbackConfiguration;
   fallback_runtime: FallbackRuntimeState;

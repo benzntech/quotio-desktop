@@ -47,6 +47,16 @@ const CODEX_MODELS = [
   "codex-auto-review",
 ];
 
+// Kiro（claude-* via kiro-rs）模型。当配置的 API 密钥绑定到 Kiro 时,模型下拉改用这组。
+// 只列 Kiro 免费账号能跑的（Sonnet 4.5 / Haiku 4.5）——列出账号用不了的(Opus、Sonnet 4.6)
+// 会触发上游 INVALID_MODEL_ID 并冷却整个 Kiro 账号。与后端 DEFAULT_KIRO_MODELS 保持一致。
+const KIRO_MODELS = [
+  "claude-sonnet-4-5-20250929",
+  "claude-sonnet-4-5-20250929-thinking",
+  "claude-haiku-4-5-20251001",
+  "claude-haiku-4-5-20251001-thinking",
+];
+
 // Codex 思考程度（model_reasoning_effort）。xhigh=极高，gpt-5.1-codex-max 等支持。
 const CODEX_REASONING: { value: string; fallback: string }[] = [
   { value: "minimal", fallback: "最低" },
@@ -237,18 +247,24 @@ export function AgentsScreen({
   function configForm(status: AgentStatus) {
     const configuration = agentConfigurations[status.agent.id];
     const backups = agentBackups[status.agent.id] ?? configuration?.backups ?? [];
-    // Codex 模型：优先用从代理实时拉到的（fetch_codex_models）；拉不到才回退到内置列表 ∪ 发现的模型。
+    // 模型列表随配置的 API 密钥所绑定的池而变：绑 Kiro → 显示 Kiro 的 claude 模型,
+    // 这样这个 CLI 走 Kiro;否则走 Codex（优先代理实时模型,回退内置列表 ∪ 发现的 gpt/codex）。
+    const boundProvider = (appState.api_key_bindings ?? []).find(
+      (binding) => binding.api_key === apiKey,
+    )?.provider_id;
     const codexModelList =
-      proxyModels.length > 0
-        ? proxyModels
-        : [
-            ...new Set([
-              ...CODEX_MODELS,
-              ...modelOptions
-                .filter((model) => /gpt-5|codex/i.test(model.id))
-                .map((model) => model.id),
-            ]),
-          ];
+      boundProvider === "kiro"
+        ? KIRO_MODELS
+        : proxyModels.length > 0
+          ? proxyModels
+          : [
+              ...new Set([
+                ...CODEX_MODELS,
+                ...modelOptions
+                  .filter((model) => /gpt-5|codex/i.test(model.id))
+                  .map((model) => model.id),
+              ]),
+            ];
 
     return (
       <div className="agent-config-panel">
