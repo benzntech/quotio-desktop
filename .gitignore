@@ -69,3 +69,8 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 *.zip
+
+# vendored kiro-rs 的 admin-ui/dist 是 rust-embed 编译期必需的占位目录,
+# 不能被上面的全局 dist/ 规则忽略,否则 CI 检出后编不过(Asset::get 缺失)。
+!vendor/kiro-rs/admin-ui/dist/
+!vendor/kiro-rs/admin-ui/dist/**
