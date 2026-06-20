@@ -2,6 +2,11 @@
 
 本文档记录 Quotio Desktop 已发布版本的主要变化。安装包请前往 [GitHub Releases](https://github.com/xiaocoss/quotio-desktop/releases)。
 
+<!-- 发版提醒：打 tag 前，把下面「未发布」段的标题改成真实版本号
+     "## vX.Y.Z - YYYY-MM-DD"，并确保它与 git tag 一致。release.yml 按 tag 版本号
+     从本文件抽取对应段作为 Release 正文 + 应用内更新弹窗内容；标题对不上就抽不到，
+     这些改动不会出现在更新提示里。 -->
+
 ## v0.4.3 - 未发布
 
 ### 修复
