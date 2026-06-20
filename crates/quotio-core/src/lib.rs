@@ -1889,7 +1889,14 @@ pub fn export_auth_files(zip_path: &std::path::Path) -> Result<String, String> {
 
 fn enrich_auth_files_with_local_markers(files: &mut [AuthFile], local_accounts: &[AuthFile]) {
     for file in files {
-        let Some(local) = local_accounts.iter().find(|local| local.name == file.name) else {
+        // Case-INSENSITIVE match: the proxy's /auth-files lowercases filenames
+        // while the local auth dir keeps the original case, so an exact `==`
+        // would skip enrichment for any mixed-case file (e.g. the scheduler
+        // standby marker), making a parked account look user-disabled.
+        let Some(local) = local_accounts
+            .iter()
+            .find(|local| local.name.eq_ignore_ascii_case(&file.name))
+        else {
             continue;
         };
         if file.quotio_bound_login_only.is_none() {

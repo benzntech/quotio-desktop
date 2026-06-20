@@ -263,8 +263,12 @@ export function ProvidersScreen({
   const authFiles = useMemo(() => {
     if (proxyAuthFiles.length === 0) return localAccounts;
     if (localAccounts.length === 0) return proxyAuthFiles;
-    const proxyNames = new Set(proxyAuthFiles.map((f) => f.name));
-    const extra = localAccounts.filter((f) => !proxyNames.has(f.name));
+    // Match case-INSENSITIVELY: the proxy's /auth-files lowercases filenames,
+    // but the local auth dir keeps the original (mixed) case. A case-sensitive
+    // check re-adds every mixed-case local file (e.g. codex-MartilloOlivia…) as
+    // a phantom duplicate while all-lowercase ones dedupe fine.
+    const proxyNames = new Set(proxyAuthFiles.map((f) => f.name.toLowerCase()));
+    const extra = localAccounts.filter((f) => !proxyNames.has(f.name.toLowerCase()));
     return extra.length > 0 ? [...proxyAuthFiles, ...extra] : proxyAuthFiles;
   }, [proxyAuthFiles, localAccounts]);
   const groups = useMemo(() => groupAccounts(authFiles, appState.providers), [authFiles, appState.providers]);

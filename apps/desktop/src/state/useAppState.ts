@@ -249,10 +249,12 @@ export function useAppState() {
       if (names.length > 0) {
         const authFiles = state.management.auth_files ?? [];
         for (const name of names) {
-          const file = authFiles.find((entry) => entry.name === name);
+          // Case-insensitive: auto-disabled keys may be mixed-case while the proxy
+          // lowercases /auth-files names; call the API with the proxy's own name.
+          const file = authFiles.find((entry) => entry.name.toLowerCase() === name.toLowerCase());
           if (file?.disabled) {
             try {
-              await invoke("set_management_auth_file_disabled", { name, disabled: false });
+              await invoke("set_management_auth_file_disabled", { name: file.name, disabled: false });
             } catch {
               continue; // 代理不可达——留在账上,下轮交接重试
             }
@@ -297,10 +299,10 @@ export function useAppState() {
     // that is no longer quota-visible gets re-probed (and re-disabled if still out).
     for (const [name, disabledAt] of Object.entries(auto)) {
       if (now - disabledAt < REENABLE_AFTER_MS) continue;
-      const file = authFiles.find((entry) => entry.name === name);
+      const file = authFiles.find((entry) => entry.name.toLowerCase() === name.toLowerCase());
       if (file?.disabled) {
         try {
-          await invoke("set_management_auth_file_disabled", { name, disabled: false });
+          await invoke("set_management_auth_file_disabled", { name: file.name, disabled: false });
           changed = true;
         } catch {
           /* skip */
