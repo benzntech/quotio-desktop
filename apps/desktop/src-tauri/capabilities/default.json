@@ -16,7 +16,10 @@
     "core:window:allow-set-size",
     "opener:default",
     "opener:allow-reveal-item-in-dir",
+    "dialog:allow-confirm",
+    "dialog:allow-open",
     "dialog:allow-save",
+    "fs:default",
     "notification:default",
     "updater:default",
     "process:default"

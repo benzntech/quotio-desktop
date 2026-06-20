@@ -210,8 +210,11 @@ export function AddAccountModal({
           nativeLoginRef.current = null;
           return;
         }
-      } catch {
-        // transient error, keep polling
+      } catch (err) {
+        setOauthStatus("error");
+        setOauthError(`授权完成失败：${String(err)}`);
+        nativeLoginRef.current = null;
+        return;
       }
     }
     setOauthStatus("error");

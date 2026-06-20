@@ -1,4 +1,4 @@
-export type AppSection = "dashboard" | "providers" | "quota" | "agents" | "fallback" | "api_keys" | "logs" | "settings" | "about";
+export type AppSection = "dashboard" | "providers" | "quota" | "two_factor" | "agents" | "api_keys" | "logs" | "settings" | "about";
 export type OperatingMode = "full" | "quota_only" | "remote";
 export type ConnectionMode = "local" | "remote";
 export type ThemeMode = "system" | "light" | "dark";

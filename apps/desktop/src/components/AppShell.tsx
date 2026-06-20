@@ -20,7 +20,7 @@ import type {
 import { DashboardScreen } from "./dashboard/DashboardScreen";
 import { AgentsScreen } from "./sections/AgentsScreen";
 import { ApiKeysScreen } from "./sections/ApiKeysScreen";
-import { FallbackScreen } from "./sections/FallbackScreen";
+import { TwoFactorAuthScreen } from "./sections/TwoFactorAuthScreen";
 import { LogsScreen } from "./sections/LogsScreen";
 import { ProvidersScreen } from "./sections/ProvidersScreen";
 import { QuotaScreen } from "./sections/QuotaScreen";
@@ -87,7 +87,7 @@ const navItems: NavItem[] = [
   { id: "dashboard", label: "Dashboard", symbol: "⌂" },
   { id: "quota", label: "Quota", symbol: "▥" },
   { id: "providers", label: "Providers", symbol: "◎" },
-  { id: "fallback", label: "Fallback", symbol: "⑂", experimental: true },
+  { id: "two_factor", label: "2FA", symbol: "⚿" },
   { id: "agents", label: "Agents", symbol: "▣" },
   { id: "api_keys", label: "API Keys", symbol: "⚿" },
   { id: "logs", label: "Logs", symbol: "☰" },
@@ -426,18 +426,8 @@ function renderSection(section: AppSection, props: AppShellProps, updater: Retur
           onSaveSettings={props.onSaveSettings}
         />
       );
-    case "fallback":
-      return (
-        <FallbackScreen
-          appState={props.appState}
-          isBusy={props.localAction === "update_fallback_configuration" || props.fallbackAction !== null}
-          fallbackAction={props.fallbackAction}
-          availableModels={props.availableModels.length > 0 ? props.availableModels : props.appState.fallback_runtime.available_models}
-          onUpdateFallback={props.onRunFallbackConfigAction}
-          onDiscoverModels={props.onDiscoverAvailableModels}
-          onRefreshRouteState={props.onRefreshFallbackRouteState}
-        />
-      );
+    case "two_factor":
+      return <TwoFactorAuthScreen />;
     case "api_keys":
       return (
         <ApiKeysScreen

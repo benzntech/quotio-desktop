@@ -3,6 +3,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::TcpListener;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -183,6 +184,71 @@ fn now_ts() -> i64 {
 
 const OAUTH_TIMEOUT_SECONDS: i64 = 300;
 
+fn native_oauth_log_path() -> std::path::PathBuf {
+    quotio_platform::app_logs_dir().join("native-oauth.log")
+}
+
+fn log_oauth_event(provider_id: &str, login_id: Option<&str>, stage: &str, detail: &str) {
+    let safe_detail = detail.replace(['\r', '\n'], " ");
+    let login = login_id.unwrap_or("-");
+    let line = format!(
+        "{} provider={} login_id={} stage={} {}\n",
+        chrono::Utc::now().to_rfc3339(),
+        provider_id,
+        login,
+        stage,
+        safe_detail
+    );
+
+    eprintln!(
+        "[OAuth] provider={} login_id={} stage={} {}",
+        provider_id, login, stage, safe_detail
+    );
+
+    let path = native_oauth_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn with_log_hint(message: &str) -> String {
+    format!(
+        "{}（详情见日志：{}）",
+        message,
+        native_oauth_log_path().display()
+    )
+}
+
+fn complete_error_response(
+    login_id: &str,
+    provider_id: &str,
+    stage: &str,
+    message: String,
+) -> OAuthCompleteResponse {
+    log_oauth_event(provider_id, Some(login_id), stage, &message);
+    let error = with_log_hint(&message);
+    if let Ok(mut guard) = get_state().lock() {
+        if let Some(s) = guard.as_mut() {
+            if s.login_id == login_id {
+                s.error = Some(error.clone());
+            }
+        }
+    }
+    OAuthCompleteResponse {
+        status: "error".to_string(),
+        error: Some(error),
+        provider_id: provider_id.to_string(),
+        account_email: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PKCE helpers
 // ---------------------------------------------------------------------------
@@ -208,8 +274,8 @@ fn oauth_success_html() -> &'static str {
     background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);font-family:system-ui,sans-serif'>\
     <div style='text-align:center;color:#fff'>\
     <div style='font-size:64px;margin-bottom:16px'>&#9989;</div>\
-    <h1 style='font-size:32px;font-weight:700;margin:0 0 12px'>授权成功</h1>\
-    <p style='font-size:16px;opacity:.85;margin:0'>您可以关闭此窗口并返回应用</p>\
+    <h1 style='font-size:32px;font-weight:700;margin:0 0 12px'>已收到授权回调</h1>\
+    <p style='font-size:16px;opacity:.85;margin:0'>请返回 Quotio 等待账号保存完成</p>\
     </div>\
     <script>setTimeout(function(){window.close()},3000)</script>\
     </body></html>"
@@ -279,9 +345,23 @@ fn start_callback_server(
 ) {
     std::thread::spawn(move || {
         let server = match tiny_http::Server::http(format!("127.0.0.1:{}", port)) {
-            Ok(s) => s,
+            Ok(s) => {
+                log_oauth_event(
+                    "unknown",
+                    Some(&expected_login_id),
+                    "callback_listening",
+                    &format!("listening on 127.0.0.1:{}{}", port, callback_path),
+                );
+                s
+            }
             Err(e) => {
                 eprintln!("[OAuth] 回调服务启动失败: {}", e);
+                log_oauth_event(
+                    "unknown",
+                    Some(&expected_login_id),
+                    "callback_start_failed",
+                    &format!("回调服务启动失败: {}", e),
+                );
                 if let Ok(mut guard) = get_state().lock() {
                     if let Some(s) = guard.as_mut() {
                         if s.login_id == expected_login_id {
@@ -331,6 +411,12 @@ fn start_callback_server(
                 Some((p, q)) => (p, q),
                 None => (raw_url.as_str(), ""),
             };
+            log_oauth_event(
+                "unknown",
+                Some(&expected_login_id),
+                "callback_received",
+                &format!("path={}", path),
+            );
 
             // Only handle the expected callback path.
             if path != callback_path && path != "/signin/callback" {
@@ -354,6 +440,7 @@ fn start_callback_server(
                 if let Ok(mut guard) = get_state().lock() {
                     if let Some(s) = guard.as_mut() {
                         if s.login_id == expected_login_id {
+                            log_oauth_event(&s.provider_id, Some(&expected_login_id), "callback_error", &msg);
                             s.error = Some(msg.clone());
                         }
                     }
@@ -369,6 +456,7 @@ fn start_callback_server(
                 if let Ok(mut guard) = get_state().lock() {
                     if let Some(s) = guard.as_mut() {
                         if s.login_id == expected_login_id {
+                            log_oauth_event(&s.provider_id, Some(&expected_login_id), "callback_state_mismatch", msg);
                             s.error = Some(msg.to_string());
                         }
                     }
@@ -384,6 +472,7 @@ fn start_callback_server(
                 if let Ok(mut guard) = get_state().lock() {
                     if let Some(s) = guard.as_mut() {
                         if s.login_id == expected_login_id {
+                            log_oauth_event(&s.provider_id, Some(&expected_login_id), "callback_missing_code", msg);
                             s.error = Some(msg.to_string());
                         }
                     }
@@ -396,6 +485,7 @@ fn start_callback_server(
             if let Ok(mut guard) = get_state().lock() {
                 if let Some(s) = guard.as_mut() {
                     if s.login_id == expected_login_id {
+                        log_oauth_event(&s.provider_id, Some(&expected_login_id), "callback_code_received", "authorization code received; waiting for token exchange");
                         s.code = Some(code);
                     }
                 }
@@ -429,6 +519,12 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 // ---------------------------------------------------------------------------
 
 fn exchange_auth_code(pending: &PendingOAuth) -> Result<serde_json::Value, String> {
+    log_oauth_event(
+        &pending.provider_id,
+        Some(&pending.login_id),
+        "token_exchange_start",
+        &format!("endpoint={}", pending.token_endpoint),
+    );
     let code = pending
         .code
         .as_deref()
@@ -490,6 +586,12 @@ fn exchange_auth_code(pending: &PendingOAuth) -> Result<serde_json::Value, Strin
         .map_err(|e| format!("读取 Token 响应失败: {}", e))?;
     let mut token: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("解析 Token 响应失败: {}", e))?;
+    log_oauth_event(
+        &pending.provider_id,
+        Some(&pending.login_id),
+        "token_exchange_success",
+        "token response received and parsed",
+    );
 
     // Unwrap { "data": { ... } } wrapper if present (Kiro).
     if let Some(data) = token
@@ -869,6 +971,12 @@ fn write_auth_file(
     token: &serde_json::Value,
 ) -> Result<(std::path::PathBuf, Option<String>), String> {
     let dir = quotio_platform::proxy_auth_dir();
+    log_oauth_event(
+        provider_id,
+        None,
+        "auth_file_write_start",
+        &format!("dir={}", dir.display()),
+    );
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 auth 目录失败: {}", e))?;
 
     let mut output = token.clone();
@@ -940,6 +1048,12 @@ fn write_auth_file(
     let content = serde_json::to_string_pretty(&output)
         .map_err(|e| format!("序列化 token 失败: {}", e))?;
     std::fs::write(&path, &content).map_err(|e| format!("写入 auth 文件失败: {}", e))?;
+    log_oauth_event(
+        provider_id,
+        None,
+        "auth_file_write_success",
+        &format!("path={} email={}", path.display(), email.as_deref().unwrap_or("unknown")),
+    );
 
     Ok((path, email))
 }
@@ -1176,8 +1290,28 @@ fn complete_auth_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse, 
         });
     }
 
-    let token = exchange_auth_code(snapshot)?;
-    let (_path, email) = write_auth_file(&snapshot.provider_id, &token)?;
+    let token = match exchange_auth_code(snapshot) {
+        Ok(token) => token,
+        Err(error) => {
+            return Ok(complete_error_response(
+                &snapshot.login_id,
+                &snapshot.provider_id,
+                "token_exchange_failed",
+                error,
+            ));
+        }
+    };
+    let (_path, email) = match write_auth_file(&snapshot.provider_id, &token) {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(complete_error_response(
+                &snapshot.login_id,
+                &snapshot.provider_id,
+                "auth_file_write_failed",
+                error,
+            ));
+        }
+    };
 
     if let Ok(mut guard) = get_state().lock() {
         if let Some(s) = guard.as_mut() {
@@ -1186,6 +1320,12 @@ fn complete_auth_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse, 
             }
         }
     }
+    log_oauth_event(
+        &snapshot.provider_id,
+        Some(&snapshot.login_id),
+        "complete_success",
+        &format!("account_email={}", email.as_deref().unwrap_or("unknown")),
+    );
 
     Ok(OAuthCompleteResponse {
         status: "success".to_string(),
@@ -1196,7 +1336,19 @@ fn complete_auth_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse, 
 }
 
 fn complete_device_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse, String> {
-    match poll_device_token(snapshot)? {
+    let polled_token = match poll_device_token(snapshot) {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(complete_error_response(
+                &snapshot.login_id,
+                &snapshot.provider_id,
+                "device_token_poll_failed",
+                error,
+            ));
+        }
+    };
+
+    match polled_token {
         None => Ok(OAuthCompleteResponse {
             status: "pending".to_string(),
             error: None,
@@ -1204,7 +1356,17 @@ fn complete_device_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse
             account_email: None,
         }),
         Some(token) => {
-            let (_path, email) = write_auth_file(&snapshot.provider_id, &token)?;
+            let (_path, email) = match write_auth_file(&snapshot.provider_id, &token) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(complete_error_response(
+                        &snapshot.login_id,
+                        &snapshot.provider_id,
+                        "auth_file_write_failed",
+                        error,
+                    ));
+                }
+            };
 
             if let Ok(mut guard) = get_state().lock() {
                 if let Some(s) = guard.as_mut() {
@@ -1213,6 +1375,12 @@ fn complete_device_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse
                     }
                 }
             }
+            log_oauth_event(
+                &snapshot.provider_id,
+                Some(&snapshot.login_id),
+                "complete_success",
+                &format!("account_email={}", email.as_deref().unwrap_or("unknown")),
+            );
 
             Ok(OAuthCompleteResponse {
                 status: "success".to_string(),
@@ -1295,4 +1463,50 @@ pub fn import_auth_token(provider_id: &str, content: &str) -> Result<(), String>
 /// Check which providers support native OAuth.
 pub fn supports_native_oauth(provider_id: &str) -> bool {
     provider_config(provider_id).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth_code_pending_with_token_endpoint(token_endpoint: &str) -> PendingOAuth {
+        PendingOAuth {
+            login_id: "test-login".to_string(),
+            provider_id: "codex".to_string(),
+            flow: OAuthFlowKind::AuthorizationCode,
+            code_verifier: Some("test-verifier".to_string()),
+            redirect_uri: Some("http://localhost:1455/auth/callback".to_string()),
+            state_token: Some("test-state".to_string()),
+            callback_port: Some(1455),
+            auth_url: "https://auth.openai.com/oauth/authorize".to_string(),
+            code: Some("test-code".to_string()),
+            device_code: None,
+            user_code: None,
+            verification_uri: None,
+            interval_seconds: 2,
+            expires_at: now_ts() + 60,
+            error: None,
+            completed: false,
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            token_endpoint: token_endpoint.to_string(),
+            use_pkce: true,
+        }
+    }
+
+    #[test]
+    fn complete_auth_code_returns_error_status_when_token_exchange_fails() {
+        let pending = auth_code_pending_with_token_endpoint("http://127.0.0.1:9/oauth/token");
+
+        let response = complete_auth_code(&pending)
+            .expect("OAuth completion should return an error status for UI diagnostics");
+
+        assert_eq!(response.status, "error");
+        assert_eq!(response.provider_id, "codex");
+        let error = response.error.expect("error details should be visible to the UI");
+        assert!(
+            error.contains("Token 交换请求失败"),
+            "unexpected error details: {error}"
+        );
+    }
 }
