@@ -94,6 +94,20 @@ jobs:
           chmod +x "$dest/CLIProxyAPI"
           echo "Staged $dest/CLIProxyAPI"
 
+      # kiro-rs sidecar + 按 key 路由插件只有 Windows 版(源码不在本仓库,无 mac/linux
+      # 构建)。从仓库的 deps 发布拉取,打进 Windows 安装包;mac/linux 跳过(届时这俩
+      # 功能不可用,优雅降级)。
+      - name: Stage kiro-rs + key-router plugin — Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/deps"
+          New-Item -ItemType Directory -Force -Path "resources/kiro/windows" | Out-Null
+          New-Item -ItemType Directory -Force -Path "resources/proxy/windows/plugins" | Out-Null
+          Invoke-WebRequest -Uri "$base/kiro-rs.exe" -OutFile "resources/kiro/windows/kiro-rs.exe"
+          Invoke-WebRequest -Uri "$base/quotio-key-router.dll" -OutFile "resources/proxy/windows/plugins/quotio-key-router.dll"
+          Write-Host "Staged kiro-rs.exe + quotio-key-router.dll (Windows)"
+
       - name: Build and publish to Release
         uses: tauri-apps/tauri-action@v0
         env:
