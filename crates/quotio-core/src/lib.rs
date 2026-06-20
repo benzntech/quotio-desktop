@@ -2294,7 +2294,20 @@ fn key_router_plugins_yaml(proxy_dir: &Path) -> String {
     } else {
         "quotio-key-router.so"
     };
-    if !plugins_dir.join(dll_name).is_file() {
+    let managed_dll = plugins_dir.join(dll_name);
+    // Stage the bundled plugin into the managed plugins dir on first use, so a
+    // fresh install that ships the plugin under resources/proxy/<plat>/plugins/
+    // works without manual placement (mirrors kiro_sidecar::resolve_binary).
+    if !managed_dll.is_file() {
+        let bundled = quotio_platform::proxy_resource_dir()
+            .join("plugins")
+            .join(dll_name);
+        if bundled.is_file() {
+            let _ = std::fs::create_dir_all(&plugins_dir);
+            let _ = std::fs::copy(&bundled, &managed_dll);
+        }
+    }
+    if !managed_dll.is_file() {
         return String::new();
     }
     let bindings = get_api_key_bindings();

@@ -49,6 +49,29 @@ if (Test-Path $proxyExe) {
   Write-Warning "未找到 $proxyExe —— 便携版未内置代理，首次运行会自动下载（需联网一次）"
 }
 
+# 4b) kiro-rs sidecar（Kiro 代理池离线可用）：取 %APPDATA% 里那份
+$kiroExe = Join-Path $env:APPDATA 'Quotio/kiro-rs/kiro-rs.exe'
+if (Test-Path $kiroExe) {
+  $kiroDir = Join-Path $resDir 'kiro/windows'
+  New-Item -ItemType Directory -Path $kiroDir -Force | Out-Null
+  Copy-Item $kiroExe (Join-Path $kiroDir 'kiro-rs.exe') -Force
+  Write-Host "已内置 kiro-rs.exe（便携版 Kiro 池离线可用）"
+} else {
+  Write-Warning "未找到 $kiroExe —— 便携版未内置 kiro-rs（无 Kiro 账号时无所谓）"
+}
+
+# 4c) 按 key 路由插件（CLIProxyAPI scheduler 插件）：取 %APPDATA% 里那份。
+#     放进 resources/proxy/windows/plugins/，app 启动时会自动装载到管理目录。
+$plugin = Join-Path $env:APPDATA 'Quotio/proxy/plugins/quotio-key-router.dll'
+if (Test-Path $plugin) {
+  $pluginDir = Join-Path $winDir 'plugins'
+  New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
+  Copy-Item $plugin (Join-Path $pluginDir 'quotio-key-router.dll') -Force
+  Write-Host "已内置 quotio-key-router.dll（便携版按 key 路由离线可用）"
+} else {
+  Write-Warning "未找到 $plugin —— 便携版未内置按 key 路由插件"
+}
+
 # 5) 打 zip（zip 内含一层 $name/ 文件夹，解压即得便携目录）
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 if (Test-Path $zip) { Remove-Item $zip -Force }
