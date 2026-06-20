@@ -5,6 +5,10 @@ members = [
     "crates/quotio-platform",
     "crates/quotio-types",
 ]
+# vendor/* are standalone upstreams (kiro-rs sidecar + key-router plugin) built
+# only by the build-deps CI workflow into per-platform binaries — NOT part of the
+# app build. Excluded so the main workspace ignores their Cargo.toml/lock.
+exclude = ["vendor/kiro-rs", "vendor/quotio-key-router"]
 resolver = "2"
 
 [workspace.package]

@@ -2291,6 +2291,8 @@ fn key_router_plugins_yaml(proxy_dir: &Path) -> String {
     let plugins_dir = proxy_dir.join("plugins");
     let dll_name = if cfg!(windows) {
         "quotio-key-router.dll"
+    } else if cfg!(target_os = "macos") {
+        "quotio-key-router.dylib"
     } else {
         "quotio-key-router.so"
     };

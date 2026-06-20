@@ -1,0 +1,91 @@
+name: Build deps (kiro-rs + key-router)
+
+# 手动触发：把 kiro-rs sidecar 与「按 key 路由」插件在 Windows / macOS / Linux 三端
+# 各编一份，上传到本仓库的 `deps` 预发布。release.yml 构建安装包时从 `deps` 下载对应
+# 平台的二进制并打进包里，用户装完即用、无需手动放置。
+#
+# 源码 vendor 在 vendor/kiro-rs 与 vendor/quotio-key-router（均为 MIT 上游）。改了那边
+# 的源码后，重跑本工作流刷新 `deps` 里的二进制即可，无需发版。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            os: windows
+          - platform: macos-latest
+            os: darwin
+          - platform: ubuntu-22.04
+            os: linux
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            vendor/kiro-rs
+            vendor/quotio-key-router
+
+      # 插件：纯 Rust cdylib，三端直接编。
+      - name: Build key-router plugin
+        shell: bash
+        run: cargo build --release --manifest-path vendor/quotio-key-router/Cargo.toml
+
+      # kiro-rs：用 --no-default-features 走 reqwest 的 rustls（其 rustls-tls 特性常开），
+      # 绕开默认的 native-tls-vendored（要从源码编 OpenSSL，跨平台易挂）。
+      - name: Build kiro-rs (rustls, no vendored openssl)
+        shell: bash
+        run: cargo build --release --no-default-features --manifest-path vendor/kiro-rs/Cargo.toml
+
+      # cargo 的 cdylib 产物名是 lib?<crate_下划线>.<ext>；app 与 CLIProxyAPI 期望插件
+      # 文件名「干」为 quotio-key-router（短横线、无 lib 前缀），这是 CLIProxyAPI 推导
+      # plugin id 的依据。这里统一改名，并给可执行文件平台后缀，避免 deps 资产重名。
+      - name: Collect + rename artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ptgt="vendor/quotio-key-router/target/release"
+          ktgt="vendor/kiro-rs/target/release"
+          case "${{ matrix.os }}" in
+            windows)
+              cp "$ptgt/quotio_key_router.dll" "out/quotio-key-router.dll"
+              cp "$ktgt/kiro-rs.exe"           "out/kiro-rs.exe"
+              ;;
+            darwin)
+              cp "$ptgt/libquotio_key_router.dylib" "out/quotio-key-router-darwin.dylib"
+              cp "$ktgt/kiro-rs"                     "out/kiro-rs-darwin"
+              ;;
+            linux)
+              cp "$ptgt/libquotio_key_router.so" "out/quotio-key-router-linux.so"
+              cp "$ktgt/kiro-rs"                 "out/kiro-rs-linux"
+              ;;
+          esac
+          ls -la out
+
+      - name: Upload to deps prerelease
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # deps 预发布若不存在则建（非 v* tag，不触发 release.yml）。多平台并发时用
+          # view 守卫 + || true 吞掉创建竞态；各平台资产名互不冲突，并发上传安全。
+          if ! gh release view deps --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create deps --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "Bundled binaries (CI offline packaging)" \
+              --notes "kiro-rs sidecar + quotio-key-router plugin, per platform. Built from vendor/ by build-deps.yml; consumed by release.yml." || true
+          fi
+          gh release upload deps out/* --repo "$GITHUB_REPOSITORY" --clobber

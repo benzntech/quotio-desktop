@@ -94,9 +94,10 @@ jobs:
           chmod +x "$dest/CLIProxyAPI"
           echo "Staged $dest/CLIProxyAPI"
 
-      # kiro-rs sidecar + 按 key 路由插件只有 Windows 版(源码不在本仓库,无 mac/linux
-      # 构建)。从仓库的 deps 发布拉取,打进 Windows 安装包;mac/linux 跳过(届时这俩
-      # 功能不可用,优雅降级)。
+      # kiro-rs sidecar + 按 key 路由插件:三端各自从仓库 deps 预发布拉取对应平台的
+      # 二进制,打进安装包。这些二进制由 build-deps.yml 从 vendor/ 源码编出并上传到
+      # deps。下载失败(deps 还没生成对应平台资产)时仅告警、不让发版失败 —— 装出来的
+      # 包届时少这两个功能(优雅降级),其余照常。先跑一次 build-deps 工作流即可补齐。
       - name: Stage kiro-rs + key-router plugin — Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -104,9 +105,39 @@ jobs:
           $base = "https://github.com/${{ github.repository }}/releases/download/deps"
           New-Item -ItemType Directory -Force -Path "resources/kiro/windows" | Out-Null
           New-Item -ItemType Directory -Force -Path "resources/proxy/windows/plugins" | Out-Null
-          Invoke-WebRequest -Uri "$base/kiro-rs.exe" -OutFile "resources/kiro/windows/kiro-rs.exe"
-          Invoke-WebRequest -Uri "$base/quotio-key-router.dll" -OutFile "resources/proxy/windows/plugins/quotio-key-router.dll"
-          Write-Host "Staged kiro-rs.exe + quotio-key-router.dll (Windows)"
+          try {
+            Invoke-WebRequest -Uri "$base/kiro-rs.exe" -OutFile "resources/kiro/windows/kiro-rs.exe"
+            Invoke-WebRequest -Uri "$base/quotio-key-router.dll" -OutFile "resources/proxy/windows/plugins/quotio-key-router.dll"
+            Write-Host "Staged kiro-rs.exe + quotio-key-router.dll (Windows)"
+          } catch {
+            Write-Warning "deps 资产下载失败($_);本次 Windows 包不内置 kiro/插件(优雅降级)。先跑 build-deps 工作流。"
+          }
+
+      - name: Stage kiro-rs + key-router plugin — macOS/Linux
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -uo pipefail
+          base="https://github.com/${{ github.repository }}/releases/download/deps"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            plat=darwin; kasset=kiro-rs-darwin; passet=quotio-key-router-darwin.dylib; pext=dylib
+          else
+            plat=linux;  kasset=kiro-rs-linux;  passet=quotio-key-router-linux.so;     pext=so
+          fi
+          mkdir -p "resources/kiro/$plat" "resources/proxy/$plat/plugins"
+          if curl -fsSL "$base/$kasset" -o "resources/kiro/$plat/kiro-rs"; then
+            chmod +x "resources/kiro/$plat/kiro-rs"
+            echo "Staged kiro-rs ($plat)"
+          else
+            echo "::warning::kiro-rs ($plat) 下载失败,本次包不内置(优雅降级);先跑 build-deps。"
+            rm -f "resources/kiro/$plat/kiro-rs"
+          fi
+          if curl -fsSL "$base/$passet" -o "resources/proxy/$plat/plugins/quotio-key-router.$pext"; then
+            echo "Staged quotio-key-router.$pext ($plat)"
+          else
+            echo "::warning::key-router 插件 ($plat) 下载失败,本次包不内置(优雅降级);先跑 build-deps。"
+            rm -f "resources/proxy/$plat/plugins/quotio-key-router.$pext"
+          fi
 
       - name: Build and publish to Release
         uses: tauri-apps/tauri-action@v0

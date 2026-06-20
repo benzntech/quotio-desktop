@@ -1,0 +1,20 @@
+[package]
+name = "quotio-key-router"
+version = "0.1.0"
+edition = "2021"
+
+# CLIProxyAPI C-ABI scheduler plugin: routes each inbound client api-key to the
+# account pool it's bound to, and denies cross-pool access. Built as a native
+# dynamic library that the proxy loads from its `plugins.dir`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+base64 = "0.22"
+
+[profile.release]
+lto = true
+strip = true

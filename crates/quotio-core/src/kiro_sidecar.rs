@@ -180,6 +180,9 @@ fn resolve_binary() -> Option<PathBuf> {
     if bundled.is_file() {
         let _ = fs::create_dir_all(work_dir());
         if fs::copy(&bundled, &managed).is_ok() {
+            // Tauri's resource bundling can drop the unix exec bit; restore it so
+            // the staged sidecar is launchable on macOS/Linux. No-op on Windows.
+            let _ = crate::make_executable(&managed);
             return Some(managed);
         }
         return Some(bundled);
