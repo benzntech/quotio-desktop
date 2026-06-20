@@ -54,6 +54,7 @@ const en: Record<string, string> = {
   // Settings sections
   "settings.title": "Settings",
   "settings.openConfigDir": "Open config directory",
+  "settings.openLogsDir": "Open logs directory",
   "settings.appMode": "App Mode",
   "settings.general": "General",
   "settings.language": "Language",
@@ -265,6 +266,7 @@ const en: Record<string, string> = {
   // 2FA
   "twoFactor.desc": "Generate and manage local TOTP verification codes. Secrets are stored only on this device; export a backup before clearing app data.",
   "twoFactor.inputPlaceholder": "otpauth://totp/... or Base32 Secret",
+  "twoFactor.namePlaceholder": "Name / email (optional)",
   "twoFactor.query": "Query",
   "twoFactor.save": "Save",
   "twoFactor.saved": "Saved",
@@ -485,6 +487,7 @@ const zh: Record<string, string> = {
   // Settings sections
   "settings.title": "设置",
   "settings.openConfigDir": "打开配置目录",
+  "settings.openLogsDir": "打开日志目录",
   "settings.appMode": "应用模式",
   "settings.general": "通用",
   "settings.language": "语言",
@@ -696,6 +699,7 @@ const zh: Record<string, string> = {
   // 2FA
   "twoFactor.desc": "生成并管理本地 TOTP 动态验证码。密钥仅保存在本机；清除应用数据前请先导出备份。",
   "twoFactor.inputPlaceholder": "otpauth://totp/... 或 Base32 Secret",
+  "twoFactor.namePlaceholder": "名称 / 邮箱（可选）",
   "twoFactor.query": "查询",
   "twoFactor.save": "保存",
   "twoFactor.saved": "已保存",

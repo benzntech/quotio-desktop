@@ -3,6 +3,7 @@ import type { AppSettings, AppState, ConnectionMode, CredentialStatus, Operating
 import { Switch } from "../Switch";
 import { Select } from "../Select";
 import { useT } from "../../i18n";
+import { invoke } from "../../lib/tauri";
 import { isHideSensitiveEnabled, setHideSensitiveEnabled } from "../../lib/format";
 import { TunnelCard, WarmupCard, AutostartCard } from "../TunnelCard";
 
@@ -170,6 +171,9 @@ export function SettingsScreen({
         <div className="topbar-actions">
           <button className="ghost-action" type="button" onClick={onOpenConfigRoot} disabled={platformAction === "open_config_root"}>
             {t("settings.openConfigDir")}
+          </button>
+          <button className="ghost-action" type="button" onClick={() => void invoke("open_logs_dir")}>
+            {t("settings.openLogsDir")}
           </button>
         </div>
       </header>

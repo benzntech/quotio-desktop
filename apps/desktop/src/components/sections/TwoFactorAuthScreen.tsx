@@ -25,6 +25,24 @@ type ListTab = "saved" | "history";
 
 const MAX_HISTORY = 50;
 
+/** Keep `head` + `tail` chars, replace the middle with a fixed `****` (fixed so the
+ *  hidden length isn't leaked). Display-only — the full value is still used to
+ *  generate codes. */
+function maskMiddle(value: string, head: number, tail: number): string {
+  const v = value.trim();
+  if (v.length <= head + tail) return v.length <= 1 ? v : `${v.slice(0, 1)}****`;
+  return `${v.slice(0, head)}****${v.slice(-tail)}`;
+}
+
+/** Mask an account name; if it's an email, mask only the local part and keep the
+ *  domain (e.g. `jel****5b@icloud.com`). */
+function maskAccountName(value: string): string {
+  const v = value.trim();
+  const at = v.indexOf("@");
+  if (at > 0) return `${maskMiddle(v.slice(0, at), 3, 2)}${v.slice(at)}`;
+  return maskMiddle(v, 3, 2);
+}
+
 async function decodeQrTextFromImage(file: Blob): Promise<string | null> {
   const imageUrl = URL.createObjectURL(file);
   try {
@@ -58,6 +76,7 @@ export function TwoFactorAuthScreen() {
   const [records, setRecords] = useState<MfaRecord[]>(() => loadSavedMfaRecords());
   const [historyRecords, setHistoryRecords] = useState<MfaRecord[]>(() => loadMfaHistoryRecords());
   const [inputValue, setInputValue] = useState("");
+  const [nameValue, setNameValue] = useState("");
   const [inputError, setInputError] = useState("");
   const [activeQuery, setActiveQuery] = useState<ParsedMfaCredential | null>(null);
   const [activeTab, setActiveTab] = useState<ListTab>("saved");
@@ -117,16 +136,19 @@ export function TwoFactorAuthScreen() {
       return;
     }
 
-    const accountName = parsed.accountName || activeQuery?.accountName || "";
+    // A manually-typed name/email wins over the otpauth-derived one.
+    const accountName = nameValue.trim() || parsed.accountName || activeQuery?.accountName || "";
     setRecords((prev) => {
       const identity = toMfaSecretIdentity(parsed.secret);
       const existingIndex = prev.findIndex((record) => toMfaSecretIdentity(record.secret) === identity);
       if (existingIndex >= 0) {
-        return prev.map((record, index) => (index === existingIndex ? { ...record, accountName: record.accountName || accountName } : record));
+        return prev.map((record, index) => (index === existingIndex ? { ...record, accountName: accountName || record.accountName } : record));
       }
       return [{ id: createMfaRecordId(), accountName, secret: parsed.secret, remark: "", time: Date.now() }, ...prev];
     });
     setInputError("");
+    setNameValue("");
+    setInputValue("");
   }
 
   async function copyText(id: string, text: string) {
@@ -247,6 +269,12 @@ export function TwoFactorAuthScreen() {
 
       <article className="panel two-factor-query-panel">
         <div className="two-factor-input-row">
+          <input
+            className="two-factor-name-input"
+            value={nameValue}
+            onChange={(event) => setNameValue(event.target.value)}
+            placeholder={t("twoFactor.namePlaceholder")}
+          />
           <input value={inputValue} onChange={(event) => setInputValue(event.target.value)} onPaste={handlePasteImage} placeholder={t("twoFactor.inputPlaceholder")} />
           <button className="secondary-action" type="button" onClick={() => parseAndQuery(inputValue)}>
             {t("twoFactor.query")}
@@ -322,9 +350,9 @@ export function TwoFactorAuthScreen() {
                       autoFocus
                     />
                   ) : (
-                    <strong>{record.accountName || t("twoFactor.unnamed")}</strong>
+                    <strong>{record.accountName ? maskAccountName(record.accountName) : t("twoFactor.unnamed")}</strong>
                   )}
-                  <code>{record.secret}</code>
+                  <code>{maskMiddle(record.secret, 4, 4)}</code>
                 </div>
                 <div className="two-factor-record-code">
                   <span>{token || "------"}</span>

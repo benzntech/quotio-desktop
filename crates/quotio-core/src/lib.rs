@@ -1610,12 +1610,13 @@ fn credential_provider(value: &serde_json::Value) -> Option<String> {
         .filter(|kind| !kind.is_empty())
 }
 
-/// Remove duplicate credential files that point at the SAME account (by
-/// `account_id`, falling back to email), keeping ONE per account: the bound-login
+/// Remove duplicate credential files that point at the SAME login (by
+/// `account_id`+email, so ChatGPT Team members — who share one account_id but
+/// are separate seats — are NOT merged), keeping ONE per login: the bound-login
 /// file if the group has one (its filename is referenced by settings, so deleting
 /// it would break Codex launch), otherwise the most-recently-modified file. Skips
-/// `glm-keys*` and non-JSON. Best-effort — fixes "re-import / re-login shows two
-/// cards" without touching distinct accounts.
+/// `glm-keys*` and non-JSON. Best-effort — fixes "re-import / re-login of the same
+/// member shows two cards" without touching distinct logins/accounts.
 fn dedup_codex_auth_keep_newest(dir: &std::path::Path, bound_account: &str) {
     use std::collections::HashMap;
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1638,11 +1639,21 @@ fn dedup_codex_auth_keep_newest(dir: &std::path::Path, bound_account: &str) {
         else {
             continue;
         };
-        // Identity = account_id (provider-scoped already), else email+provider so
-        // two different-provider accounts that happen to share an email aren't
-        // merged. No identity at all → leave the file alone.
+        // Identity = account_id + member email. ChatGPT Team accounts share ONE
+        // account_id across members, but each member is a SEPARATE seat with its
+        // own quota/login — so keying on account_id alone would wrongly merge two
+        // Team members and delete one. Adding the email keeps members distinct
+        // (matching CLIProxyAPI's own `<account_id>-<email>` credential filename),
+        // while a genuine re-import of the SAME member (same account_id + email)
+        // still collapses. Fallback when no account_id: email+provider so two
+        // different-provider accounts sharing an email aren't merged. No identity
+        // at all → leave the file alone.
         let identity = match credential_account_id(&value) {
-            Some(id) => id.to_ascii_lowercase(),
+            Some(id) => format!(
+                "{}|{}",
+                id.to_ascii_lowercase(),
+                credential_email(&value).unwrap_or_default().to_ascii_lowercase()
+            ),
             None => match credential_email(&value) {
                 Some(email) => format!(
                     "{}|{}",
@@ -1683,6 +1694,79 @@ fn dedup_codex_auth_keep_newest(dir: &std::path::Path, bound_account: &str) {
             }
         }
     }
+}
+
+/// Append failed requests (HTTP >= 400, or flagged failed) to a per-day JSONL
+/// error log under the app logs dir, then prune logs older than 30 days. Best
+/// effort — never fails the caller. Gives users a `errors-YYYY-MM-DD.jsonl` they
+/// can hand over for diagnosis. Includes the redacted raw usage snapshot so any
+/// upstream error detail the proxy reported is captured too.
+pub fn append_request_errors(events: &[quotio_types::UsageEvent]) {
+    use std::io::Write as _;
+    let failed: Vec<&quotio_types::UsageEvent> = events
+        .iter()
+        .filter(|event| event.failed || event.status_code.is_some_and(|status| status >= 400))
+        .collect();
+    if failed.is_empty() {
+        return;
+    }
+    let dir = quotio_platform::app_logs_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    prune_old_error_logs(&dir);
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let path = dir.join(format!("errors-{today}.jsonl"));
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    for event in failed {
+        let line = serde_json::json!({
+            "ts": event.timestamp,
+            "account": event.source,
+            "model": event.model,
+            "requested_model": event.requested_model,
+            "reasoning_effort": event.reasoning_effort,
+            "provider": event.provider,
+            "endpoint": event.endpoint,
+            "status": event.status_code,
+            "latency_ms": event.latency_ms,
+            "raw": event.raw_json,
+        });
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Delete `errors-YYYY-MM-DD.jsonl` files whose date is more than 30 days old.
+/// `YYYY-MM-DD` strings compare in chronological order, so a plain `<` works.
+fn prune_old_error_logs(dir: &std::path::Path) {
+    let cutoff = (chrono::Local::now() - chrono::Duration::days(30))
+        .format("%Y-%m-%d")
+        .to_string();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(date) = name
+            .strip_prefix("errors-")
+            .and_then(|rest| rest.strip_suffix(".jsonl"))
+        {
+            if date < cutoff.as_str() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Open the app logs dir (where `errors-*.jsonl` live) in the OS file manager,
+/// creating it first so the action works even before any error was logged.
+pub fn open_logs_dir() -> Result<(), String> {
+    let dir = quotio_platform::app_logs_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    quotio_platform::open_file_manager(&dir).map_err(|error| format!("无法打开日志目录：{error}"))
 }
 
 pub fn list_local_accounts() -> Vec<AuthFile> {
@@ -3543,6 +3627,56 @@ mod tests {
             "all-blank refresh stores as-is so the proxy-unreachable banner can fire"
         );
     }
+    #[test]
+    fn dedup_keeps_team_members_but_collapses_true_dupes() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("quotio_dedup_team_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, email: &str, acct: &str| {
+            fs::write(
+                dir.join(name),
+                format!(r#"{{"type":"codex","email":"{email}","account_id":"{acct}","access_token":"x"}}"#),
+            )
+            .unwrap();
+        };
+        // ChatGPT Team: two members share ONE account_id but are separate seats.
+        write("a.json", "alice@x.com", "acct-1");
+        write("b.json", "bob@x.com", "acct-1");
+        // A genuine re-import of alice (same account_id + email) must still collapse.
+        write("a2.json", "alice@x.com", "acct-1");
+
+        dedup_codex_auth_keep_newest(&dir, "");
+
+        let remaining: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(remaining.len(), 2, "alice (deduped) + bob (distinct member): {remaining:?}");
+        assert!(remaining.iter().any(|n| n == "b.json"), "distinct Team member kept");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_old_error_logs_drops_only_stale_dated_files() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("quotio_errlog_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        fs::write(dir.join("errors-2000-01-01.jsonl"), "stale").unwrap();
+        fs::write(dir.join(format!("errors-{today}.jsonl")), "fresh").unwrap();
+        fs::write(dir.join("native-oauth.log"), "unrelated").unwrap();
+
+        prune_old_error_logs(&dir);
+
+        assert!(!dir.join("errors-2000-01-01.jsonl").exists(), "30天前的删掉");
+        assert!(dir.join(format!("errors-{today}.jsonl")).exists(), "今天的保留");
+        assert!(dir.join("native-oauth.log").exists(), "非 errors-* 文件不动");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn parse_model_list_splits_dedups_and_trims() {
         // Comma, whitespace, and newline separators all work; blanks dropped;

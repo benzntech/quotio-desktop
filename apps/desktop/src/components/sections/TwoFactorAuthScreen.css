@@ -7,13 +7,13 @@
   gap: 12px;
   align-items: center;
   padding: 18px 20px;
-  color: #5f6b7c;
+  color: var(--quotio-muted);
   line-height: 1.5;
 }
 
 .two-factor-intro svg {
   flex: 0 0 auto;
-  color: #2563eb;
+  color: var(--quotio-blue);
 }
 
 .two-factor-query-panel {
@@ -34,24 +34,29 @@
   min-width: 260px;
   min-height: 42px;
   padding: 0 14px;
-  border: 1px solid rgba(148, 163, 184, 0.32);
-  border-radius: 12px;
-  color: #172033;
+  border: 1px solid var(--quotio-border-strong);
+  border-radius: var(--quotio-radius-md);
+  color: var(--quotio-text);
   font: inherit;
-  background: rgba(255, 255, 255, 0.88);
-  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.04);
+  background: var(--quotio-card-solid);
+}
+
+/* Name/email field sits beside the (wider) secret field. */
+.two-factor-input-row .two-factor-name-input {
+  flex: 0 1 220px;
+  min-width: 160px;
 }
 
 .two-factor-input-row input:focus,
 .two-factor-record-main input:focus {
   outline: none;
-  border-color: #2563eb;
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  border-color: rgba(10, 132, 255, 0.5);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.12);
 }
 
 .two-factor-error {
   margin: 0;
-  color: #dc2626;
+  color: var(--quotio-red);
   font-size: 13px;
 }
 
@@ -61,14 +66,14 @@
   gap: 16px;
   align-items: center;
   padding: 18px 20px;
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 18px;
-  background: linear-gradient(135deg, rgba(248, 250, 252, 0.96), rgba(239, 246, 255, 0.88));
+  border: 1px solid var(--quotio-border);
+  border-radius: var(--quotio-radius-xl);
+  background: linear-gradient(135deg, var(--quotio-card-solid), var(--quotio-blue-soft));
 }
 
 .two-factor-current-code > span {
   flex: 0 0 auto;
-  color: #4b5b70;
+  color: var(--quotio-muted);
   font-size: 14px;
   font-weight: 700;
 }
@@ -79,12 +84,12 @@
   font-size: 32px;
   line-height: 1;
   letter-spacing: 0.12em;
-  color: #172033;
+  color: var(--quotio-text);
 }
 
 .two-factor-code-placeholder {
   flex: 1;
-  color: #7b8797;
+  color: var(--quotio-muted-2);
   font-size: 15px;
   font-weight: 600;
   letter-spacing: 0;
@@ -92,7 +97,7 @@
 
 .two-factor-current-code small,
 .two-factor-record-code small {
-  color: #7b8797;
+  color: var(--quotio-orange);
   font-variant-numeric: tabular-nums;
 }
 
@@ -112,7 +117,7 @@
   gap: 12px;
   align-items: center;
   padding: 14px 18px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+  border-bottom: 1px solid var(--quotio-border);
 }
 
 .two-factor-tabs,
@@ -128,19 +133,19 @@
   border-radius: 999px;
   padding: 8px 14px;
   background: transparent;
-  color: #5f6b7c;
+  color: var(--quotio-muted);
   font-weight: 700;
   cursor: pointer;
 }
 
 .two-factor-tabs button:hover {
-  color: #172033;
-  background: rgba(37, 99, 235, 0.08);
+  color: var(--quotio-text);
+  background: var(--quotio-blue-soft);
 }
 
 .two-factor-tabs button.active {
-  color: #2563eb;
-  background: rgba(37, 99, 235, 0.12);
+  color: var(--quotio-blue);
+  background: var(--quotio-blue-soft);
 }
 
 .two-factor-records {
@@ -157,13 +162,17 @@
   gap: 10px;
   align-items: center;
   padding: 14px 18px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  border-bottom: 1px solid var(--quotio-border);
 }
 
 .two-factor-record-main {
   min-width: 0;
   display: grid;
   gap: 4px;
+}
+
+.two-factor-record-main strong {
+  color: var(--quotio-text);
 }
 
 .two-factor-record-main strong,
@@ -174,7 +183,7 @@
 }
 
 .two-factor-record-main code {
-  color: #7b8797;
+  color: var(--quotio-muted-2);
   font-size: 12px;
 }
 
@@ -182,24 +191,25 @@
   width: 100%;
   min-height: 36px;
   padding: 0 10px;
-  border: 1px solid rgba(148, 163, 184, 0.32);
-  border-radius: 10px;
-  color: #172033;
+  border: 1px solid var(--quotio-border-strong);
+  border-radius: var(--quotio-radius-md);
+  color: var(--quotio-text);
   font: inherit;
-  background: rgba(255, 255, 255, 0.9);
+  background: var(--quotio-card-solid);
 }
 
 .two-factor-record-code {
-  display: grid;
-  justify-items: end;
-  gap: 2px;
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .two-factor-record-code span {
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-weight: 700;
   letter-spacing: 0.12em;
-  color: #2563eb;
+  color: var(--quotio-blue);
 }
 
 @media (max-width: 760px) {

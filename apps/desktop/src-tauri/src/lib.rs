@@ -34,12 +34,17 @@ struct TunnelStatus {
 }
 
 #[tauri::command]
-fn get_app_state(state: State<'_, DesktopState>) -> Result<AppState, String> {
-    let mut core = state
-        .core
-        .lock()
-        .map_err(|_| "无法读取应用状态".to_string())?;
-    Ok(core.app_state())
+async fn get_app_state(state: State<'_, DesktopState>) -> Result<AppState, String> {
+    // app_state() probes the proxy health (a sync network call) and reads every
+    // auth file in the auth dir — slow with many accounts. Run it on a blocking
+    // worker so the UI/main thread never freezes on startup or refresh.
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut core = core.lock().map_err(|_| "无法读取应用状态".to_string())?;
+        Ok(core.app_state())
+    })
+    .await
+    .map_err(|error| format!("读取应用状态任务异常：{error}"))?
 }
 
 #[tauri::command]
@@ -270,6 +275,11 @@ fn open_config_root(state: State<'_, DesktopState>) -> Result<(), String> {
         .lock()
         .map_err(|_| "无法打开配置目录".to_string())?;
     core.open_config_root().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_logs_dir() -> Result<(), String> {
+    quotio_core::open_logs_dir()
 }
 
 #[tauri::command]
@@ -641,6 +651,7 @@ async fn drain_request_logs(state: State<'_, DesktopState>) -> Result<AppState, 
     };
     if !events.is_empty() {
         store.insert_events(&events);
+        quotio_core::append_request_errors(&events);
     }
     let mut core = state.core.lock().map_err(|_| "无法读取状态".to_string())?;
     Ok(core.app_state())
@@ -1442,6 +1453,7 @@ fn spawn_usage_collector(app: AppHandle) {
                     .unwrap_or_default();
                 if !events.is_empty() {
                     let inserted = store.insert_events(&events);
+                    quotio_core::append_request_errors(&events);
                     if inserted > 0 {
                         let _ = app.emit("usage-updated", inserted);
                     }
@@ -1644,6 +1656,7 @@ pub fn run() {
             credential_status,
             clear_remote_management_key,
             open_config_root,
+            open_logs_dir,
             set_launch_at_login,
             request_notification_permission,
             send_test_notification,
