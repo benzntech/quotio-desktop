@@ -2458,7 +2458,40 @@ fn settings_path() -> PathBuf {
 fn read_settings() -> Option<AppSettings> {
     let path = settings_path();
     let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    parse_settings_tolerant(&content)
+}
+
+/// 容错解析设置。直接 `from_str` 是「全有或全无」:只要某个字段格式跨版本变了
+/// (典型是枚举变体改名),serde 会拒绝整份 JSON,上层 `unwrap_or_default()` 就把
+/// 用户全部设置重置成默认、并在启动时写回覆盖——这正是升级后「配置被初始化」的根因。
+///
+/// 这里改成:先走快路径(整份能解析就直接用);否则把用户的每个字段逐个盖到默认值
+/// 上,只丢弃放不进当前 schema 的字段,其余(代理、端口、语言、主题、调度规则……)
+/// 原样保留。仅在罕见的格式不兼容时走慢路径,启动时跑一次,开销可忽略。
+fn parse_settings_tolerant(content: &str) -> Option<AppSettings> {
+    // 快路径:当前版本能完整解析。
+    if let Ok(settings) = serde_json::from_str::<AppSettings>(content) {
+        return Some(settings);
+    }
+    // 慢路径:逐字段抢救。
+    let user: serde_json::Value = serde_json::from_str(content).ok()?;
+    let user_obj = user.as_object()?;
+    let mut merged = serde_json::to_value(AppSettings::default()).ok()?;
+    let merged_obj = merged.as_object_mut()?;
+    for (key, value) in user_obj {
+        let previous = merged_obj.get(key).cloned();
+        merged_obj.insert(key.clone(), value.clone());
+        // 放进去后整体还能解析就保留;否则这个字段不兼容,回退默认。
+        if serde_json::from_value::<AppSettings>(serde_json::Value::Object(merged_obj.clone()))
+            .is_err()
+        {
+            match previous {
+                Some(prev) => merged_obj.insert(key.clone(), prev),
+                None => merged_obj.remove(key),
+            };
+        }
+    }
+    serde_json::from_value(merged).ok()
 }
 
 fn write_settings(settings: &AppSettings) -> std::io::Result<()> {
@@ -3802,6 +3835,24 @@ mod tests {
             "accounts": [{ "platform": "openai", "credentials": { "email": "b@x.com" } }]
         });
         assert!(convert_sub2api_accounts(&missing).is_none());
+    }
+
+    #[test]
+    fn parse_settings_tolerant_salvages_valid_fields_when_one_field_is_incompatible() {
+        // 模拟升级:某个枚举字段(theme)用了当前版本不认识的值 → 严格 from_str 失败。
+        let json =
+            r#"{ "proxy_port": 9999, "language": "zh-CN", "theme": "some_future_theme_variant" }"#;
+        assert!(
+            serde_json::from_str::<AppSettings>(json).is_err(),
+            "坏枚举值应让严格解析失败(否则测不到容错路径)"
+        );
+        // 容错解析:保留有效字段,只把坏字段回退默认,而不是整份重置。
+        let salvaged = parse_settings_tolerant(json).expect("应抢救出设置,而不是返回 None");
+        assert_eq!(salvaged.proxy_port, 9999, "有效字段(端口)必须保留");
+        assert_eq!(salvaged.language, "zh-CN", "有效字段(语言)必须保留");
+        // 完全合法的设置走快路径,原样返回。
+        let clean = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(parse_settings_tolerant(&clean).is_some());
     }
 
     #[test]
