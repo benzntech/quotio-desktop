@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, type ChangeEvent } from "react";
+import { Mfa2faQuickPanel } from "./Mfa2faQuickPanel";
 import type { NativeOAuthCompleteResponse, NativeOAuthStartResponse, OAuthStatusResponse, OAuthUrlResponse, ProviderSummary } from "../types";
 import { CheckIcon, CopyIcon, KeyIcon, PlusIcon, RefreshIcon } from "./icons";
 import { invoke } from "../lib/tauri";
@@ -433,6 +434,8 @@ export function AddAccountModal({
               <span>{importMessage}</span>
             </div>
           ) : null}
+
+          <Mfa2faQuickPanel />
         </div>
       </div>
     </div>
