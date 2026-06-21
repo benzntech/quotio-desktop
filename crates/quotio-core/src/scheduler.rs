@@ -196,6 +196,39 @@ pub fn build_candidates(
         .collect()
 }
 
+/// 额度耗尽迟滞:余量(所有窗口的最小剩余 %)≤ 3% 的账号视为耗尽,踢出可选集
+/// (记入 `exhausted`),直到余量回到 > 5%(通常是窗口刷新后)才放回。3%~5% 是
+/// 迟滞缓冲,避免在阈值边界反复横跳。
+///
+/// 这补上了 codex 配额里 `is_forbidden` 的空档:它只在 `session_used >= 100` 或
+/// API 明确 block 时才置位,而「只剩 3% 但 API 仍 allowed」的号发请求会 429——本
+/// 逻辑据余量提前把它移出池子,换满血待命号。
+pub fn apply_exhaustion_hysteresis(
+    candidates: &mut [Candidate],
+    exhausted: &mut std::collections::HashSet<String>,
+) {
+    const PARK_AT_OR_BELOW: f64 = 3.0;
+    const RESUME_ABOVE: f64 = 5.0;
+    for candidate in candidates.iter_mut() {
+        if exhausted.contains(&candidate.key) {
+            // 已被踢:只有明显恢复(> 5%,通常是窗口刷新后)才放回。
+            if candidate.weekly_remaining > RESUME_ABOVE {
+                exhausted.remove(&candidate.key);
+            } else {
+                candidate.eligible = false;
+            }
+        } else if candidate.weekly_remaining <= PARK_AT_OR_BELOW {
+            // 新耗尽:踢出,等它自己刷新。
+            exhausted.insert(candidate.key.clone());
+            candidate.eligible = false;
+        }
+    }
+    // 池里已不存在的账号从集合里清掉,防止无限增长。
+    let present: std::collections::HashSet<&str> =
+        candidates.iter().map(|c| c.key.as_str()).collect();
+    exhausted.retain(|k| present.contains(k.as_str()));
+}
+
 /// 排序键：活跃窗口在前（按刷新时间升序），闲置垫后；平手看 Weekly 剩余多者优先。
 fn rank(candidate: &Candidate) -> (u8, i64, i64, String) {
     match candidate.session_reset_at {
@@ -383,6 +416,38 @@ mod tests {
         ];
         let target = pick_target(&candidates, None, HOLD, MARGIN);
         assert_eq!(target.as_deref(), Some("codex-soon.json"));
+    }
+
+    #[test]
+    fn exhaustion_hysteresis_parks_at_3pct_and_resumes_above_5pct() {
+        let mut exhausted = std::collections::HashSet::new();
+
+        // soon 余量 3%(快刷新但快耗尽)→ 踢出;pick_target 改选满血的 late。
+        let mut candidates = vec![
+            candidate("soon", Some(2_000), 3.0, true),
+            candidate("late", Some(10_000), 50.0, true),
+        ];
+        apply_exhaustion_hysteresis(&mut candidates, &mut exhausted);
+        assert!(!candidates[0].eligible, "soon 3% 应被踢出可选");
+        assert!(candidates[1].eligible);
+        assert!(exhausted.contains("soon"));
+        assert_eq!(
+            pick_target(&candidates, None, HOLD, MARGIN).as_deref(),
+            Some("codex-late.json"),
+            "耗尽号被踢后改选满血号,不再死磕"
+        );
+
+        // 迟滞:soon 小幅回到 4%(仍 < 5%)→ 不放回。
+        let mut candidates = vec![candidate("soon", Some(2_000), 4.0, true)];
+        apply_exhaustion_hysteresis(&mut candidates, &mut exhausted);
+        assert!(!candidates[0].eligible, "4% 在 3~5% 迟滞缓冲内,不放回");
+        assert!(exhausted.contains("soon"));
+
+        // 刷新到 99%(> 5%)→ 放回可选。
+        let mut candidates = vec![candidate("soon", Some(2_000), 99.0, true)];
+        apply_exhaustion_hysteresis(&mut candidates, &mut exhausted);
+        assert!(candidates[0].eligible, "恢复 > 5% 放回");
+        assert!(!exhausted.contains("soon"));
     }
 
     #[test]

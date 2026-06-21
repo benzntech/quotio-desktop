@@ -112,6 +112,9 @@ struct ProviderSchedulerState {
     current_reset_at: Option<i64>,
     standby_count: u32,
     failure_recheck_at: Option<Instant>,
+    /// 账号 key → 因额度耗尽(余量 ≤ 3%)被踢出可选集的账号。带迟滞:余量回到
+    /// > 5%(刷新后)才移除。避免在阈值边界反复横跳。
+    exhausted: std::collections::HashSet<String>,
 }
 
 /// Codex 监控的进程探测目标。由 [`AppCore::codex_monitor_probe`] 在锁内产出，
@@ -489,7 +492,8 @@ impl AppCore {
 
         for provider_id in &providers {
             let pool = scheduler::read_pool_for_provider(&dir, provider_id);
-            let candidates = scheduler::build_candidates(&pool, &self.quotas, now_unix, provider_id);
+            let mut candidates =
+                scheduler::build_candidates(&pool, &self.quotas, now_unix, provider_id);
 
             let state = self
                 .schedulers
@@ -500,7 +504,12 @@ impl AppCore {
                     current_reset_at: None,
                     standby_count: 0,
                     failure_recheck_at: None,
+                    exhausted: Default::default(),
                 });
+
+            // 额度耗尽迟滞:把余量 ≤3% 的号踢出可选(状态记在 state.exhausted,余量
+            // 回 >5% 才放回),让 pick_target 改选满血待命号,而不是死磕快耗尽的号。
+            scheduler::apply_exhaustion_hysteresis(&mut candidates, &mut state.exhausted);
 
             let current = state
                 .current
@@ -3928,6 +3937,7 @@ mod tests {
                 current_reset_at: None,
                 standby_count: 0,
                 failure_recheck_at: None,
+                exhausted: Default::default(),
             },
         );
 
