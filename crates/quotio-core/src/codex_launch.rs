@@ -649,8 +649,11 @@ pub fn launch_codex_app(exe: &Path) -> Result<Option<u32>, String> {
             if err.kind() == std::io::ErrorKind::PermissionDenied && is_windowsapps_path(exe) =>
         {
             launch_codex_app_via_shell(exe)?;
-            Ok(resolve_codex_app_pid_within(std::time::Duration::from_secs(
-                8,
+            // 商店版 shell 激活拿不到子进程句柄。pid 只是「停止」时精确杀进程的额外保险
+            // （App 模式停止/监控本就按进程名兜底），所以只 best-effort 轻探最多 1.5 秒：
+            // 进程出现得快就记下 pid，否则返回 None（绝不再像以前那样空转 8 秒）。
+            Ok(resolve_codex_app_pid_within(std::time::Duration::from_millis(
+                1500,
             )))
         }
         Err(err) => Err(format!("启动 Codex 应用失败: {err}")),
@@ -744,7 +747,9 @@ fn detect_codex_store_app_id() -> Option<String> {
     .and_then(stdout_first_line)
 }
 
-/// 在超时时间内按进程名轮询 Codex 应用 pid（shell 启动拿不到子进程句柄时用）。
+/// shell 启动拿不到子进程句柄时，在 `timeout` 内 best-effort 按进程名取一次 Codex 应用 pid。
+/// pid 只是「停止」时精确杀进程的额外保险（App 模式停止/监控本就按进程名兜底），所以只
+/// 轻量探一小会儿：拿到就记、到点没拿到就返回 None，绝不为它长时间空转。
 #[cfg(target_os = "windows")]
 fn resolve_codex_app_pid_within(timeout: std::time::Duration) -> Option<u32> {
     let started = std::time::Instant::now();
@@ -759,7 +764,7 @@ fn resolve_codex_app_pid_within(timeout: std::time::Duration) -> Option<u32> {
         if started.elapsed() >= timeout {
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
 

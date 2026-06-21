@@ -99,6 +99,29 @@ pub struct PlatformInfo {
     pub arch: String,
 }
 
+/// 一套 Codex 一键启动方案。多套可共存,但同一时刻只能启动一套
+/// (启动改的是全局 `~/.codex`,后端只有一个会话)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexLaunchProfile {
+    /// 稳定 id(前端创建时生成;旧平铺配置迁移成的方案用固定种子)。
+    pub id: String,
+    /// 用户起的方案名,如 "日常-5.5极高"。
+    pub name: String,
+    /// 启动方式:"app"(桌面应用)或 "cli"(终端)。
+    pub launch_mode: String,
+    /// 绑定的 Codex 账号 key(`~/.cli-proxy-api` 文件名去 .json)。
+    pub bound_account: String,
+    /// Codex 请求要走的代理地址(写入 config.toml 的 base_url);留空 = 用本机代理端点。
+    /// 配不同地址 / 密钥,即可让不同方案走不同账号池。
+    pub proxy_url: String,
+    /// Codex 模型(写入 config.toml 的 model)。
+    pub model: String,
+    /// 思考程度(model_reasoning_effort:minimal/low/medium/high/xhigh)。
+    pub reasoning: String,
+    /// 代理访问密钥(写入 config.toml 的 experimental_bearer_token);留空 = 自动取代理第一个 key。
+    pub api_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AppSettings {
@@ -141,6 +164,8 @@ pub struct AppSettings {
     pub codex_reasoning: String,
     /// Codex 代理访问密钥（写入 config.toml 的 experimental_bearer_token）。
     pub codex_api_key: String,
+    /// 多套 Codex 一键启动方案。空 = 未配置或待迁移(由上面旧平铺 codex_* 字段合成第一条)。
+    pub codex_profiles: Vec<CodexLaunchProfile>,
     /// 智能账号调度规则："off"（关闭）或 "reset_soonest"（5h 窗口临近刷新优先）。
     pub scheduler_rule: String,
     /// 调度防抖：已选账号最小保持分钟数（除非打满/出错被迫切换）。
@@ -185,6 +210,7 @@ impl Default for AppSettings {
             codex_model: String::new(),
             codex_reasoning: "high".to_string(),
             codex_api_key: String::new(),
+            codex_profiles: Vec::new(),
             scheduler_rule: "off".to_string(),
             scheduler_min_hold_minutes: 10,
             scheduler_switch_margin_minutes: 15,
@@ -1641,7 +1667,7 @@ pub fn default_cli_agents() -> Vec<CliAgentSummary> {
         ),
         cli_agent(
             "codex",
-            "Codex CLI",
+            "Codex",
             "OpenAI's Codex CLI for GPT-5 models",
             AgentConfigType::File,
             &["codex"],
@@ -1650,7 +1676,7 @@ pub fn default_cli_agents() -> Vec<CliAgentSummary> {
         ),
         cli_agent(
             "gemini-cli",
-            "Gemini CLI",
+            "Gemini",
             "Google's Gemini CLI for Gemini models",
             AgentConfigType::Environment,
             &["gemini"],
@@ -1659,7 +1685,7 @@ pub fn default_cli_agents() -> Vec<CliAgentSummary> {
         ),
         cli_agent(
             "amp",
-            "Amp CLI",
+            "Amp",
             "Sourcegraph's Amp coding assistant",
             AgentConfigType::Both,
             &["amp"],

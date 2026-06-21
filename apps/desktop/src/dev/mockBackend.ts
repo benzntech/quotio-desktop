@@ -207,11 +207,11 @@ function agentStatus(
 
 const agents: AgentStatus[] = [
   agentStatus("claude", "Claude Code", "Anthropic's official CLI for Claude models", true, true, "~/.local/bin/claude", "1.2.0", "~/.claude/settings.json"),
-  agentStatus("codex", "Codex CLI", "OpenAI's Codex CLI for GPT-5 models", true, false, "/opt/homebrew/bin/codex", "0.8.1", "~/.codex/config.toml"),
+  agentStatus("codex", "Codex", "OpenAI's Codex CLI for GPT-5 models", true, false, "/opt/homebrew/bin/codex", "0.8.1", "~/.codex/config.toml"),
   agentStatus("factory", "Factory Droid", "Factory's AI coding agent", true, true, "~/.local/bin/droid", "2.1.0", "~/.factory/config.json"),
-  agentStatus("gemini", "Gemini CLI", "Google's Gemini CLI for Gemini models", true, false, "/usr/local/bin/gemini", "0.4.2", "~/.gemini/settings.json"),
+  agentStatus("gemini", "Gemini", "Google's Gemini CLI for Gemini models", true, false, "/usr/local/bin/gemini", "0.4.2", "~/.gemini/settings.json"),
   agentStatus("opencode", "OpenCode", "The open source AI coding agent", true, false, "~/.opencode/bin/opencode", "0.6.0", "~/.opencode/config.json"),
-  agentStatus("amp", "Amp CLI", "Sourcegraph's agentic coding tool", false, false, null, null, "~/.amp/config.json"),
+  agentStatus("amp", "Amp", "Sourcegraph's agentic coding tool", false, false, null, null, "~/.amp/config.json"),
 ];
 
 function reqLog(
@@ -296,6 +296,28 @@ export const mockAppState: AppState = {
     codex_model: "",
     codex_reasoning: "high",
     codex_api_key: "",
+    codex_profiles: [
+      {
+        id: "codex-mock-daily",
+        name: "日常-5.5极高",
+        launch_mode: "app",
+        bound_account: "codex-demo@example.com-plus",
+        proxy_url: "http://127.0.0.1:28317",
+        model: "gpt-5.5",
+        reasoning: "xhigh",
+        api_key: "sk-pool-a-demo",
+      },
+      {
+        id: "codex-mock-spare",
+        name: "备用-5.4中",
+        launch_mode: "cli",
+        bound_account: "codex-spare@example.com-free",
+        proxy_url: "http://127.0.0.1:28317",
+        model: "gpt-5.4",
+        reasoning: "medium",
+        api_key: "sk-pool-b-demo",
+      },
+    ],
     scheduler_rule: "off",
     scheduler_min_hold_minutes: 10,
     scheduler_switch_margin_minutes: 15,
@@ -366,6 +388,7 @@ export const mockAppState: AppState = {
   ],
   api_key_bindings: [
     { api_key: "proxyp-live-xxxxxxxxocal", provider_id: "cp-1" },
+    { api_key: "sk-pool-a-demo", provider_id: "codex" }, // 日常方案密钥绑到 codex(不告警);备用方案未绑定(告警)
   ],
   request_stats: {
     total_requests: 0,
@@ -701,6 +724,8 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       return "已停止 Codex 并还原配置（mock）" as unknown as T;
     case "codex_launch_active":
       return false as unknown as T;
+    case "codex_active_profile":
+      return null as unknown as T;
     case "fetch_codex_models":
       return ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark", "codex-auto-review"] as unknown as T;
     case "save_settings": {

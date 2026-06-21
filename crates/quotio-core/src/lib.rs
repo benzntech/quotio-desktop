@@ -102,6 +102,8 @@ pub struct AppCore {
     /// 会话代数：每次启动 +1。监控的进程探测在锁外执行，
     /// 写回结果时校验代数，期间停止/重启过就丢弃这次探测。
     codex_session_generation: u64,
+    /// 当前在跑的启动方案 id（与 codex_session 同生命周期；停止/自动退出时清空）。
+    codex_active_profile_id: Option<String>,
     /// 每个服务商的调度状态。
     schedulers: std::collections::HashMap<String, ProviderSchedulerState>,
 }
@@ -141,6 +143,7 @@ impl CodexMonitorProbe {
 impl Default for AppCore {
     fn default() -> Self {
         let mut settings = read_settings().unwrap_or_default();
+        migrate_codex_profiles(&mut settings);
         let mut credential_error = migrate_remote_management_key(&mut settings);
         let (management_key, local_credential_error) = load_or_create_local_management_key();
         if credential_error.is_none() {
@@ -166,6 +169,7 @@ impl Default for AppCore {
             credential_error,
             codex_session: None,
             codex_session_generation: 0,
+            codex_active_profile_id: None,
             schedulers: std::collections::HashMap::new(),
         }
     }
@@ -185,16 +189,6 @@ impl AppCore {
         &mut self,
         mut settings: AppSettings,
     ) -> Result<AppState, ManagementCoreError> {
-        let previous_bound_account = self.settings.codex_bound_account.trim().to_string();
-        let next_bound_account = settings.codex_bound_account.trim().to_string();
-        if previous_bound_account != next_bound_account {
-            codex_launch::apply_bound_account_selection(
-                &previous_bound_account,
-                &next_bound_account,
-            )
-            .map_err(ManagementCoreError::Unavailable)?;
-        }
-
         if let Some(remote_key) = settings
             .remote_management_key
             .as_deref()
@@ -781,15 +775,31 @@ impl AppCore {
 
     /// 一键启动 Codex：备份原始 auth.json/config.toml → 写代理配置 → 注入绑定账号 → 启动 App/CLI。
     /// 参数全部来自已保存的设置（codex_* 字段）。
-    pub fn codex_start(&mut self) -> Result<String, ManagementCoreError> {
+    pub fn codex_start(&mut self, profile_id: &str) -> Result<String, ManagementCoreError> {
+        let profile_id = profile_id.trim();
+        // 找到要启动的方案（按 id）。
+        let profile = self
+            .settings
+            .codex_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+            .ok_or_else(|| {
+                ManagementCoreError::Unavailable("找不到该启动方案，请刷新后重试".to_string())
+            })?;
+
+        // 已经在跑：同一套幂等返回；不同套先停掉当前的（还原配置、释放占用）再起新的。
         if self.codex_session.is_some() {
-            return Ok("Codex 已在运行".to_string());
+            if self.codex_active_profile_id.as_deref() == Some(profile_id) {
+                return Ok("该方案已在运行".to_string());
+            }
+            self.codex_stop()?;
         }
-        let settings = self.settings.clone();
-        let account_key = settings.codex_bound_account.trim().to_string();
+
+        let account_key = profile.bound_account.trim().to_string();
         if account_key.is_empty() {
             return Err(ManagementCoreError::Unavailable(
-                "请先在 Codex 卡片里选择并保存要绑定的账号".to_string(),
+                "该方案还没有绑定 Codex 账号，请先编辑方案选择账号".to_string(),
             ));
         }
 
@@ -820,21 +830,30 @@ impl AppCore {
                 ManagementCoreError::Unavailable(format!("启动代理失败：{error}"))
             })?;
         }
-        let endpoint = self.app_state().proxy.endpoint.clone();
-        // 先关掉所有 Codex：避免运行中的实例把我们写的 config 覆盖掉，并让它重启时读到新配置。
-        codex_launch::close_codex_app();
-        thread::sleep(Duration::from_millis(500));
+        let local_endpoint = self.app_state().proxy.endpoint.clone();
+        // 方案指定了代理地址就用它（让不同方案走不同账号池）；留空回退本机端点。
+        let proxy_url = if profile.proxy_url.trim().is_empty() {
+            local_endpoint
+        } else {
+            profile.proxy_url.trim().to_string()
+        };
+        // 只有 Codex 真在跑时才关它（避免运行中的实例覆盖我们写的 config、并让它重启读到新
+        // 配置）并等它退干净；没在跑（典型：首次启动 / 切换时已先停掉旧的）就别白等这 500ms。
+        if codex_launch::codex_app_process_running() {
+            codex_launch::close_codex_app();
+            thread::sleep(Duration::from_millis(500));
+        }
         // 此刻把 ~/.codex 原样写进固定备份文件（停止/关软件时从这个文件还原）。
         codex_launch::write_launch_backup().map_err(ManagementCoreError::Unavailable)?;
 
         let mut model_slots = std::collections::BTreeMap::new();
-        if !settings.codex_model.trim().is_empty() {
-            model_slots.insert(ModelSlot::Sonnet, settings.codex_model.trim().to_string());
+        if !profile.model.trim().is_empty() {
+            model_slots.insert(ModelSlot::Sonnet, profile.model.trim().to_string());
         }
         // bearer token（写入 config.toml 的 experimental_bearer_token）：
         // 优先用用户在表单里填的；没填就自动用代理的第一个 api-key，省得手填。
-        let api_key = if !settings.codex_api_key.trim().is_empty() {
-            settings.codex_api_key.clone()
+        let api_key = if !profile.api_key.trim().is_empty() {
+            profile.api_key.clone()
         } else {
             // 没填就自动取代理的 api-key：先管理快照，再读代理配置兜底。
             self.management_snapshot
@@ -849,12 +868,12 @@ impl AppCore {
             mode: AgentConfigMode::Automatic,
             setup_mode: AgentSetupMode::Proxy,
             storage_option: AgentConfigStorageOption::Json,
-            proxy_url: endpoint,
+            proxy_url,
             api_key,
             model_slots,
             use_oauth: false,
             available_models: Vec::new(),
-            reasoning_effort: settings.codex_reasoning.clone(),
+            reasoning_effort: profile.reasoning.clone(),
         };
         // 直接写代理配置（不刷文件备份）+ 注入选中账号当登录（写 auth.json）。
         agent_config::write_codex_proxy_config_no_backup(&request)?;
@@ -865,16 +884,16 @@ impl AppCore {
         // 会消失。此刻 Codex 已关闭(上面 close_codex_app),改库安全。Best-effort。
         let _ = codex_session_visibility::repair_session_visibility_in_default_dir_no_backup();
 
-        let mode = if settings.codex_launch_mode.trim().is_empty() {
+        let mode = if profile.launch_mode.trim().is_empty() {
             "app"
         } else {
-            settings.codex_launch_mode.trim()
+            profile.launch_mode.trim()
         };
         let pid = if mode == "cli" {
             codex_launch::launch_codex_cli().map_err(ManagementCoreError::Unavailable)?
         } else {
-            let exe = (!settings.codex_app_path.trim().is_empty())
-                .then(|| PathBuf::from(settings.codex_app_path.trim()))
+            let exe = (!self.settings.codex_app_path.trim().is_empty())
+                .then(|| PathBuf::from(self.settings.codex_app_path.trim()))
                 .filter(|path| path.exists())
                 .or_else(codex_launch::detect_codex_app_path)
                 .ok_or_else(|| {
@@ -886,8 +905,9 @@ impl AppCore {
         };
         self.codex_session = Some(codex_launch::CodexSession::new(pid, mode));
         self.codex_session_generation = self.codex_session_generation.wrapping_add(1);
+        self.codex_active_profile_id = Some(profile_id.to_string());
         Ok(if mode == "cli" {
-            "已在终端启动 Codex CLI（停止会还原配置）".to_string()
+            "已在终端启动 Codex（停止会还原配置）".to_string()
         } else {
             match pid {
                 Some(pid) => format!("已启动 Codex 应用（pid={pid}）"),
@@ -900,6 +920,7 @@ impl AppCore {
     pub fn codex_stop(&mut self) -> Result<String, ManagementCoreError> {
         let session = self.codex_session.take();
         if session.is_none() && !codex_launch::launch_backup_exists() {
+            self.codex_active_profile_id = None;
             return Ok("Codex 未在运行".to_string());
         }
 
@@ -912,12 +933,33 @@ impl AppCore {
         thread::sleep(Duration::from_millis(400));
         codex_launch::restore_codex_state_from_launch_backup()
             .map_err(ManagementCoreError::Unavailable)?;
+        // 停了就把绑定账号放回代理池（解除 login-only 占用）。
+        self.release_active_profile_binding();
+        self.codex_active_profile_id = None;
         Ok("已停止 Codex 并还原配置".to_string())
     }
 
     /// 当前是否有 Codex 一键启动会话在运行。
     pub fn codex_active(&self) -> bool {
         self.codex_session.is_some() || codex_launch::launch_backup_exists()
+    }
+
+    /// 当前在跑的启动方案 id（没有则 None，前端据此高亮「运行中」那套）。
+    pub fn active_codex_profile_id(&self) -> Option<String> {
+        self.codex_active_profile_id.clone()
+    }
+
+    /// 释放当前活动方案绑定账号的 login-only 占用（放回代理池）。best-effort。
+    fn release_active_profile_binding(&self) {
+        let account = self
+            .codex_active_profile_id
+            .as_ref()
+            .and_then(|id| self.settings.codex_profiles.iter().find(|p| &p.id == id))
+            .map(|profile| profile.bound_account.trim().to_string())
+            .unwrap_or_default();
+        if !account.is_empty() {
+            let _ = codex_launch::release_bound_account_login_only(&account);
+        }
     }
 
     /// 监控第一步（持锁，纯内存）：有可监控的会话时返回（会话代数, 探测目标）。
@@ -962,7 +1004,9 @@ impl AppCore {
             return false;
         }
         self.codex_session = None;
+        self.release_active_profile_binding();
         let _ = codex_launch::restore_codex_state_from_launch_backup();
+        self.codex_active_profile_id = None;
         true
     }
 
@@ -2528,6 +2572,56 @@ fn migrate_remote_management_key(settings: &mut AppSettings) -> Option<String> {
     }
 }
 
+/// 把旧的单套平铺 Codex 启动配置迁移成一条方案。仅在还没有任何方案、且配过绑定账号时
+/// 跑一次：按旧字段合成 profiles[0]，并清空旧平铺字段（单一数据源——避免用户删光方案后
+/// 下次启动又被旧字段「复活」出一条）。迁移结果在 `Default` 里随其它设置一并写回磁盘。
+fn migrate_codex_profiles(settings: &mut AppSettings) {
+    if !settings.codex_profiles.is_empty() {
+        return;
+    }
+    let account = settings.codex_bound_account.trim().to_string();
+    if account.is_empty() {
+        return;
+    }
+    let launch_mode = if settings.codex_launch_mode.trim().is_empty() {
+        "app".to_string()
+    } else {
+        settings.codex_launch_mode.trim().to_string()
+    };
+    let reasoning = if settings.codex_reasoning.trim().is_empty() {
+        "high".to_string()
+    } else {
+        settings.codex_reasoning.trim().to_string()
+    };
+    settings.codex_profiles.push(quotio_types::CodexLaunchProfile {
+        id: "migrated-default".to_string(),
+        name: profile_name_from_account_key(&account),
+        launch_mode,
+        bound_account: account,
+        proxy_url: String::new(), // 旧配置没有自定义地址,启动时回退本机端点。
+        model: settings.codex_model.trim().to_string(),
+        reasoning,
+        api_key: settings.codex_api_key.trim().to_string(),
+    });
+    // 清空旧平铺字段：迁移后以 codex_profiles 为唯一数据源。
+    settings.codex_launch_mode = "app".to_string();
+    settings.codex_bound_account = String::new();
+    settings.codex_model = String::new();
+    settings.codex_reasoning = "high".to_string();
+    settings.codex_api_key = String::new();
+}
+
+/// 从账号 key（如 `codex-foo@bar.com`）提取一个友好的方案名。
+fn profile_name_from_account_key(key: &str) -> String {
+    let trimmed = key.trim();
+    let friendly = trimmed.strip_prefix("codex-").unwrap_or(trimmed);
+    if friendly.is_empty() {
+        "默认方案".to_string()
+    } else {
+        friendly.to_string()
+    }
+}
+
 fn read_fallback_configuration() -> Option<FallbackConfiguration> {
     let path = fallback_config_path();
     let content = fs::read_to_string(path).ok()?;
@@ -3942,6 +4036,43 @@ mod tests {
         // CLI 模式没拿到终端 pid：无从监控。
         core.codex_session = Some(codex_launch::CodexSession::new(None, "cli"));
         assert!(core.codex_monitor_probe().is_none());
+    }
+
+    #[test]
+    fn migrate_codex_profiles_seeds_one_profile_from_flat_fields() {
+        let mut settings = AppSettings {
+            codex_bound_account: "codex-foo@bar.com".to_string(),
+            codex_launch_mode: "cli".to_string(),
+            codex_model: "gpt-5.5".to_string(),
+            codex_reasoning: "xhigh".to_string(),
+            codex_api_key: "sk-x".to_string(),
+            ..AppSettings::default()
+        };
+        migrate_codex_profiles(&mut settings);
+
+        assert_eq!(settings.codex_profiles.len(), 1);
+        let profile = &settings.codex_profiles[0];
+        assert_eq!(profile.name, "foo@bar.com");
+        assert_eq!(profile.launch_mode, "cli");
+        assert_eq!(profile.bound_account, "codex-foo@bar.com");
+        assert_eq!(profile.proxy_url, ""); // 旧配置没有自定义代理地址
+        assert_eq!(profile.model, "gpt-5.5");
+        assert_eq!(profile.reasoning, "xhigh");
+        assert_eq!(profile.api_key, "sk-x");
+        // 旧平铺字段已清空（单一数据源）。
+        assert!(settings.codex_bound_account.is_empty());
+        assert!(settings.codex_model.is_empty());
+
+        // 已有方案时不重复迁移。
+        migrate_codex_profiles(&mut settings);
+        assert_eq!(settings.codex_profiles.len(), 1);
+    }
+
+    #[test]
+    fn migrate_codex_profiles_noop_without_bound_account() {
+        let mut settings = AppSettings::default();
+        migrate_codex_profiles(&mut settings);
+        assert!(settings.codex_profiles.is_empty());
     }
 
     fn usage_event_for_test(source: &str, failed: bool) -> quotio_types::UsageEvent {

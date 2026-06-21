@@ -47,6 +47,7 @@ export type AppSettings = {
   codex_model: string;
   codex_reasoning: string;
   codex_api_key: string;
+  codex_profiles: CodexLaunchProfile[];
   scheduler_rule: string;
   scheduler_min_hold_minutes: number;
   scheduler_switch_margin_minutes: number;
@@ -72,6 +73,18 @@ export type CodexAccountRef = {
   key: string;
   email: string;
   disabled: boolean;
+};
+
+// 一套 Codex 一键启动方案。镜像 crates/quotio-types `CodexLaunchProfile`。
+export type CodexLaunchProfile = {
+  id: string;
+  name: string;
+  launch_mode: string; // app / cli
+  bound_account: string;
+  proxy_url: string; // 代理地址（base_url）；留空 = 本机端点
+  model: string;
+  reasoning: string;
+  api_key: string;
 };
 
 export type ProxyHealthState = {

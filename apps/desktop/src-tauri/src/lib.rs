@@ -133,24 +133,31 @@ fn list_codex_launch_accounts() -> Vec<quotio_core::codex_launch::CodexAccountRe
     quotio_core::codex_launch::list_codex_accounts()
 }
 
-/// 一键启动 Codex（用已保存的 codex_* 设置）：确保代理 → 备份原始 → 写配置 → 注入账号 → 启动。
+/// 一键启动指定方案的 Codex：确保代理 → 备份原始 → 写配置 → 注入账号 → 启动。
+/// 全程都是阻塞活儿（关进程 / 写文件 / 修 sqlite / 拉起进程，商店版还要轮询 pid 数秒），
+/// 放到 blocking 线程跑，避免冻住 UI 主线程（否则窗口会「未响应」）。
 #[tauri::command]
-fn codex_start(state: State<'_, DesktopState>) -> Result<String, String> {
-    let mut core = state
-        .core
-        .lock()
-        .map_err(|_| "无法启动 Codex".to_string())?;
-    core.codex_start().map_err(|error| error.to_string())
+async fn codex_start(state: State<'_, DesktopState>, profile_id: String) -> Result<String, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut core = core.lock().map_err(|_| "无法启动 Codex".to_string())?;
+        core.codex_start(&profile_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("启动任务异常：{}", error))?
 }
 
-/// 停止 Codex：杀掉启动的进程 + 把 ~/.codex 还原到启动前。
+/// 停止 Codex：杀掉启动的进程 + 把 ~/.codex 还原到启动前。同样放到 blocking 线程,避免冻 UI。
 #[tauri::command]
-fn codex_stop(state: State<'_, DesktopState>) -> Result<String, String> {
-    let mut core = state
-        .core
-        .lock()
-        .map_err(|_| "无法停止 Codex".to_string())?;
-    core.codex_stop().map_err(|error| error.to_string())
+async fn codex_stop(state: State<'_, DesktopState>) -> Result<String, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut core = core.lock().map_err(|_| "无法停止 Codex".to_string())?;
+        core.codex_stop().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("停止任务异常：{}", error))?
 }
 
 /// 当前 Codex 一键启动会话是否在运行。
@@ -161,6 +168,16 @@ fn codex_launch_active(state: State<'_, DesktopState>) -> Result<bool, String> {
         .lock()
         .map_err(|_| "无法读取 Codex 状态".to_string())?;
     Ok(core.codex_active())
+}
+
+/// 当前在跑的启动方案 id（前端据此高亮「运行中」那套；无则 null）。
+#[tauri::command]
+fn codex_active_profile(state: State<'_, DesktopState>) -> Result<Option<String>, String> {
+    let core = state
+        .core
+        .lock()
+        .map_err(|_| "无法读取 Codex 状态".to_string())?;
+    Ok(core.active_codex_profile_id())
 }
 
 /// 修复 Codex 历史会话可见性：对齐 rollout/state_5.sqlite 里的 provider 元数据。
@@ -1649,6 +1666,7 @@ pub fn run() {
             codex_start,
             codex_stop,
             codex_launch_active,
+            codex_active_profile,
             codex_repair_session_visibility,
             fetch_codex_models,
             discover_available_models,
