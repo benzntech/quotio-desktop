@@ -3594,6 +3594,13 @@ h3 {
   flex: 1 1 auto;
 }
 
+.account-row-email.account-row-email--revealed {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-all;
+}
+
 .account-row-email {
   overflow: hidden;
   color: var(--quotio-text);

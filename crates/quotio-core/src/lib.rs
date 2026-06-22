@@ -687,11 +687,6 @@ impl AppCore {
                     .to_string()
             });
 
-        let email = obj
-            .get("email")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-
         // Build a clean auth object with `type` always set.
         let mut output = item.clone();
         if let Some(out_obj) = output.as_object_mut() {
@@ -700,21 +695,9 @@ impl AppCore {
                 .or_insert_with(|| serde_json::Value::String(provider.clone()));
         }
 
-        let email_part = email
-            .map(|e| {
-                e.chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '@' || c == '.' || c == '-' || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let target_name = format!("{}-{}.json", provider, email_part);
+        // 文件名 = <provider>-<唯一标识>.json。标识见 auth_file_ident:多份「没 email」的账号
+        // 不再都落到 <provider>-unknown.json 互相覆盖(= 多选导入只进来一个的根因)。
+        let target_name = format!("{}-{}.json", provider, auth_file_ident(item));
         let target = dir.join(&target_name);
 
         if let Ok(json) = serde_json::to_string_pretty(&output) {
@@ -1737,6 +1720,46 @@ fn convert_sub2api_accounts(parsed: &serde_json::Value) -> Option<Vec<serde_json
     }
 }
 
+/// 给导入的账号文件取一个稳定且唯一的标识段(用于文件名 `<provider>-<ident>.json`):
+/// 优先 email,其次 account_id(顶层或 tokens 里),都没有就用内容指纹。关键是别让多份
+/// 「没 email」的账号都落到同一个 `<provider>-unknown.json` 而互相覆盖(= 多选导入只进来一个)。
+fn auth_file_ident(item: &serde_json::Value) -> String {
+    fn sanitize(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '@' || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+    let obj = item.as_object();
+    let email = obj
+        .and_then(|o| o.get("email"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    if let Some(email) = email {
+        return sanitize(email);
+    }
+    let account_id = obj
+        .and_then(|o| o.get("account_id"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            obj.and_then(|o| o.get("tokens"))
+                .and_then(|tokens| tokens.get("account_id"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| !s.is_empty());
+    if let Some(account_id) = account_id {
+        return format!("aid-{}", sanitize(account_id));
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&item.to_string(), &mut hasher);
+    format!("anon-{:x}", std::hash::Hasher::finish(&hasher))
+}
+
 fn dedup_codex_auth_keep_newest(dir: &std::path::Path, bound_account: &str) {
     use std::collections::HashMap;
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1968,8 +1991,16 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
 /// GLM key file) into a single zip under `dest_dir`, for backup / moving to
 /// another machine. Returns the written zip's path; errors when there's nothing
 /// to export. NOTE: the zip contains live OAuth tokens — treat it as a secret.
-pub fn export_auth_files(zip_path: &std::path::Path) -> Result<String, String> {
+pub fn export_auth_files(
+    zip_path: &std::path::Path,
+    names: Option<&[String]>,
+) -> Result<String, String> {
     use std::io::Write as _;
+    // names = Some 时只导这些账号(按服务商导出);None = 导全部。
+    // 归一化(去 .json 后缀 + 小写)后比对,兼容代理把文件名小写化、以及传入带不带 .json。
+    let normalize = |value: &str| value.trim().trim_end_matches(".json").to_ascii_lowercase();
+    let only: Option<std::collections::HashSet<String>> =
+        names.map(|list| list.iter().map(|name| normalize(name)).collect());
     let src = quotio_platform::proxy_auth_dir();
     let entries = std::fs::read_dir(&src).map_err(|error| format!("读取账号目录失败：{}", error))?;
     if let Some(parent) = zip_path.parent() {
@@ -1989,6 +2020,11 @@ pub fn export_auth_files(zip_path: &std::path::Path) -> Result<String, String> {
         let lower = name.to_ascii_lowercase();
         if !lower.ends_with(".json") || lower.starts_with("glm-keys") {
             continue;
+        }
+        if let Some(only) = &only {
+            if !only.contains(&normalize(name)) {
+                continue;
+            }
         }
         let Ok(content) = std::fs::read(&path) else {
             continue;
@@ -3806,6 +3842,29 @@ fn now_unix_seconds() -> u64 {
 mod tests {
     use super::*;
     use quotio_types::{ConnectionMode, MigrationPhase};
+
+    #[test]
+    fn auth_file_ident_keeps_emailless_accounts_distinct() {
+        // 两份没 email 的 codex 账号(account_id 在 tokens 里):标识必须不同,否则落到同一个
+        // 文件名互相覆盖 —— 多选导入只进来一个的根因。
+        let a = serde_json::json!({ "type": "codex", "tokens": { "account_id": "acc-A" } });
+        let b = serde_json::json!({ "type": "codex", "tokens": { "account_id": "acc-B" } });
+        assert_ne!(auth_file_ident(&a), auth_file_ident(&b));
+        assert!(auth_file_ident(&a).contains("acc-A"));
+
+        // 既无 email 也无 account_id 的两份不同内容靠指纹区分;同一份重复导入仍同名(幂等)。
+        let c = serde_json::json!({ "type": "codex", "access_token": "tok-c" });
+        let d = serde_json::json!({ "type": "codex", "access_token": "tok-d" });
+        assert_ne!(auth_file_ident(&c), auth_file_ident(&d));
+        assert_eq!(
+            auth_file_ident(&c),
+            auth_file_ident(&serde_json::json!({ "type": "codex", "access_token": "tok-c" }))
+        );
+
+        // 有 email 时优先用 email。
+        let e = serde_json::json!({ "type": "codex", "email": "x@e.com", "tokens": { "account_id": "acc-A" } });
+        assert_eq!(auth_file_ident(&e), "x@e.com");
+    }
 
     fn quota_with_models(key: &str) -> quotio_types::AccountQuota {
         quotio_types::AccountQuota {

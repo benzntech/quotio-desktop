@@ -789,12 +789,12 @@ fn import_auth_file(
     core.import_auth_file(&filename, &content)
 }
 
-/// Export all CPA account credential files as one zip into the user's Downloads
-/// folder (falling back to the app config dir). Returns the zip's path so the UI
-/// can reveal it in the file manager.
+/// Export CPA account credential files as one zip. `names` (auth file names of a
+/// single provider) limits the export to those accounts; omit it to export all.
+/// Returns the zip's path so the UI can reveal it in the file manager.
 #[tauri::command]
-fn export_auth_files(path: String) -> Result<String, String> {
-    quotio_core::export_auth_files(std::path::Path::new(&path))
+fn export_auth_files(path: String, names: Option<Vec<String>>) -> Result<String, String> {
+    quotio_core::export_auth_files(std::path::Path::new(&path), names.as_deref())
 }
 
 #[tauri::command]

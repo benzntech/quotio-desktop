@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo, memo, type ChangeEvent } from "react";
 import type { AccountAuthHealth, AppState, AuthFile, OAuthStatusResponse, OAuthUrlResponse, ProviderSummary } from "../../types";
 import { maskEmail, matchAuthFile } from "../../lib/format";
-import { PlusIcon, RefreshIcon, TrashIcon } from "../icons";
+import { EyeIcon, EyeOffIcon, PlusIcon, RefreshIcon, TrashIcon } from "../icons";
 import { useT } from "../../i18n";
 import { invoke } from "../../lib/tauri";
 import { Select } from "../Select";
@@ -28,22 +28,14 @@ type AccountGroupData = {
   accounts: AuthFile[];
 };
 
+// 公共「⋯」菜单:只用来给「还没连接」(没卡片)的服务商加第一个账号。
+// 已连接的有自己的卡片(+ 添加 / 导出账号 / 删除所有账号),文件导入也在添加弹窗里——
+// 所以这里不再放 导入 / 导出所有 / 清空所有。没有可加的服务商时整个菜单不显示。
 function GlobalActionsMenu({
-  oauthProviders, authFiles, isManagementBusy, exportState,
-  confirmClearAll, setConfirmClearAll,
-  onImportFiles, onExportAccounts, onClearAll, onSelectProvider, t,
+  oauthProviders, onSelectProvider,
 }: {
   oauthProviders: ProviderSummary[];
-  authFiles: AuthFile[];
-  isManagementBusy: boolean;
-  exportState: string;
-  confirmClearAll: boolean;
-  setConfirmClearAll: (v: boolean) => void;
-  onImportFiles: (e: ChangeEvent<HTMLInputElement>) => void;
-  onExportAccounts: () => Promise<void>;
-  onClearAll: () => void;
   onSelectProvider: (provider: ProviderSummary) => void;
-  t: (key: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -57,9 +49,11 @@ function GlobalActionsMenu({
     return () => document.removeEventListener("mousedown", close);
   }, [open]);
 
+  if (oauthProviders.length === 0) return null;
+
   return (
     <div className="pv-card-menu-anchor" ref={ref}>
-      <button className="pv-card-more pv-global-more" type="button" onClick={() => setOpen((v) => !v)} aria-label="批量操作">
+      <button className="pv-card-more pv-global-more" type="button" onClick={() => setOpen((v) => !v)} aria-label="添加未连接的服务商">
         <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><circle cx="3" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="13" cy="8" r="1.3"/></svg>
       </button>
       {open ? (
@@ -69,28 +63,6 @@ function GlobalActionsMenu({
               添加 {p.display_name} 账号
             </button>
           ))}
-          <label className="pv-dropdown-label">
-            {t("import.button")}
-            <input type="file" accept=".json,application/json" multiple hidden disabled={isManagementBusy} onChange={(e) => { onImportFiles(e); setOpen(false); }} />
-          </label>
-          {authFiles.length > 0 ? (
-            <button type="button" disabled={isManagementBusy || exportState === "busy"} onClick={() => { void onExportAccounts(); setOpen(false); }}>
-              {exportState === "busy" ? "导出中…" : exportState === "done" ? "已导出 ✓" : "导出所有账号"}
-            </button>
-          ) : null}
-          {authFiles.length > 0 ? (
-            <button
-              type="button"
-              className={confirmClearAll ? "pv-dropdown-danger" : ""}
-              disabled={isManagementBusy}
-              onClick={() => {
-                if (confirmClearAll) { setConfirmClearAll(false); onClearAll(); setOpen(false); }
-                else { setConfirmClearAll(true); window.setTimeout(() => setConfirmClearAll(false), 4000); }
-              }}
-            >
-              {confirmClearAll ? `确认清空全部 ${authFiles.length} 个？` : "清空所有账号"}
-            </button>
-          ) : null}
         </div>
       ) : null}
     </div>
@@ -304,8 +276,6 @@ export function ProvidersScreen({
   const oauthProviders = appState.providers.filter((provider) => provider.native_oauth || provider.oauth_endpoint || provider.supports_manual_auth);
 
   const [addAccountProvider, setAddAccountProvider] = useState<ProviderSummary | null>(null);
-  const [confirmClearAll, setConfirmClearAll] = useState(false);
-  const [exportState, setExportState] = useState<"idle" | "busy" | "done" | "error">("idle");
   const [projectId] = useState("");
   const [showAddCustom, setShowAddCustom] = useState(false);
   const [editingCustomId, setEditingCustomId] = useState<string | null>(null);
@@ -424,11 +394,14 @@ export function ProvidersScreen({
     }
   }
 
-  async function onExportAccounts() {
+  // 按服务商导出:只把该服务商的账号文件打包成 zip(把账号名传给后端做过滤)。
+  // 反馈靠系统保存对话框 + 导出后在文件管理器里高亮该 zip,不再用应用内状态。
+  async function onExportProvider(group: AccountGroupData) {
     if (!("__TAURI_INTERNALS__" in window)) return;
-    // Default name: account email (first, "+N" when several) + a readable
-    // timestamp. The save dialog lets the user change the name and location.
-    const emails = authFiles.map((file) => file.email).filter((email): email is string => Boolean(email));
+    const accounts = group.accounts;
+    if (accounts.length === 0) return;
+    const names = accounts.map((account) => account.name);
+    const emails = accounts.map((account) => account.email).filter((email): email is string => Boolean(email));
     const now = new Date();
     const pad = (value: number) => String(value).padStart(2, "0");
     const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
@@ -437,8 +410,9 @@ export function ProvidersScreen({
         ? emails[0]
         : emails.length > 1
           ? `${emails[0]}+${emails.length - 1}`
-          : `${authFiles.length}accounts`;
-    const defaultName = `quotio_${base.replace(/[<>:"\\|?*\x00-\x1f]/g, "-")}_${stamp}.zip`;
+          : `${accounts.length}accounts`;
+    const safe = (value: string) => value.replace(/[<>:"\\|?*\x00-\x1f/]/g, "-");
+    const defaultName = `quotio_${safe(group.id)}_${safe(base)}_${stamp}.zip`;
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");
       const target = await save({
@@ -446,9 +420,7 @@ export function ProvidersScreen({
         filters: [{ name: "Zip", extensions: ["zip"] }],
       });
       if (!target) return; // user cancelled the dialog
-      setExportState("busy");
-      const path = await invoke<string>("export_auth_files", { path: target });
-      setExportState("done");
+      const path = await invoke<string>("export_auth_files", { path: target, names });
       try {
         const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
         await revealItemInDir(path);
@@ -456,9 +428,8 @@ export function ProvidersScreen({
         /* revealing the folder is best-effort */
       }
     } catch {
-      setExportState("error");
+      /* save 取消 / 导出失败 —— best-effort,不弹 toast */
     }
-    window.setTimeout(() => setExportState("idle"), 4000);
   }
 
   return (
@@ -497,17 +468,11 @@ export function ProvidersScreen({
         <span className="pv-section-actions">
           <span className="pv-count-badge">共 {groups.length} 个服务商</span>
           <GlobalActionsMenu
-            oauthProviders={oauthProviders}
-            authFiles={authFiles}
-            isManagementBusy={isManagementBusy}
-            exportState={exportState}
-            confirmClearAll={confirmClearAll}
-            setConfirmClearAll={setConfirmClearAll}
-            onImportFiles={onImportFiles}
-            onExportAccounts={onExportAccounts}
-            onClearAll={() => onRunManagementStateAction("delete_all_management_auth_files")}
+            oauthProviders={oauthProviders.filter(
+              // 只列「还没连接」(没卡片)的服务商——加首个账号的唯一入口;已连接的卡片上有 +。
+              (p) => !groups.some((g) => g.id === p.id || p.id.includes(g.id) || g.id.includes(p.id)),
+            )}
             onSelectProvider={setAddAccountProvider}
-            t={t}
           />
         </span>
       </div>
@@ -529,6 +494,7 @@ export function ProvidersScreen({
                 const provider = appState.providers.find((p) => p.id === group.id || p.id.includes(group.id) || group.id.includes(p.id));
                 if (provider) setAddAccountProvider(provider);
               }}
+              onExport={() => void onExportProvider(group)}
               onDeleteAll={() => {
                 for (const account of group.accounts) {
                   onRunManagementStateAction("delete_management_auth_file", { name: account.name });
@@ -765,6 +731,7 @@ function ProviderCard({
   onDelete,
   onReauth,
   onAddAccount,
+  onExport,
   onDeleteAll,
   onToggleDisableAll,
 }: {
@@ -775,6 +742,7 @@ function ProviderCard({
   onDelete: (account: AuthFile) => void;
   onReauth: (account: AuthFile) => void;
   onAddAccount: () => void;
+  onExport: () => void;
   onDeleteAll: () => void;
   onToggleDisableAll: () => void;
 }) {
@@ -841,6 +809,11 @@ function ProviderCard({
               {accounts.length > 0 ? (
                 <button type="button" onClick={() => { onToggleDisableAll(); setMenuOpen(false); }}>
                   {allDisabled ? "✦ 全部启用" : "⏸ 全部禁用"}
+                </button>
+              ) : null}
+              {accounts.length > 0 ? (
+                <button type="button" onClick={() => { onExport(); setMenuOpen(false); }}>
+                  ⬇ 导出账号
                 </button>
               ) : null}
               {accounts.length > 0 ? (
@@ -956,6 +929,7 @@ const AccountRow = memo(function AccountRow({
   const label = account.email || account.account || account.label || account.name;
   const initial = label.trim().charAt(0).toUpperCase() || "?";
   const state = accountState(account, authFailed, health);
+  const [revealed, setRevealed] = useState(false);
 
   return (
     <div className="account-row">
@@ -963,7 +937,9 @@ const AccountRow = memo(function AccountRow({
         {initial}
       </span>
       <div className="account-row-info">
-        <span className="account-row-email">{maskEmail(label)}</span>
+        <span className={`account-row-email${revealed ? " account-row-email--revealed" : ""}`} title={label}>
+          {revealed ? label : maskEmail(label)}
+        </span>
         <span className={`account-row-status account-row-status--${state.tone}`}>{t(state.key, state.fallback)}</span>
       </div>
       <div className="account-row-actions">
@@ -972,6 +948,15 @@ const AccountRow = memo(function AccountRow({
             {t("providers.reauth", "重新授权")}
           </button>
         ) : null}
+        <button
+          className="row-icon-btn"
+          type="button"
+          onClick={() => setRevealed((v) => !v)}
+          title={revealed ? "隐藏邮箱" : "显示完整邮箱"}
+          aria-label={revealed ? "隐藏邮箱" : "显示完整邮箱"}
+        >
+          {revealed ? <EyeOffIcon /> : <EyeIcon />}
+        </button>
         <button className="row-icon-btn row-icon-btn--danger" type="button" onClick={onDelete} disabled={isBusy} title="删除账号" aria-label="删除账号">
           <TrashIcon />
         </button>

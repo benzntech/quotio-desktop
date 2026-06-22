@@ -75,3 +75,22 @@ export function KeyIcon() {
     </svg>
   );
 }
+
+export function EyeIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M1.5 8S3.9 3.8 8 3.8 14.5 8 14.5 8 12.1 12.2 8 12.2 1.5 8 1.5 8z" />
+      <circle cx="8" cy="8" r="1.9" />
+    </svg>
+  );
+}
+
+export function EyeOffIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6.4 6.4a1.9 1.9 0 0 0 2.7 2.7" />
+      <path d="M4.2 4.3C2.5 5.4 1.5 8 1.5 8s2.4 4.2 6.5 4.2c1.1 0 2.1-.3 2.9-.8M13 6.2c.9.9 1.5 1.8 1.5 1.8s-.5 1-1.4 1.9" />
+      <path d="M2.5 2.5l11 11" />
+    </svg>
+  );
+}
