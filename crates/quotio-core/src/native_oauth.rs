@@ -1065,7 +1065,7 @@ fn write_auth_file(
 
 pub fn start_oauth(provider_id: &str) -> Result<OAuthStartResponse, String> {
     let config = provider_config(provider_id)
-        .ok_or_else(|| format!("不支持的服务商: {}", provider_id))?;
+        .ok_or_else(|| format!("Unsupported provider: {}", provider_id))?;
 
     // Cancel any existing login.
     cancel_oauth(None).ok();
