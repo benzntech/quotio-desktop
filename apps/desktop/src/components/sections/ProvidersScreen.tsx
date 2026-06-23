@@ -466,7 +466,7 @@ export function ProvidersScreen({
       <div className="pv-section-header">
         <h2 className="pv-section-title">{t("providers.connected", "Connected Providers")}</h2>
         <span className="pv-section-actions">
-          <span className="pv-count-badge">{t("providers.count", `Total ${groups.length} providers`, { count: groups.length })}</span>
+          <span className="pv-count-badge">{t("providers.count", `Total ${groups.length} providers`)}</span>
           <GlobalActionsMenu
             oauthProviders={oauthProviders.filter(
               // 只列「还没连接」(没卡片)的服务商——加首个账号的唯一入口;已连接的卡片上有 +。
