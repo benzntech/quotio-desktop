@@ -3618,6 +3618,14 @@ fn make_executable(path: &Path) -> std::io::Result<()> {
         let mut permissions = fs::metadata(path)?.permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions)?;
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("xattr")
+                .arg("-c")
+                .arg(path)
+                .status();
+        }
     }
 
     #[cfg(not(unix))]
