@@ -310,7 +310,7 @@ impl AppCore {
             && !matches!(self.proxy.state.status, ProxyStatusKind::Running)
         {
             return Err(ManagementCoreError::Unavailable(
-                "代理核心未运行，无法访问本地管理接口。".to_string(),
+                "Proxy core is not running, cannot access local management interface.".to_string(),
             ));
         }
 
@@ -2823,7 +2823,7 @@ impl ProxyLifecycle {
                 None,
                 0,
                 ProxyHealthState::default(),
-                "代理核心尚未启动。",
+                "Proxy core has not been started.",
             )
         } else {
             missing_binary_state(settings, &paths, 0)
@@ -2885,7 +2885,7 @@ impl ProxyLifecycle {
                 None,
                 self.crash_count,
                 self.state.health.clone(),
-                "代理核心已经在运行。",
+                "Proxy core is already running.",
             );
             return Ok(());
         }
@@ -2905,7 +2905,7 @@ impl ProxyLifecycle {
             None,
             self.crash_count,
             ProxyHealthState::unknown("代理进程正在启动。"),
-            "正在启动代理核心。",
+            "Starting proxy core...",
         );
 
         // Prefer a bundled resource binary (copy it into the managed dir);
@@ -3012,9 +3012,9 @@ impl ProxyLifecycle {
                 self.child = Some(child);
                 let health = self.probe_health(settings);
                 let message = if health.ok == Some(true) {
-                    "代理核心已启动并通过健康检查。"
+                    "Proxy core started and passed health check."
                 } else {
-                    "代理核心已启动，但健康检查尚未通过。"
+                    "Proxy core started, but health check has not passed yet."
                 };
                 self.state = state_for_paths(
                     settings,
@@ -3061,9 +3061,9 @@ impl ProxyLifecycle {
         let dest = self.paths.managed_binary_path();
         let _ = make_executable(&dest);
         let message = if tag.is_empty() {
-            "代理核心已下载，可以启动。".to_string()
+            "Proxy core downloaded, ready to start.".to_string()
         } else {
-            format!("代理核心 {} 已下载，可以启动。", tag)
+            format!("Proxy core {} downloaded, ready to start.", tag)
         };
         self.state = state_for_paths(
             settings,
@@ -3072,7 +3072,7 @@ impl ProxyLifecycle {
             None,
             None,
             self.crash_count,
-            ProxyHealthState::unknown("代理核心已就绪。"),
+            ProxyHealthState::unknown("Proxy core is ready."),
             message,
         );
     }
@@ -3115,8 +3115,8 @@ impl ProxyLifecycle {
                 None,
                 None,
                 self.crash_count,
-                ProxyHealthState::unknown("代理核心未运行。"),
-                "代理核心已停止。",
+                ProxyHealthState::unknown("Proxy core is not running."),
+                "Proxy core stopped.",
             );
             return Ok(());
         };
@@ -3130,7 +3130,7 @@ impl ProxyLifecycle {
             None,
             self.crash_count,
             self.state.health.clone(),
-            "正在停止代理核心。",
+            "Stopping proxy core...",
         );
 
         if let Err(error) = child.kill() {
@@ -3147,8 +3147,8 @@ impl ProxyLifecycle {
             None,
             None,
             self.crash_count,
-            ProxyHealthState::unknown("代理核心已停止。"),
-            "代理核心已停止。",
+            ProxyHealthState::unknown("Proxy core stopped."),
+            "Proxy core stopped.",
         );
         Ok(())
     }
@@ -3222,7 +3222,7 @@ impl ProxyLifecycle {
                     None,
                     self.crash_count,
                     health,
-                    "检测到代理核心正在运行(非本会话启动)。",
+                    "Detected proxy core is running (not started by this session).",
                 );
             } else if self.port_conflict {
                 // 占用方已不再响应：解除冲突态，回到「未启动」。
@@ -3234,8 +3234,8 @@ impl ProxyLifecycle {
                     None,
                     None,
                     self.crash_count,
-                    ProxyHealthState::unknown("代理核心未运行。"),
-                    "端口占用已解除，代理核心尚未启动。",
+                    ProxyHealthState::unknown("Proxy core is not running."),
+                    "Port is free, proxy core has not been started.",
                 );
             } else {
                 self.sync_settings(settings);
@@ -3295,17 +3295,17 @@ impl ProxyLifecycle {
                 self.state.status,
                 ProxyStatusKind::MissingBinary | ProxyStatusKind::Crashed
             ) {
-                self.state.health = ProxyHealthState::unknown("代理核心未运行。");
-                self.state.message = "代理核心未运行，无法执行健康检查。".to_string();
+                self.state.health = ProxyHealthState::unknown("Proxy core is not running.");
+                self.state.message = "Proxy core is not running, cannot execute health check.".to_string();
             }
             return;
         }
 
         let health = self.probe_health(settings);
         let message = if health.ok == Some(true) {
-            "代理核心健康检查通过。"
+            "Proxy core passed health check."
         } else {
-            "代理核心健康检查失败。"
+            "Proxy core health check failed."
         };
         self.state = state_for_paths(
             settings,

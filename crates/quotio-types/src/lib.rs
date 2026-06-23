@@ -276,7 +276,7 @@ impl ProxyState {
             exit_code: None,
             crash_count: 0,
             health: ProxyHealthState::default(),
-            message: "代理核心尚未启动。".to_string(),
+            message: "Proxy core has not been started.".to_string(),
         }
     }
 
