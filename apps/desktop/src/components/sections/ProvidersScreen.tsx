@@ -478,7 +478,7 @@ export function ProvidersScreen({
       </div>
 
       {groups.length === 0 ? (
-        <p className="empty-copy" style={{ padding: "24px 0" }}>暂无账号。点击卡片上的 + 授权或通过右上角 ⋯ 导入。</p>
+        <p className="empty-copy" style={{ padding: "24px 0" }}>{t("providers.empty", "No accounts yet. Click + on a card to authorize, or import via the ⋯ menu.")}</p>
       ) : (
         <div className="pv-card-grid">
           {groups.map((group) => (
