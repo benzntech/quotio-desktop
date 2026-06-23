@@ -372,7 +372,7 @@ export function AppShell(props: AppShellProps) {
           <div className="boot-bar" aria-hidden="true">
             <span />
           </div>
-          <p>正在加载额度… {props.quotaToast.loaded}</p>
+          <p>Loading quotas... {props.quotaToast.loaded}</p>
         </div>
       ) : null}
     </main>
