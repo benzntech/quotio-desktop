@@ -241,6 +241,24 @@ export function SettingsScreen({
       </div>
 
       <div className="settings-group">
+        <h2 className="settings-group-title">{t("settings.logging", "Logging")}</h2>
+        <div className="settings-card">
+          <div className="settings-row">
+            <div className="settings-row-text">
+              <strong>{t("settings.loggingToFile", "Log to file")}</strong>
+              <small>{t("settings.loggingHelp", "Write application logs to rotating files instead of stdout. Disable to log to stdout/stderr.")}</small>
+            </div>
+            <Switch
+              on={settings.logging_to_file ?? true}
+              disabled={isSaving}
+              onChange={() => applySettings({ logging_to_file: !(settings.logging_to_file ?? true) })}
+              label="Log to file"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="settings-group">
         <h2 className="settings-group-title">{t("settings.language")}</h2>
         <div className="settings-card">
           <div className="settings-row">

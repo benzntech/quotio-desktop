@@ -248,7 +248,9 @@ export function AppShell(props: AppShellProps) {
         </div>
 
         <nav className="nav-list" aria-label="Primary navigation">
-          {navItems.map((item) => (
+          {navItems
+            .filter((item) => item.id !== "logs" || props.appState.settings.logging_to_file)
+            .map((item) => (
             <button
               className={activeSection === item.id ? "active" : ""}
               key={item.id}
