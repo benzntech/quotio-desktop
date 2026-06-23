@@ -346,7 +346,7 @@ export function SettingsScreen({
               type="password"
               value={connDraft.remote_management_key}
               onChange={(event) => setConnDraft({ ...connDraft, remote_management_key: event.target.value })}
-              placeholder={credentialStatus.remote_management_key_masked ?? "保存后迁入安全存储"}
+              placeholder={credentialStatus.remote_management_key_masked ?? t("settings.remoteKeyPlaceholder", "Stored securely after saving")}
             />
           </div>
           <div className="settings-row">
@@ -358,7 +358,7 @@ export function SettingsScreen({
           </div>
           <div className="settings-row settings-row--actions">
             <span className="settings-status">
-              {t("settings.localRuntime")}：{appState.proxy.status === "running" && appState.proxy.health.ok ? "running · healthy" : appState.proxy.status}
+              {t("settings.localRuntime")}: {appState.proxy.status === "running" && appState.proxy.health.ok ? "running · healthy" : appState.proxy.status}
               {connDirty ? (
                 <strong className="settings-unsaved" style={{ color: "#d97706", marginInlineStart: 8 }}>
                   ● {t("settings.unsavedChanges")}
