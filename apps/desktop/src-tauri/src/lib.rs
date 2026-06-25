@@ -1622,8 +1622,8 @@ pub fn run() {
                 quotio_platform::set_proxy_resource_root(proxy_resource_root);
             }
 
-            let show = MenuItem::with_id(app, "show", "打开 Quotio", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "Open Quotio", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
 
             let mut tray_builder = TrayIconBuilder::with_id("main-tray")

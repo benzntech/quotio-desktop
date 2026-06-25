@@ -499,7 +499,7 @@ export function SettingsScreen({
                 }}
                 disabled={isManagementBusy || proxyUrlDraft.trim().length === 0}
               >
-                写入
+                {t("common.apply", "Apply")}
               </button>
               <button
                 className="danger-action"
@@ -510,11 +510,11 @@ export function SettingsScreen({
                 }}
                 disabled={isManagementBusy}
               >
-                清空
+                {t("common.clear", "Clear")}
               </button>
             </div>
           </div>
-          {managementAction ? <p className="settings-status settings-status--busy">写入中… {managementAction}</p> : null}
+          {managementAction ? <p className="settings-status settings-status--busy">{t("settings.applying", "Applying…")} {managementAction}</p> : null}
         </div>
       </div>
 
