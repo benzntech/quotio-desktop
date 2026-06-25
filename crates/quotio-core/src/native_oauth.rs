@@ -564,8 +564,10 @@ fn exchange_auth_code(pending: &PendingOAuth) -> Result<serde_json::Value, Strin
 
     let is_kiro = pending.provider_id == "kiro";
 
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
+
     let response = if is_kiro {
-        ureq::post(&pending.token_endpoint)
+        agent.post(&pending.token_endpoint)
             .set("Content-Type", "application/json")
             .send_string(
                 &serde_json::json!({
@@ -576,7 +578,7 @@ fn exchange_auth_code(pending: &PendingOAuth) -> Result<serde_json::Value, Strin
                 .to_string(),
             )
     } else {
-        ureq::post(&pending.token_endpoint)
+        agent.post(&pending.token_endpoint)
             .set("Content-Type", "application/x-www-form-urlencoded")
             .send_string(&body)
     };

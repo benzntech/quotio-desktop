@@ -770,7 +770,7 @@ function ProviderCard({
   const allDisabled = accounts.length > 0 && accounts.every((a) => a.disabled);
 
   const cardStatus = badCount > 0 ? "warn" : accounts.length === 0 ? "muted" : "good";
-  const statusLabel = badCount > 0 ? `${badCount} 个异常` : allDisabled ? "已禁用" : goodCount === accounts.length ? "正常" : "多闲";
+  const statusLabel = badCount > 0 ? `${badCount} Error(s)` : allDisabled ? "Disabled" : goodCount === accounts.length ? "Healthy" : "Idle";
 
   const PREVIEW_COUNT = 3;
   const previewAccounts = expanded ? accounts : accounts.slice(0, PREVIEW_COUNT);
@@ -794,26 +794,26 @@ function ProviderCard({
           <strong className="pv-card-name">{group.label}</strong>
           <span className={`pv-card-status pv-card-status--${cardStatus}`}>{statusLabel}</span>
         </div>
-        <button className="pv-card-add" type="button" onClick={onAddAccount} disabled={isBusy} title="添加账号" aria-label="添加账号">
+        <button className="pv-card-add" type="button" onClick={onAddAccount} disabled={isBusy} title="Add Account" aria-label="Add Account">
           <PlusIcon />
         </button>
         <div className="pv-card-menu-anchor" ref={menuRef}>
-          <button className="pv-card-more" type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="更多操作">
+          <button className="pv-card-more" type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="More Actions">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><circle cx="8" cy="3" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="8" cy="13" r="1.3"/></svg>
           </button>
           {menuOpen ? (
             <div className="pv-card-dropdown">
               <button type="button" onClick={() => { onAddAccount(); setMenuOpen(false); }}>
-                <PlusIcon /> 添加账号
+                <PlusIcon /> Add Account
               </button>
               {accounts.length > 0 ? (
                 <button type="button" onClick={() => { onToggleDisableAll(); setMenuOpen(false); }}>
-                  {allDisabled ? "✦ 全部启用" : "⏸ 全部禁用"}
+                  {allDisabled ? "✦ Enable All" : "⏸ Disable All"}
                 </button>
               ) : null}
               {accounts.length > 0 ? (
                 <button type="button" onClick={() => { onExport(); setMenuOpen(false); }}>
-                  ⬇ 导出账号
+                  ⬇ Export Accounts
                 </button>
               ) : null}
               {accounts.length > 0 ? (
@@ -825,7 +825,7 @@ function ProviderCard({
                     else { setConfirmDelete(true); window.setTimeout(() => setConfirmDelete(false), 3000); }
                   }}
                 >
-                  <TrashIcon /> {confirmDelete ? `确认删除 ${accounts.length} 个？` : "删除所有账号"}
+                  <TrashIcon /> {confirmDelete ? `Confirm delete ${accounts.length}?` : "Delete All Accounts"}
                 </button>
               ) : null}
             </div>
@@ -852,7 +852,7 @@ function ProviderCard({
 
       {accounts.length > PREVIEW_COUNT ? (
         <button className="pv-card-toggle" type="button" onClick={() => setExpanded((v) => !v)}>
-          {expanded ? "收起" : `查看全部 ${accounts.length} 个`}{" "}
+          {expanded ? "Collapse" : `View all ${accounts.length}`}{" "}
             <svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", transition: "transform 0.2s", transform: expanded ? "rotate(180deg)" : "rotate(0)" }}>
               <path d="M2.5 4.5 6 8l3.5-3.5" />
             </svg>
@@ -952,12 +952,12 @@ const AccountRow = memo(function AccountRow({
           className="row-icon-btn"
           type="button"
           onClick={() => setRevealed((v) => !v)}
-          title={revealed ? "隐藏邮箱" : "显示完整邮箱"}
-          aria-label={revealed ? "隐藏邮箱" : "显示完整邮箱"}
+          title={revealed ? "Hide email" : "Show full email"}
+          aria-label={revealed ? "Hide email" : "Show full email"}
         >
           {revealed ? <EyeOffIcon /> : <EyeIcon />}
         </button>
-        <button className="row-icon-btn row-icon-btn--danger" type="button" onClick={onDelete} disabled={isBusy} title="删除账号" aria-label="删除账号">
+        <button className="row-icon-btn row-icon-btn--danger" type="button" onClick={onDelete} disabled={isBusy} title="Delete Account" aria-label="Delete Account">
           <TrashIcon />
         </button>
       </div>
