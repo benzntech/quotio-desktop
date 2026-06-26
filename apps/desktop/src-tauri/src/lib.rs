@@ -281,7 +281,7 @@ fn open_logs_dir() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_launch_at_login(
+async fn set_launch_at_login(
     enabled: bool,
     app: AppHandle,
     state: State<'_, DesktopState>,
@@ -295,12 +295,19 @@ fn set_launch_at_login(
             .disable()
             .map_err(|error| error.to_string())?;
     }
+    let resolved = app.autolaunch().is_enabled().unwrap_or(enabled);
 
-    let mut core = lock_core(&state.core);
-    let mut settings = core.app_state().settings;
-    settings.launch_at_login = app.autolaunch().is_enabled().unwrap_or(enabled);
-    core.save_settings(settings)
-        .map_err(|error| error.to_string())
+    // app_state()/save_settings 内含同步健康探测(对不可达端点最坏阻塞数秒)。放到
+    // spawn_blocking,别在 Tauri 主线程上跑、冻住 UI(与 start/stop_proxy 一致)。
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut core = lock_core(&core);
+        let mut settings = core.app_state().settings;
+        settings.launch_at_login = resolved;
+        core.save_settings(settings).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("保存自启状态任务异常：{}", error))?
 }
 
 #[tauri::command]
@@ -592,9 +599,15 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn check_proxy_health(state: State<'_, DesktopState>) -> Result<AppState, String> {
-    let mut core = lock_core(&state.core);
-    Ok(core.check_proxy_health())
+async fn check_proxy_health(state: State<'_, DesktopState>) -> Result<AppState, String> {
+    // 健康检查本就做同步网络探测(最坏阻塞数秒):放到 spawn_blocking,别冻 UI。
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut core = lock_core(&core);
+        core.check_proxy_health()
+    })
+    .await
+    .map_err(|error| format!("健康检查任务异常：{}", error))
 }
 
 #[tauri::command]
@@ -846,31 +859,46 @@ fn set_api_key_binding(
 }
 
 #[tauri::command]
-fn add_api_key(key: String, state: State<'_, DesktopState>) -> Result<AppState, String> {
+async fn add_api_key(key: String, state: State<'_, DesktopState>) -> Result<AppState, String> {
     quotio_core::add_api_key(key)?;
-    let mut core = lock_core(&state.core);
-    core.rewrite_proxy_config();
-    Ok(core.app_state())
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut core = lock_core(&core);
+        core.rewrite_proxy_config();
+        core.app_state()
+    })
+    .await
+    .map_err(|error| format!("新增密钥任务异常：{}", error))
 }
 
 #[tauri::command]
-fn remove_api_key(key: String, state: State<'_, DesktopState>) -> Result<AppState, String> {
+async fn remove_api_key(key: String, state: State<'_, DesktopState>) -> Result<AppState, String> {
     quotio_core::remove_api_key(&key)?;
-    let mut core = lock_core(&state.core);
-    core.rewrite_proxy_config();
-    Ok(core.app_state())
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut core = lock_core(&core);
+        core.rewrite_proxy_config();
+        core.app_state()
+    })
+    .await
+    .map_err(|error| format!("删除密钥任务异常：{}", error))
 }
 
 #[tauri::command]
-fn update_api_key(
+async fn update_api_key(
     key: String,
     replacement: String,
     state: State<'_, DesktopState>,
 ) -> Result<AppState, String> {
     quotio_core::update_api_key(&key, replacement)?;
-    let mut core = lock_core(&state.core);
-    core.rewrite_proxy_config();
-    Ok(core.app_state())
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut core = lock_core(&core);
+        core.rewrite_proxy_config();
+        core.app_state()
+    })
+    .await
+    .map_err(|error| format!("替换密钥任务异常：{}", error))
 }
 
 #[tauri::command]
