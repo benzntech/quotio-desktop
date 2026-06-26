@@ -2997,6 +2997,8 @@ h3 {
   align-items: center;
   gap: 10px;
   padding: 14px 22px;
+  /* 给确定性进度条一个稳定的宽度,不随账号名长短抖动 */
+  min-width: 240px;
   border-radius: 12px;
   background: var(--quotio-card-solid);
   border: 1px solid var(--quotio-border);

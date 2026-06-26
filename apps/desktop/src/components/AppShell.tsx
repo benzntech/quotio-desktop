@@ -35,7 +35,7 @@ type AppShellProps = {
   isProxyBusy: boolean;
   isManagementBusy: boolean;
   isQuotaBusy: boolean;
-  quotaToast: { loaded: number; current?: string } | null;
+  quotaToast: { loaded: number; total: number; current?: string } | null;
   isRefreshing: boolean;
   proxyAction: string | null;
   managementAction: string | null;
@@ -407,10 +407,24 @@ export function AppShell(props: AppShellProps) {
 
       {props.quotaToast ? (
         <div className="quota-toast">
-          <div className="boot-bar" aria-hidden="true">
-            <span />
-          </div>
-          <p>正在加载额度… {props.quotaToast.loaded}{props.quotaToast.current ? ` — ${props.quotaToast.current}` : ""}</p>
+          {props.quotaToast.total > 0 ? (
+            <div className="update-progress" aria-hidden="true">
+              <span
+                style={{
+                  width: `${Math.min(100, Math.round((props.quotaToast.loaded / props.quotaToast.total) * 100))}%`,
+                }}
+              />
+            </div>
+          ) : (
+            <div className="boot-bar" aria-hidden="true">
+              <span />
+            </div>
+          )}
+          <p>
+            正在加载额度… {Math.min(props.quotaToast.loaded, props.quotaToast.total || props.quotaToast.loaded)}
+            {props.quotaToast.total > 0 ? ` / ${props.quotaToast.total}` : ""}
+            {props.quotaToast.current ? ` — ${props.quotaToast.current}` : ""}
+          </p>
         </div>
       ) : null}
     </main>
