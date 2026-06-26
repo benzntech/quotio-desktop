@@ -74,13 +74,13 @@ English · 简体中文
 
 ### Option A: Download Installer (Recommended)
 
-Click the links below to download **v0.5.0**, or head to [**Releases**](https://github.com/xiaocoss/quotio-desktop/releases/latest) for the latest version:
+Click the links below to download **v0.6.0**, or head to [**Releases**](https://github.com/xiaocoss/quotio-desktop/releases/latest) for the latest version:
 
 | Platform | Download |
 |---|---|
-| **Windows** | [`.msi` (Recommended)](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.5.0/Quotio_0.5.0_x64_en-US.msi) · [`-setup.exe`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.5.0/Quotio_0.5.0_x64-setup.exe) |
-| **macOS** (Apple Silicon & Intel Universal) | [`.dmg`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.5.0/Quotio_0.5.0_universal.dmg) |
-| **Linux** | [`.deb`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.5.0/Quotio_0.5.0_amd64.deb) · [`.rpm`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.5.0/Quotio-0.5.0-1.x86_64.rpm) · [`.AppImage`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.5.0/Quotio_0.5.0_amd64.AppImage) |
+| **Windows** | [`.msi` (Recommended)](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64_en-US.msi) · [`-setup.exe`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64-setup.exe) |
+| **macOS** (Apple Silicon & Intel Universal) | [`.dmg`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_universal.dmg) |
+| **Linux** | [`.deb`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.deb) · [`.rpm`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio-0.6.0-1.x86_64.rpm) · [`.AppImage`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.AppImage) |
 
 > Note: macOS packages are currently unsigned. If you see "App is damaged / cannot be opened", go to "System Settings → Privacy & Security" and click "Open Anyway".
 

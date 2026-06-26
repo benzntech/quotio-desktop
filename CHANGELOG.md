@@ -7,6 +7,19 @@
      从本文件抽取对应段作为 Release 正文 + 应用内更新弹窗内容；标题对不上就抽不到，
      这些改动不会出现在更新提示里。 -->
 
+## v0.6.0 - 2026-06-26
+
+This is the first major English-localized release of Quotio Desktop!
+
+### Added
+- **Full English Localization**: The entire UI (including Settings, Providers, Quota, Logs, and Menus) has been translated to English.
+- **Auto-Start Proxy**: Added a new setting to automatically boot the `CLIProxyAPI` process when Quotio starts up.
+- **Request Log Toggle Fix**: Fixed a bug where toggling request logs or file logging would silently fail to persist.
+
+### Changed
+- Complete `README.md` rewrite into English, with proper credit to the original project.
+- Merged upstream `v0.5.0` features (Quota loading progress bar, new Menu Bar styles, improved OAuth resiliency).
+
 ## v0.5.0 - 2026-06-27
 
 这一版是**稳定性 / 安全性集中大修 + 体验打磨**,含一次对整个代码库的系统排查与逐项修复。
