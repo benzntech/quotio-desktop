@@ -1,10 +1,10 @@
 # Quotio
 
-[![release](https://img.shields.io/github/v/release/xiaocoss/quotio-desktop?color=orange&label=release)](https://github.com/xiaocoss/quotio-desktop/releases/latest)
+[![release](https://img.shields.io/github/v/release/benzntech/quotio-desktop?color=orange&label=release)](https://github.com/benzntech/quotio-desktop/releases/latest)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)
-[![downloads](https://img.shields.io/github/downloads/xiaocoss/quotio-desktop/total?color=success)](https://github.com/xiaocoss/quotio-desktop/releases)
-[![stars](https://img.shields.io/github/stars/xiaocoss/quotio-desktop)](https://github.com/xiaocoss/quotio-desktop/stargazers)
-[![license](https://img.shields.io/github/license/xiaocoss/quotio-desktop)](LICENSE)
+[![downloads](https://img.shields.io/github/downloads/benzntech/quotio-desktop/total?color=success)](https://github.com/benzntech/quotio-desktop/releases)
+[![stars](https://img.shields.io/github/stars/benzntech/quotio-desktop)](https://github.com/benzntech/quotio-desktop/stargazers)
+[![license](https://img.shields.io/github/license/benzntech/quotio-desktop)](LICENSE)
 
 **一款跨平台的 AI 账号额度管理工具** —— 通过本地 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 代理，统一管理多个 AI 账号的额度与调用，支持多账号轮询、额度监控、智能调度，以及 Codex 多开实例。
 
@@ -12,7 +12,7 @@
 
 > 本项目是 [quotio](https://github.com/nguyenphutrong/quotio)（原 macOS / SwiftUI 版）的跨平台移植，基于 Tauri 重写，一套代码覆盖 macOS / Windows / Linux。
 
-📥 **[下载最新版](https://github.com/xiaocoss/quotio-desktop/releases/latest)** —— macOS / Windows / Linux（或见下方[安装指南](#-安装)）
+📥 **[下载最新版](https://github.com/benzntech/quotio-desktop/releases/latest)** —— macOS / Windows / Linux（或见下方[安装指南](#-安装)）
 
 ---
 
@@ -72,15 +72,15 @@
 
 ### 选项 A：下载安装包（推荐）
 
-点下表直达下载 **v0.6.0**，或前往 [**Releases**](https://github.com/xiaocoss/quotio-desktop/releases/latest) 取最新版：
+点下表直达下载 **v0.6.0**，或前往 [**Releases**](https://github.com/benzntech/quotio-desktop/releases/latest) 取最新版：
 
 | 平台 | 下载 |
 |---|---|
-| **Windows** | [`.msi`（推荐）](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64_en-US.msi) · [`-setup.exe`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64-setup.exe) |
-| **macOS**（Apple Silicon & Intel 通用） | [`.dmg`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_universal.dmg) |
-| **Linux** | [`.deb`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.deb) · [`.rpm`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio-0.6.0-1.x86_64.rpm) · [`.AppImage`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.AppImage) |
+| **Windows** | [`.msi`（推荐）](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64_en-US.msi) · [`-setup.exe`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64-setup.exe) |
+| **macOS**（Apple Silicon & Intel 通用） | [`.dmg`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_universal.dmg) |
+| **Linux** | [`.deb`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.deb) · [`.rpm`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio-0.6.0-1.x86_64.rpm) · [`.AppImage`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.AppImage) |
 
-> 上表为 v0.6.0 直链；后续新版请走 [Releases](https://github.com/xiaocoss/quotio-desktop/releases/latest) 页。
+> 上表为 v0.6.0 直链；后续新版请走 [Releases](https://github.com/benzntech/quotio-desktop/releases/latest) 页。
 > macOS 安装包未签名，若提示「已损坏 / 无法打开」，到「系统设置 → 隐私与安全性」点「仍要打开」即可。
 
 ### 选项 B：从源码构建
@@ -88,7 +88,7 @@
 需先安装 [Node.js](https://nodejs.org)（18+）与 [Rust](https://rustup.rs)。
 
 ```bash
-git clone https://github.com/xiaocoss/quotio-desktop.git
+git clone https://github.com/benzntech/quotio-desktop.git
 cd quotio-desktop
 npm run desktop:install
 npm run desktop:build      # 产物：target/release/ 与 target/release/bundle/

@@ -1,12 +1,12 @@
 # Quotio
 
-[![release](https://img.shields.io/github/v/release/xiaocoss/quotio-desktop?color=orange&label=release)](https://github.com/xiaocoss/quotio-desktop/releases/latest)
+[![release](https://img.shields.io/github/v/release/benzntech/quotio-desktop?color=orange&label=release)](https://github.com/benzntech/quotio-desktop/releases/latest)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)
-[![downloads](https://img.shields.io/github/downloads/xiaocoss/quotio-desktop/total?color=success)](https://github.com/xiaocoss/quotio-desktop/releases)
-[![stars](https://img.shields.io/github/stars/xiaocoss/quotio-desktop)](https://github.com/xiaocoss/quotio-desktop/stargazers)
-[![license](https://img.shields.io/github/license/xiaocoss/quotio-desktop)](LICENSE)
+[![downloads](https://img.shields.io/github/downloads/benzntech/quotio-desktop/total?color=success)](https://github.com/benzntech/quotio-desktop/releases)
+[![stars](https://img.shields.io/github/stars/benzntech/quotio-desktop)](https://github.com/benzntech/quotio-desktop/stargazers)
+[![license](https://img.shields.io/github/license/benzntech/quotio-desktop)](LICENSE)
 
-> **Note**: This is the English version of Quotio Desktop. Full credit for the original Chinese version goes to [xiaocoss/quotio-desktop](https://github.com/xiaocoss/quotio-desktop).
+> **Note**: This is the English version of Quotio Desktop. Full credit for the original Chinese version goes to [benzntech/quotio-desktop](https://github.com/benzntech/quotio-desktop).
 
 **A cross-platform AI account quota management tool** —— Uses a local [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) proxy to unify and manage the quotas and invocations of multiple AI accounts. It supports multi-account rotation, quota monitoring, smart scheduling, and multiple Codex instances.
 
@@ -14,7 +14,7 @@ Currently supports providers such as **Codex (OpenAI)**, **Claude Code**, **GitH
 
 > This project is a cross-platform port of [quotio](https://github.com/nguyenphutrong/quotio) (originally macOS / SwiftUI), rewritten in Tauri, using one codebase for macOS / Windows / Linux.
 
-📥 **[Download the latest version](https://github.com/xiaocoss/quotio-desktop/releases/latest)** —— macOS / Windows / Linux (or see [Installation Guide](#-installation) below)
+📥 **[Download the latest version](https://github.com/benzntech/quotio-desktop/releases/latest)** —— macOS / Windows / Linux (or see [Installation Guide](#-installation) below)
 
 ---
 
@@ -74,13 +74,13 @@ Currently supports providers such as **Codex (OpenAI)**, **Claude Code**, **GitH
 
 ### Option A: Download Installer (Recommended)
 
-Click the links below to download **v0.6.0**, or head to [**Releases**](https://github.com/xiaocoss/quotio-desktop/releases/latest) for the latest version:
+Click the links below to download **v0.6.0**, or head to [**Releases**](https://github.com/benzntech/quotio-desktop/releases/latest) for the latest version:
 
 | Platform | Download |
 |---|---|
-| **Windows** | [`.msi` (Recommended)](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64_en-US.msi) · [`-setup.exe`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64-setup.exe) |
-| **macOS** (Apple Silicon & Intel Universal) | [`.dmg`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_universal.dmg) |
-| **Linux** | [`.deb`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.deb) · [`.rpm`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio-0.6.0-1.x86_64.rpm) · [`.AppImage`](https://github.com/xiaocoss/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.AppImage) |
+| **Windows** | [`.msi` (Recommended)](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64_en-US.msi) · [`-setup.exe`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_x64-setup.exe) |
+| **macOS** (Apple Silicon & Intel Universal) | [`.dmg`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_universal.dmg) |
+| **Linux** | [`.deb`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.deb) · [`.rpm`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio-0.6.0-1.x86_64.rpm) · [`.AppImage`](https://github.com/benzntech/quotio-desktop/releases/download/v0.6.0/Quotio_0.6.0_amd64.AppImage) |
 
 > Note: macOS packages are currently unsigned. If you see "App is damaged / cannot be opened", go to "System Settings → Privacy & Security" and click "Open Anyway".
 
@@ -89,7 +89,7 @@ Click the links below to download **v0.6.0**, or head to [**Releases**](https://
 Ensure you have [Node.js](https://nodejs.org) (18+) and [Rust](https://rustup.rs) installed.
 
 ```bash
-git clone https://github.com/xiaocoss/quotio-desktop.git
+git clone https://github.com/benzntech/quotio-desktop.git
 cd quotio-desktop
 npm run desktop:install
 npm run desktop:build      # Output: target/release/ and target/release/bundle/
@@ -116,7 +116,7 @@ npm run release                # Compile + assemble portable builds (dist-portab
 
 ## 🙏 Acknowledgements
 
-- **[xiaocoss/quotio-desktop](https://github.com/xiaocoss/quotio-desktop)** —— The original Chinese project this English version is based on.
+- **[benzntech/quotio-desktop](https://github.com/benzntech/quotio-desktop)** —— The original Chinese project this English version is based on.
 - **[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** —— The core local proxy service that this project relies on.
 - **[kiro.rs](https://github.com/hank9999/kiro.rs)** —— Kiro (AWS CodeWhisperer) → Anthropic compatible proxy, built-in as a sidecar for the Kiro proxy pool.
 - **[cockpit-tools](https://github.com/jlcodes99/cockpit-tools)** —— Similar project, used as a reference for product and documentation.
