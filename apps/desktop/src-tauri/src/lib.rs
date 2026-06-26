@@ -1142,6 +1142,19 @@ async fn clear_request_logs(app: AppHandle, state: State<'_, DesktopState>) -> R
     Ok(result)
 }
 
+/// 请求日志总条数。日志页删除按钮在弹二次确认前调用,告知用户实际会删多少条
+/// (列表只显示最近 500,实际存储远多于此,必须如实告知以免误删全部历史)。
+#[tauri::command]
+async fn count_request_logs(state: State<'_, DesktopState>) -> Result<usize, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let core = lock_core(&core);
+        core.count_request_logs()
+    })
+    .await
+    .map_err(|error| format!("统计请求日志任务异常：{}", error))
+}
+
 #[tauri::command]
 async fn add_management_api_key(
     key: String,
@@ -1796,6 +1809,7 @@ pub fn run() {
             set_management_request_retry,
             clear_management_logs,
             clear_request_logs,
+            count_request_logs,
             add_management_api_key,
             update_management_api_key,
             delete_management_api_key,

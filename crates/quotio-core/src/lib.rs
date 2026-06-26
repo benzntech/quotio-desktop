@@ -318,6 +318,11 @@ impl AppCore {
         self.app_state()
     }
 
+    /// 请求记录总数。日志页删除前的二次确认用它告知用户实际会删多少条。
+    pub fn count_request_logs(&self) -> usize {
+        self.usage_store.count()
+    }
+
     pub fn management_client(&mut self) -> Result<ManagementApiClient, ManagementCoreError> {
         self.proxy.refresh(&self.settings);
 
