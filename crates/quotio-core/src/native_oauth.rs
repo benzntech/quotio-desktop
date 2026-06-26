@@ -1048,6 +1048,8 @@ fn write_auth_file(
     let content = serde_json::to_string_pretty(&output)
         .map_err(|e| format!("序列化 token 失败: {}", e))?;
     std::fs::write(&path, &content).map_err(|e| format!("写入 auth 文件失败: {}", e))?;
+    // 含 access/refresh/id_token 的长期凭据:Unix 上收紧到 0600(Windows no-op)。
+    let _ = quotio_platform::set_sensitive_permissions(&path);
     log_oauth_event(
         provider_id,
         None,
