@@ -161,6 +161,9 @@ struct PendingOAuth {
     user_code: Option<String>,
     verification_uri: Option<String>,
     interval_seconds: u64,
+    /// 设备码流:下次允许真正轮询服务器的最早 unix 秒(节流 + slow_down 退避用)。
+    /// 0 = 立即可轮询。前端固定 ~2s 调一次,这里据此跳过过早的轮询。
+    next_poll_at: i64,
     // Shared
     expires_at: i64,
     error: Option<String>,
@@ -737,7 +740,14 @@ fn request_device_code(config: &DeviceCodeConfig) -> Result<DeviceCodeResponse, 
     serde_json::from_str(&text).map_err(|e| format!("解析 device code 响应失败: {}", e))
 }
 
-fn poll_device_token(pending: &PendingOAuth) -> Result<Option<serde_json::Value>, String> {
+/// 设备码轮询结果:拿到 token / 仍在等待授权 / 服务器要求放慢(slow_down)。
+enum DevicePoll {
+    Token(serde_json::Value),
+    Pending,
+    SlowDown,
+}
+
+fn poll_device_token(pending: &PendingOAuth) -> Result<DevicePoll, String> {
     let device_code = pending
         .device_code
         .as_deref()
@@ -771,7 +781,8 @@ fn poll_device_token(pending: &PendingOAuth) -> Result<Option<serde_json::Value>
 
     if let Some(error) = &parsed.error {
         match error.as_str() {
-            "authorization_pending" | "slow_down" => return Ok(None),
+            "authorization_pending" => return Ok(DevicePoll::Pending),
+            "slow_down" => return Ok(DevicePoll::SlowDown),
             "expired_token" | "access_denied" => {
                 let desc = parsed.error_description.as_deref().unwrap_or(error);
                 return Err(format!("授权失败: {}", desc));
@@ -801,7 +812,7 @@ fn poll_device_token(pending: &PendingOAuth) -> Result<Option<serde_json::Value>
         }
     }
 
-    Ok(Some(value))
+    Ok(DevicePoll::Token(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,6 +1207,7 @@ fn start_auth_code_flow(
         user_code: None,
         verification_uri: None,
         interval_seconds: 1,
+        next_poll_at: 0,
         expires_at: now_ts() + OAUTH_TIMEOUT_SECONDS,
         error: None,
         completed: false,
@@ -1259,6 +1271,7 @@ fn start_device_code_flow(
         user_code: Some(user_code.clone()),
         verification_uri: Some(verification_uri.clone()),
         interval_seconds: dc.interval.unwrap_or(5).max(1) as u64,
+        next_poll_at: 0,
         expires_at: now_ts() + dc.expires_in() as i64,
         error: None,
         completed: false,
@@ -1402,8 +1415,26 @@ fn complete_auth_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse, 
 }
 
 fn complete_device_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse, String> {
-    let polled_token = match poll_device_token(snapshot) {
-        Ok(result) => result,
+    let pending_response = || OAuthCompleteResponse {
+        status: "pending".to_string(),
+        error: None,
+        provider_id: snapshot.provider_id.clone(),
+        account_email: None,
+    };
+
+    // 节流:遵守服务器要求的轮询间隔(及 slow_down 退避)。前端固定 ~2s 调一次,
+    // 未到 next_poll_at 就直接返回 pending、不打服务器,避免被判 slow_down/拒绝。
+    let now = now_ts();
+    if let Ok(guard) = get_state().lock() {
+        if let Some(live) = guard.as_ref() {
+            if live.login_id == snapshot.login_id && now < live.next_poll_at {
+                return Ok(pending_response());
+            }
+        }
+    }
+
+    let outcome = match poll_device_token(snapshot) {
+        Ok(outcome) => outcome,
         Err(error) => {
             return Ok(complete_error_response(
                 &snapshot.login_id,
@@ -1414,48 +1445,56 @@ fn complete_device_code(snapshot: &PendingOAuth) -> Result<OAuthCompleteResponse
         }
     };
 
-    match polled_token {
-        None => Ok(OAuthCompleteResponse {
-            status: "pending".to_string(),
-            error: None,
-            provider_id: snapshot.provider_id.clone(),
-            account_email: None,
-        }),
-        Some(token) => {
-            let (_path, email) = match write_auth_file(&snapshot.provider_id, &token) {
-                Ok(result) => result,
-                Err(error) => {
-                    return Ok(complete_error_response(
-                        &snapshot.login_id,
-                        &snapshot.provider_id,
-                        "auth_file_write_failed",
-                        error,
-                    ));
-                }
-            };
-
+    let token = match outcome {
+        DevicePoll::Token(token) => token,
+        other => {
+            // 仍在等待授权:更新下次可轮询时间;slow_down 时按 RFC 8628 把间隔 +5s。
             if let Ok(mut guard) = get_state().lock() {
-                if let Some(s) = guard.as_mut() {
-                    if s.login_id == snapshot.login_id {
-                        s.completed = true;
+                if let Some(live) = guard.as_mut() {
+                    if live.login_id == snapshot.login_id {
+                        if matches!(other, DevicePoll::SlowDown) {
+                            live.interval_seconds = live.interval_seconds.saturating_add(5);
+                        }
+                        live.next_poll_at = now + live.interval_seconds as i64;
                     }
                 }
             }
-            log_oauth_event(
-                &snapshot.provider_id,
-                Some(&snapshot.login_id),
-                "complete_success",
-                &format!("account_email={}", email.as_deref().unwrap_or("unknown")),
-            );
+            return Ok(pending_response());
+        }
+    };
 
-            Ok(OAuthCompleteResponse {
-                status: "success".to_string(),
-                error: None,
-                provider_id: snapshot.provider_id.clone(),
-                account_email: email,
-            })
+    let (_path, email) = match write_auth_file(&snapshot.provider_id, &token) {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(complete_error_response(
+                &snapshot.login_id,
+                &snapshot.provider_id,
+                "auth_file_write_failed",
+                error,
+            ));
+        }
+    };
+
+    if let Ok(mut guard) = get_state().lock() {
+        if let Some(s) = guard.as_mut() {
+            if s.login_id == snapshot.login_id {
+                s.completed = true;
+            }
         }
     }
+    log_oauth_event(
+        &snapshot.provider_id,
+        Some(&snapshot.login_id),
+        "complete_success",
+        &format!("account_email={}", email.as_deref().unwrap_or("unknown")),
+    );
+
+    Ok(OAuthCompleteResponse {
+        status: "success".to_string(),
+        error: None,
+        provider_id: snapshot.provider_id.clone(),
+        account_email: email,
+    })
 }
 
 pub fn cancel_oauth(login_id: Option<&str>) -> Result<(), String> {
@@ -1550,6 +1589,7 @@ mod tests {
             user_code: None,
             verification_uri: None,
             interval_seconds: 2,
+            next_poll_at: 0,
             expires_at: now_ts() + 60,
             error: None,
             completed: false,

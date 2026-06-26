@@ -320,6 +320,7 @@ export function AppShell(props: AppShellProps) {
         percent={updater.percent}
         error={updater.error}
         onInstall={updater.install}
+        onRetry={updater.retry}
         onDismiss={updater.dismiss}
       />
 
