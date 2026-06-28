@@ -188,6 +188,7 @@ export type AuthFile = {
   quotio_bound_login_only?: boolean | null;
   quotio_scheduler_standby?: boolean | null;
   quotio_health_isolated?: boolean | null;
+  quotio_health_isolated_reason?: string | null;
   active_in_ide?: boolean | null;
   success?: number | null;
   failed?: number | null;

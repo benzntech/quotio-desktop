@@ -2134,6 +2134,11 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
             .as_ref()
             .and_then(|value| value.get("quotio_health_isolated"))
             .and_then(|value| value.as_bool());
+        let quotio_health_isolated_reason = parsed
+            .as_ref()
+            .and_then(|value| value.get("quotio_health_isolated_reason"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
         files.push(AuthFile {
             id: name.to_string(),
             name: name.to_string(),
@@ -2156,6 +2161,7 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
             quotio_bound_login_only,
             quotio_scheduler_standby,
             quotio_health_isolated,
+            quotio_health_isolated_reason,
             success: None,
             failed: None,
             recent_requests: None,
@@ -2241,6 +2247,9 @@ fn enrich_auth_files_with_local_markers(files: &mut [AuthFile], local_accounts: 
         }
         if file.quotio_health_isolated.is_none() {
             file.quotio_health_isolated = local.quotio_health_isolated;
+        }
+        if file.quotio_health_isolated_reason.is_none() {
+            file.quotio_health_isolated_reason = local.quotio_health_isolated_reason.clone();
         }
         if local.quotio_bound_login_only == Some(true) {
             file.disabled = true;

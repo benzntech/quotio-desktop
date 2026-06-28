@@ -26,6 +26,8 @@ use crate::codex_launch;
 pub(crate) const STANDBY_FIELD: &str = "quotio_scheduler_standby";
 /// 账号健康隔离标记：401/403/auth_failed 时即使未启用智能调度也临时禁用。
 pub(crate) const HEALTH_ISOLATED_FIELD: &str = "quotio_health_isolated";
+/// 健康隔离原因标记："auth"(需重新授权)/"quota"(额度耗尽,等刷新)——供 UI 区分提示。
+const HEALTH_ISOLATED_REASON_FIELD: &str = "quotio_health_isolated_reason";
 /// Codex 一键启动绑定标记（codex_launch 写入），带它的账号调度器不碰。
 const BOUND_FIELD: &str = "quotio_bound_login_only";
 
@@ -41,6 +43,8 @@ pub struct PoolFile {
     pub standby: bool,
     /// 是否因账号健康失败被临时隔离。
     pub health_isolated: bool,
+    /// 健康隔离原因："auth" / "quota" / None(未隔离或升级前的旧文件)。
+    pub health_isolated_reason: Option<String>,
     /// 是否被 Codex 一键启动绑定占用。
     pub bound: bool,
 }
@@ -112,6 +116,10 @@ pub fn read_pool_for_provider(dir: &Path, provider_id: &str) -> Vec<PoolFile> {
             disabled: flag("disabled"),
             standby: flag(STANDBY_FIELD),
             health_isolated: flag(HEALTH_ISOLATED_FIELD),
+            health_isolated_reason: value
+                .get(HEALTH_ISOLATED_REASON_FIELD)
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             bound: flag(BOUND_FIELD),
         });
     }
@@ -382,17 +390,24 @@ pub fn reconcile_health_isolation_in(dir: &Path, quotas: &[AccountQuota]) -> boo
             else {
                 continue;
             };
-            let should_isolate = quota.is_forbidden
-                || quota.status_message.as_deref() == Some("auth_failed");
+            let should_isolate = quota.is_forbidden || quota.is_auth_failure();
             let health_known = should_isolate || !quota.models.is_empty();
             if !health_known {
                 continue;
             }
             let path = dir.join(&file.file_name);
-            if should_isolate && (!file.health_isolated || !file.disabled) {
-                changed |= set_health_isolated(&path, true).is_ok();
-            } else if !should_isolate && file.health_isolated {
-                changed |= set_health_isolated(&path, false).is_ok();
+            if should_isolate {
+                // 区分隔离原因:鉴权失效要提示用户重新登录;额度耗尽只需等窗口刷新自动恢复。
+                // 对已隔离的旧文件(reason 缺失)或原因变化也补写,保证 UI 标签始终正确。
+                let reason = if quota.is_auth_failure() { "auth" } else { "quota" };
+                let needs_write = !file.health_isolated
+                    || !file.disabled
+                    || file.health_isolated_reason.as_deref() != Some(reason);
+                if needs_write {
+                    changed |= set_health_isolated(&path, true, Some(reason)).is_ok();
+                }
+            } else if file.health_isolated {
+                changed |= set_health_isolated(&path, false, None).is_ok();
             }
         }
     }
@@ -426,6 +441,7 @@ fn clear_temp_disable_markers(path: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("账号文件不是 JSON 对象: {}", path.display()))?;
     object.remove(STANDBY_FIELD);
     object.remove(HEALTH_ISOLATED_FIELD);
+    object.remove(HEALTH_ISOLATED_REASON_FIELD);
     // 绑定账号必须保持禁用;其余放回池子。
     let bound = object.get(BOUND_FIELD).and_then(|v| v.as_bool()).unwrap_or(false);
     object.insert("disabled".to_string(), Value::Bool(bound));
@@ -453,8 +469,8 @@ fn set_standby(path: &Path, standby: bool) -> Result<(), String> {
     codex_launch::write_proxy_account_to(path, &value)
 }
 
-/// 写账号健康隔离状态：true → `disabled=true` + 标记；false → 去标记并按 standby 保持禁用。
-fn set_health_isolated(path: &Path, isolated: bool) -> Result<(), String> {
+/// 写账号健康隔离状态：true → `disabled=true` + 标记 + 原因；false → 去标记/原因并按 standby 保持禁用。
+fn set_health_isolated(path: &Path, isolated: bool, reason: Option<&str>) -> Result<(), String> {
     let mut value = codex_launch::read_proxy_account_from(path)?;
     let object = value
         .as_object_mut()
@@ -462,6 +478,17 @@ fn set_health_isolated(path: &Path, isolated: bool) -> Result<(), String> {
     if isolated {
         object.insert("disabled".to_string(), Value::Bool(true));
         object.insert(HEALTH_ISOLATED_FIELD.to_string(), Value::Bool(true));
+        match reason {
+            Some(reason) => {
+                object.insert(
+                    HEALTH_ISOLATED_REASON_FIELD.to_string(),
+                    Value::String(reason.to_string()),
+                );
+            }
+            None => {
+                object.remove(HEALTH_ISOLATED_REASON_FIELD);
+            }
+        }
     } else {
         let standby = object
             .get(STANDBY_FIELD)
@@ -469,6 +496,7 @@ fn set_health_isolated(path: &Path, isolated: bool) -> Result<(), String> {
             .unwrap_or(false);
         object.insert("disabled".to_string(), Value::Bool(standby));
         object.remove(HEALTH_ISOLATED_FIELD);
+        object.remove(HEALTH_ISOLATED_REASON_FIELD);
     }
     codex_launch::write_proxy_account_to(path, &value)
 }
@@ -647,6 +675,7 @@ mod tests {
                 disabled: false,
                 standby: false,
                 health_isolated: false,
+                health_isolated_reason: None,
                 bound: false,
             },
             PoolFile {
@@ -655,6 +684,7 @@ mod tests {
                 disabled: true, // 用户手动禁用
                 standby: false,
                 health_isolated: false,
+                health_isolated_reason: None,
                 bound: false,
             },
         ];
@@ -939,5 +969,112 @@ mod tests {
         assert!(bad.health_isolated);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_isolation_records_auth_vs_quota_reason() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_reason_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        std::fs::write(dir.join("codex-authbad.json"), format!("{{{base}}}")).unwrap();
+        std::fs::write(dir.join("codex-quotabad.json"), format!("{{{base}}}")).unwrap();
+
+        let q = |key: &str, forbidden: bool, msg: Option<&str>, models: Vec<QuotaModelUsage>| {
+            AccountQuota {
+                provider_id: "codex".into(),
+                account_label: format!("{key}@x.com"),
+                account_key: key.into(),
+                is_forbidden: forbidden,
+                status_message: msg.map(str::to_string),
+                models,
+            }
+        };
+        let model = || {
+            vec![QuotaModelUsage {
+                model: "Session".into(),
+                used_percent: 100.0,
+                remaining_percent: 0.0,
+                reset_at: None,
+                reset_at_unix: Some(9_000),
+            }]
+        };
+
+        // authbad: codex 401 不可恢复 → is_forbidden=false + "auth_failed" + 空 models。
+        // quotabad: 额度打满 → is_forbidden=true,无鉴权哨兵。
+        assert!(reconcile_health_isolation_in(
+            &dir,
+            &[
+                q("authbad", false, Some("auth_failed"), Vec::new()),
+                q("quotabad", true, None, model()),
+            ],
+        ));
+        let pool = read_pool(&dir);
+        let by = |name: &str| pool.iter().find(|f| f.file_name == name).unwrap().clone();
+        assert!(by("codex-authbad.json").health_isolated);
+        assert_eq!(
+            by("codex-authbad.json").health_isolated_reason.as_deref(),
+            Some("auth"),
+            "鉴权失效隔离原因应为 auth"
+        );
+        assert!(by("codex-quotabad.json").health_isolated);
+        assert_eq!(
+            by("codex-quotabad.json").health_isolated_reason.as_deref(),
+            Some("quota"),
+            "额度耗尽隔离原因应为 quota"
+        );
+
+        // 原因变化:quotabad 之后令牌也失效 → reason 应被改写为 auth。
+        assert!(reconcile_health_isolation_in(
+            &dir,
+            &[q("quotabad", false, Some("auth_failed"), Vec::new())],
+        ));
+        let pool = read_pool(&dir);
+        let quotabad = pool
+            .iter()
+            .find(|f| f.file_name == "codex-quotabad.json")
+            .unwrap();
+        assert_eq!(quotabad.health_isolated_reason.as_deref(), Some("auth"));
+
+        // 恢复:authbad 健康了 → 隔离标记与原因一并清掉。
+        assert!(reconcile_health_isolation_in(
+            &dir,
+            &[q("authbad", false, None, model())],
+        ));
+        let pool = read_pool(&dir);
+        let authbad = pool
+            .iter()
+            .find(|f| f.file_name == "codex-authbad.json")
+            .unwrap();
+        assert!(!authbad.health_isolated);
+        assert!(authbad.health_isolated_reason.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_auth_failure_matches_provider_sentinels() {
+        let q = |msg: Option<&str>, forbidden: bool| AccountQuota {
+            provider_id: "x".into(),
+            account_label: "x".into(),
+            account_key: "x".into(),
+            is_forbidden: forbidden,
+            status_message: msg.map(str::to_string),
+            models: Vec::new(),
+        };
+        assert!(q(Some("auth_failed"), false).is_auth_failure());
+        assert!(q(Some("需要重新授权"), true).is_auth_failure());
+        assert!(q(Some("需要重新登录"), true).is_auth_failure());
+        assert!(q(Some("密钥无效"), true).is_auth_failure());
+        // 额度耗尽 / 健康 / plan 串都不是鉴权失败。
+        assert!(!q(None, true).is_auth_failure());
+        assert!(!q(Some("plan: pro | resets: 3"), true).is_auth_failure());
+        assert!(!q(None, false).is_auth_failure());
     }
 }

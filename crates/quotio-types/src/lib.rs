@@ -410,6 +410,10 @@ pub struct AuthFile {
     /// 健康隔离临时禁用标记——403/auth_failed 时由 Quotio 自动写入本地文件。
     #[serde(default)]
     pub quotio_health_isolated: Option<bool>,
+    /// 健康隔离原因："auth"=鉴权失效需重新登录;"quota"=额度耗尽,等窗口刷新自动恢复。
+    /// 由 Quotio 隔离时写入本地文件,管理 API 不返回。缺省/未知按 auth 处理(宁可多提示)。
+    #[serde(default)]
+    pub quotio_health_isolated_reason: Option<String>,
     #[serde(default)]
     pub success: Option<u64>,
     #[serde(default)]
@@ -455,6 +459,20 @@ pub struct AccountQuota {
     pub is_forbidden: bool,
     pub status_message: Option<String>,
     pub models: Vec<QuotaModelUsage>,
+}
+
+impl AccountQuota {
+    /// 该账号「被禁」是否源于鉴权失效(需用户重新登录),而非额度耗尽 / 限流。
+    ///
+    /// 各 provider 鉴权失败时会把固定哨兵串写进 `status_message`(见 quota.rs);
+    /// 额度耗尽没有专属 status_message(仅 `is_forbidden=true` + None/"plan:…"),
+    /// 所以匹配这个闭集即可可靠区分 auth 与 quota。新增 provider 的鉴权哨兵要同步这里。
+    pub fn is_auth_failure(&self) -> bool {
+        matches!(
+            self.status_message.as_deref(),
+            Some("auth_failed") | Some("需要重新授权") | Some("需要重新登录") | Some("密钥无效")
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1945,6 +1963,8 @@ mod tests {
                 last_refresh: None,
                 quotio_bound_login_only: None,
                 quotio_scheduler_standby: None,
+                quotio_health_isolated: None,
+                quotio_health_isolated_reason: None,
                 success: None,
                 failed: None,
                 recent_requests: None,

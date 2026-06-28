@@ -244,13 +244,14 @@ export function ProvidersScreen({
     return extra.length > 0 ? [...proxyAuthFiles, ...extra] : proxyAuthFiles;
   }, [proxyAuthFiles, localAccounts]);
   const groups = useMemo(() => groupAccounts(authFiles, appState.providers), [authFiles, appState.providers]);
-  // Accounts whose quota fetch hit an unrecoverable 401 are flagged "auth_failed"
-  // by the backend. Unlike the proxy's recent-request health (which resets on
+  // Accounts whose quota fetch hit a genuine auth failure (unrecoverable 401/403,
+  // refresh failed, invalid key) — flagged by the backend with a fixed sentinel in
+  // status_message. Unlike the proxy's recent-request health (which resets on
   // restart), this re-detects every refresh, so it's a durable "re-auth" signal.
   const authFailedNames = useMemo(() => {
     const names = new Set<string>();
     for (const quota of appState.quotas) {
-      if (quota.status_message === "auth_failed") {
+      if (isAuthFailureMessage(quota.status_message)) {
         const file = matchAuthFile(quota, authFiles);
         if (file) names.add(file.name);
       }
@@ -674,6 +675,15 @@ function healthFor(
   return undefined;
 }
 
+// Fixed sentinels each provider writes into quota.status_message on a genuine auth
+// failure (keep in sync with the backend `AccountQuota::is_auth_failure`). Quota
+// exhaustion has NO sentinel (just is_forbidden + None/"plan:…"), so membership
+// here cleanly separates "needs re-login" from "wait for the window to reset".
+const AUTH_FAILURE_MESSAGES = new Set(["auth_failed", "需要重新授权", "需要重新登录", "密钥无效"]);
+function isAuthFailureMessage(message: string | null | undefined): boolean {
+  return message != null && AUTH_FAILURE_MESSAGES.has(message);
+}
+
 function accountState(
   account: AuthFile,
   authFailed: boolean,
@@ -687,8 +697,13 @@ function accountState(
   // triggers re-auth, since 500/429 failures are rate-limit/transient, not auth.
   if (authFailed) return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "需重新授权", needsReauth: true };
   if (health?.recommend_reauth) return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "需重新授权", needsReauth: true };
-  if (account.disabled && account.quotio_health_isolated)
-    return { tone: "bad", key: "providers.stateHealthIsolated", fallback: "健康隔离", needsReauth: true };
+  if (account.disabled && account.quotio_health_isolated) {
+    // 额度耗尽的隔离不必重新登录,等窗口刷新即可——只有鉴权失效才提示重新授权。
+    // reason 缺失(升级前隔离的旧文件,下一轮对账会补写)时按 auth 兜底:宁可多提示一次。
+    if (account.quotio_health_isolated_reason === "quota")
+      return { tone: "warn", key: "providers.stateQuotaExhausted", fallback: "额度耗尽 · 待刷新", needsReauth: false };
+    return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "需重新授权", needsReauth: true };
+  }
   if (account.disabled && account.quotio_scheduler_standby)
     return { tone: "muted", key: "providers.stateStandby", fallback: "待命(调度)", needsReauth: false };
   if (account.disabled && account.quotio_bound_login_only)
@@ -913,6 +928,7 @@ function areAccountRowPropsEqual(a: AccountRowProps, b: AccountRowProps): boolea
     x.label === y.label &&
     x.disabled === y.disabled &&
     x.quotio_health_isolated === y.quotio_health_isolated &&
+    x.quotio_health_isolated_reason === y.quotio_health_isolated_reason &&
     x.quotio_scheduler_standby === y.quotio_scheduler_standby &&
     x.quotio_bound_login_only === y.quotio_bound_login_only &&
     x.unavailable === y.unavailable &&
