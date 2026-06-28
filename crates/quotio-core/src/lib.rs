@@ -513,12 +513,12 @@ impl AppCore {
     /// standby 账号放回池子（fail-open 同理）。返回是否改动了池子状态。
     pub fn scheduler_reconcile(&mut self) -> bool {
         let dir = quotio_platform::proxy_auth_dir();
+        // 健康隔离(隔离 403/鉴权失败、健康恢复后放回)在两种调度模式下都跑。
         let health_changed = scheduler::reconcile_health_isolation_in(&dir, &self.quotas);
         if self.settings.scheduler_rule != "reset_soonest" {
-            let legacy_changed = scheduler::recover_legacy_plain_disabled_in(&dir, &self.quotas);
             let changed = scheduler::release_all_in(&dir);
             self.schedulers.clear();
-            return health_changed || legacy_changed || changed;
+            return health_changed || changed;
         }
 
         let providers = scheduler::discover_schedulable_providers(&dir);

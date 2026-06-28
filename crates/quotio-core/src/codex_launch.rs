@@ -307,9 +307,11 @@ pub(crate) fn read_proxy_account_from(path: &Path) -> Result<Value, String> {
 pub(crate) fn write_proxy_account_to(path: &Path, value: &Value) -> Result<(), String> {
     let text =
         serde_json::to_string_pretty(value).map_err(|e| format!("序列化账号文件失败: {e}"))?;
-    std::fs::write(path, text).map_err(|e| format!("写入账号文件失败 {}: {e}", path.display()))?;
-    let _ = quotio_platform::set_sensitive_permissions(path);
-    Ok(())
+    // 原子写(临时文件 → rename + 0600):账号文件含长期凭据,且 CLIProxyAPI 跨进程
+    // 同时读;原地 fs::write 截断会有半写窗口,坏了要重登。atomic_write 让读者只会看到
+    // 完整的旧文件或完整的新文件,绝不读到半截;写失败也是整体失败、不损坏原文件。
+    quotio_platform::atomic_write(path, text.as_bytes(), true)
+        .map_err(|e| format!("写入账号文件失败 {}: {e}", path.display()))
 }
 
 /// 切换 Codex 绑定账号：释放旧绑定账号，锁定新绑定账号。

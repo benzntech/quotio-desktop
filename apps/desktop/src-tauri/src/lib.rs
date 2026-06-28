@@ -1220,7 +1220,9 @@ async fn set_management_auth_file_disabled(
         .await
         .map_err(|error| error.to_string())?;
     if !disabled {
-        quotio_core::scheduler::clear_health_isolation_for_file_in(
+        // 用户手动启用:彻底清掉调度待命 + 健康隔离两个临时标记并放回池子,
+        // 否则残留的 standby 会把刚启用的账号又写回 disabled=true(启用静默失效)。
+        quotio_core::scheduler::clear_temp_disable_markers_for_file_in(
             &quotio_platform::proxy_auth_dir(),
             &name,
         );
