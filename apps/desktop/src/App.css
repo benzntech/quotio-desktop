@@ -3671,15 +3671,24 @@ h3 {
   color: var(--quotio-text);
 }
 
+.account-row-drag {
+  transition: transform 0.16s ease, box-shadow 0.16s ease;
+}
+
 .account-row-drag--draggable {
   cursor: grab;
   user-select: none;
   touch-action: none;
 }
 
+/* 拖拽中的行:浮起(实心底 + 阴影 + 抬到上层),跟着指针走。 */
 .account-row-drag--dragging {
-  opacity: 0.4;
   cursor: grabbing;
+  background: var(--quotio-card-solid);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  border-radius: 8px;
+  position: relative;
+  z-index: 5;
 }
 
 .account-row-info {

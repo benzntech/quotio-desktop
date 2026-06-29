@@ -870,24 +870,34 @@ function ProviderCard({
   const moveRowDrag = (e: React.PointerEvent) => {
     const d = dragRef.current;
     if (!d) return;
+    const el = e.currentTarget as HTMLElement;
     if (!d.dragging) {
       if (Math.abs(e.clientY - d.startY) < 5) return; // 越过阈值才算拖,普通点击不触发
       d.dragging = true;
       setDraggingFile(d.file);
+      el.style.transition = "none"; // 拖拽中 1:1 跟手,不要过渡延迟
       try {
-        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        el.setPointerCapture(e.pointerId);
       } catch {
         /* 某些环境无 pointer capture,忽略即可 */
       }
     }
+    // 被拖的行跟着指针上下走(命令式改 transform,避免每次 move 触发 React 重渲染)。
+    el.style.transform = `translateY(${e.clientY - d.startY}px)`;
+    // 命中检测时让被拖的行临时"穿透",否则 elementFromPoint 总命中它自己、找不到落点行。
+    el.style.pointerEvents = "none";
     const under = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+    el.style.pointerEvents = "";
     const target = under?.closest<HTMLElement>("[data-drag-file]")?.dataset.dragFile ?? null;
     d.over = target && target !== d.file ? target : null;
     setDragOverFile(d.over);
   };
-  const endRowDrag = () => {
+  const endRowDrag = (e: React.PointerEvent) => {
     const d = dragRef.current;
     dragRef.current = null;
+    const el = e.currentTarget as HTMLElement;
+    el.style.transition = ""; // 恢复 CSS 过渡 → 松手平滑归位
+    el.style.transform = "";
     if (d?.dragging && d.over) onReorderMove(d.file, d.over);
     setDraggingFile(null);
     setDragOverFile(null);
@@ -1001,7 +1011,7 @@ function ProviderCard({
               onPointerUp={canDrag ? endRowDrag : undefined}
               onPointerCancel={canDrag ? endRowDrag : undefined}
               className={`account-row-drag${canDrag ? " account-row-drag--draggable" : ""}${draggingFile === account.name ? " account-row-drag--dragging" : ""}`}
-              style={isOver ? { boxShadow: `inset 0 2px 0 0 #${group.colorHex}`, borderRadius: "8px" } : undefined}
+              style={isOver ? { boxShadow: `inset 0 2.5px 0 0 #${group.colorHex}`, background: `#${group.colorHex}14`, borderRadius: "8px" } : undefined}
             >
               <AccountRow
                 account={account}
@@ -1156,9 +1166,15 @@ const AccountRow = memo(function AccountRow({
       <div className="account-row-actions">
         {order ? (
           <div className="account-reorder">
-            <button className="reorder-btn" type="button" title="置顶" aria-label="置顶" disabled={isBusy || order.position <= 1} onClick={() => onReorder(account.name, "top")}>⤒</button>
-            <button className="reorder-btn" type="button" title="上移" aria-label="上移" disabled={isBusy || order.position <= 1} onClick={() => onReorder(account.name, "up")}>↑</button>
-            <button className="reorder-btn" type="button" title="下移" aria-label="下移" disabled={isBusy || order.position >= orderCount} onClick={() => onReorder(account.name, "down")}>↓</button>
+            <button className="reorder-btn" type="button" title="置顶" aria-label="置顶" disabled={isBusy || order.position <= 1} onClick={() => onReorder(account.name, "top")}>
+              <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 5.5l3-2.5 3 2.5M3 9l3-2.5 3 2.5" /></svg>
+            </button>
+            <button className="reorder-btn" type="button" title="上移" aria-label="上移" disabled={isBusy || order.position <= 1} onClick={() => onReorder(account.name, "up")}>
+              <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7.5l3-3 3 3" /></svg>
+            </button>
+            <button className="reorder-btn" type="button" title="下移" aria-label="下移" disabled={isBusy || order.position >= orderCount} onClick={() => onReorder(account.name, "down")}>
+              <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 4.5l3 3 3-3" /></svg>
+            </button>
           </div>
         ) : null}
         {state.needsReauth ? (
