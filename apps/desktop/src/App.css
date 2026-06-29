@@ -2314,6 +2314,7 @@ h3 {
 .scheduler-head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -2329,8 +2330,42 @@ h3 {
   color: #4f46e5;
 }
 
-.scheduler-switch {
+/* 调度模式三选一(关闭 / 智能调度 / 顺序故障转移):分段控件。 */
+.scheduler-modes {
   margin-left: auto;
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.1);
+}
+
+.scheduler-mode-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--quotio-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.scheduler-mode-btn:hover {
+  color: #4f46e5;
+}
+
+.scheduler-mode-btn.is-active {
+  background: #6366f1;
+  color: #fff;
+  box-shadow: 0 1px 3px rgba(79, 70, 229, 0.4);
+}
+
+.scheduler-mode-btn.is-active:hover {
+  color: #fff;
 }
 
 .scheduler-desc {

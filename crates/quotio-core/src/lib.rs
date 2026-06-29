@@ -520,17 +520,61 @@ impl AppCore {
         let dir = quotio_platform::proxy_auth_dir();
         // 健康隔离(隔离 403/鉴权失败、健康恢复后放回)在两种调度模式下都跑。
         let health_changed = scheduler::reconcile_health_isolation_in(&dir, &self.quotas);
+
+        // 顺序故障转移:不做单号独占,健康号全启用 + 把手动顺序写成代理认的
+        // attributes.priority,由代理 fill-first 按序用号、坏了无感顺位(不报错给客户端)。
+        if self.settings.scheduler_rule == "priority_failover" {
+            let providers = scheduler::discover_schedulable_providers(&dir);
+            let now_unix = now_unix_seconds() as i64;
+            let mut any_changed = health_changed;
+            self.schedulers.retain(|pid, _| providers.contains(pid));
+            for provider_id in &providers {
+                let pool = scheduler::read_pool_for_provider(&dir, provider_id);
+                let candidates =
+                    scheduler::build_candidates(&pool, &self.quotas, now_unix, provider_id);
+                let (changed, order, active) =
+                    scheduler::apply_failover_in(&dir, provider_id, &pool, &candidates);
+                let target_label = active
+                    .as_ref()
+                    .and_then(|file| candidates.iter().find(|c| &c.file_name == file))
+                    .map(|c| c.label.clone());
+                let state = self
+                    .schedulers
+                    .entry(provider_id.clone())
+                    .or_insert_with(|| ProviderSchedulerState {
+                        current: None,
+                        target_label: None,
+                        current_reset_at: None,
+                        standby_count: 0,
+                        failure_recheck_at: None,
+                        consecutive_target_failures: 0,
+                        exhausted: Default::default(),
+                        order: Vec::new(),
+                    });
+                state.current = active.map(|file| (file, Instant::now()));
+                state.target_label = target_label;
+                state.standby_count = 0;
+                state.order = order;
+                any_changed |= changed;
+            }
+            return any_changed;
+        }
+
+        // 不在顺序故障转移模式:清掉之前写给代理的 attributes.priority,避免残留让 fill-first
+        // 仍按旧手动顺序路由(只清这个代理键,不动用户手动顺序 quotio_priority)。
+        let priority_cleared = scheduler::clear_proxy_priorities_in(&dir);
+
         if self.settings.scheduler_rule != "reset_soonest" {
             let changed = scheduler::release_all_in(&dir);
             self.schedulers.clear();
-            return health_changed || changed;
+            return health_changed || changed || priority_cleared;
         }
 
         let providers = scheduler::discover_schedulable_providers(&dir);
         let now_unix = now_unix_seconds() as i64;
         let min_hold = Duration::from_secs(self.settings.scheduler_min_hold_minutes as u64 * 60);
         let margin = self.settings.scheduler_switch_margin_minutes as i64 * 60;
-        let mut any_changed = health_changed;
+        let mut any_changed = health_changed || priority_cleared;
 
         // 清理已不存在的服务商。
         self.schedulers.retain(|pid, _| providers.contains(pid));

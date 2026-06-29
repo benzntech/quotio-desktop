@@ -51,6 +51,8 @@ pub struct PoolFile {
     pub bound: bool,
     /// 用户手动请求优先级(越小越先);None = 自动档。
     pub priority: Option<u32>,
+    /// 代理(CLIProxyAPI)读的 `attributes.priority`(数字大=先用);顺序故障转移模式写入。
+    pub proxy_priority: Option<u32>,
 }
 
 impl PoolFile {
@@ -131,6 +133,11 @@ pub fn read_pool_for_provider(dir: &Path, provider_id: &str) -> Vec<PoolFile> {
                 .get(PRIORITY_FIELD)
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
+            proxy_priority: value
+                .get("attributes")
+                .and_then(|attrs| attrs.get("priority"))
+                .and_then(|p| p.as_str())
+                .and_then(|s| s.parse::<u32>().ok()),
         });
     }
     pool.sort_by(|a, b| a.file_name.cmp(&b.file_name));
@@ -604,6 +611,114 @@ fn set_priority(path: &Path, priority: Option<u32>) -> Result<(), String> {
     codex_launch::write_proxy_account_to(path, &value)
 }
 
+/// 写 / 删账号的 `attributes.priority`(代理 fill-first 据它排序,数字大=先用)。保留
+/// attributes 里其它键;值按 CLIProxyAPI 格式写成字符串。
+fn set_proxy_priority(path: &Path, priority: Option<u32>) -> Result<(), String> {
+    let mut value = codex_launch::read_proxy_account_from(path)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("账号文件不是 JSON 对象: {}", path.display()))?;
+    match priority {
+        Some(p) => {
+            let attrs = object
+                .entry("attributes")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            // 容错:attributes 万一不是对象(手改 / 导入的坏文件),换成对象,否则下面
+            // as_object_mut 拿不到、优先级永远写不进 → apply_failover_priorities 每轮都
+            // 判定有改动、反复重写文件并空发 scheduler-changed。
+            if !attrs.is_object() {
+                *attrs = Value::Object(serde_json::Map::new());
+            }
+            if let Some(attrs_obj) = attrs.as_object_mut() {
+                attrs_obj.insert("priority".to_string(), Value::String(p.to_string()));
+            }
+        }
+        None => {
+            if let Some(attrs_obj) = object.get_mut("attributes").and_then(|a| a.as_object_mut()) {
+                attrs_obj.remove("priority");
+            }
+        }
+    }
+    codex_launch::write_proxy_account_to(path, &value)
+}
+
+/// 顺序故障转移:把手动优先级(quotio_priority,小=先)翻译成代理认的 attributes.priority
+/// (大=先)写进各账号文件,仅在变化时写。绑定 / 用户禁用的号不碰。返回是否有改动。
+fn apply_failover_priorities(dir: &Path, pool: &[PoolFile]) -> bool {
+    let max_priority = pool.iter().filter_map(|file| file.priority).max().unwrap_or(0);
+    let mut changed = false;
+    for file in pool {
+        if file.bound || file.user_disabled() {
+            continue;
+        }
+        // quotio_priority p(1=最先)→ attributes.priority = max-p+1(大=先);无优先级 → None(代理按默认 0)。
+        let desired = file.priority.map(|p| max_priority.saturating_sub(p) + 1);
+        if file.proxy_priority != desired {
+            changed |= set_proxy_priority(&dir.join(&file.file_name), desired).is_ok();
+        }
+    }
+    changed
+}
+
+/// 「顺序故障转移」模式一轮收敛:① 健康号全放回池子(清 standby,代理才能在它们间无感顺位);
+/// ② 把手动顺序写成代理的 `attributes.priority`;③ 算徽章顺序(active = 优先级最高的可用号,
+/// 即代理 fill-first 会先用的那个)。返回 (是否有改动, 顺序列表, 激活号文件名)。
+pub fn apply_failover_in(
+    dir: &Path,
+    provider_id: &str,
+    pool: &[PoolFile],
+    candidates: &[Candidate],
+) -> (bool, Vec<SchedulerOrderItem>, Option<String>) {
+    let mut changed = release_provider_in(dir, provider_id);
+    changed |= apply_failover_priorities(dir, pool);
+    // active = 代理 fill-first 实际先用的号:轮换池(非绑定 / 非用户禁用)按 rank 排序后
+    // 第一个「仍启用」的号。按 `!disabled` 选,而不是按 `eligible`(配额是否健康)——代理
+    // 只看 disabled、不看配额,否则上游抖动让主号暂时查不到配额时,徽章会把 ① 误标到下一个
+    // 号。与 build_order 同序,故 ① 必落在列表中第一个启用号上(被隔离的高优先号显示为暗格)。
+    let mut rotation: Vec<(&PoolFile, &Candidate)> = pool
+        .iter()
+        .zip(candidates.iter())
+        .filter(|(file, _)| !file.bound && !file.user_disabled())
+        .collect();
+    rotation.sort_by(|(_, a), (_, b)| rank(a).cmp(&rank(b)));
+    let active = rotation
+        .iter()
+        .find(|(file, _)| !file.disabled)
+        .map(|(file, _)| file.file_name.clone());
+    let order = build_order(pool, candidates, active.as_deref());
+    (changed, order, active)
+}
+
+/// 离开顺序故障转移后:清掉所有账号文件里写给代理的 `attributes.priority`,避免残留让
+/// 代理在 fill-first 下继续按旧的手动顺序路由(7.2.x+ 会认这个键)。只动 `attributes.priority`,
+/// 不碰用户的手动顺序 `quotio_priority`;仅在确有该键时才写,清干净后即为只读扫描、无副作用。
+/// 返回是否有改动。
+pub fn clear_proxy_priorities_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut changed = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let has_priority = codex_launch::read_proxy_account_from(&path)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("attributes")
+                    .and_then(|attrs| attrs.get("priority"))
+                    .map(|_| ())
+            })
+            .is_some();
+        if has_priority {
+            changed |= set_proxy_priority(&path, None).is_ok();
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,6 +967,123 @@ mod tests {
     }
 
     #[test]
+    fn failover_maps_priority_to_proxy_higher_first_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_failover_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        // a=手动第1(最先)、b=第2、c=自动档(无优先级)。
+        std::fs::write(
+            dir.join("codex-a.json"),
+            format!("{{{base},\"quotio_priority\":1}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("codex-b.json"),
+            format!("{{{base},\"quotio_priority\":2}}"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("codex-c.json"), format!("{{{base}}}")).unwrap();
+
+        let pool = read_pool(&dir);
+        assert!(apply_failover_priorities(&dir, &pool));
+        let proxy_of = |name: &str| {
+            read_pool(&dir)
+                .into_iter()
+                .find(|f| f.file_name == name)
+                .unwrap()
+                .proxy_priority
+        };
+        // 手动 p(小=先)→ 代理 attributes.priority(大=先):max(2)-p+1。
+        assert_eq!(proxy_of("codex-a.json"), Some(2)); // 1 → 2(最大,代理最先用)
+        assert_eq!(proxy_of("codex-b.json"), Some(1)); // 2 → 1
+        assert_eq!(proxy_of("codex-c.json"), None); // 自动档,不写
+
+        // 字符串格式 + attributes 嵌套(CLIProxyAPI 认的格式)。
+        let raw = std::fs::read_to_string(dir.join("codex-a.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["attributes"]["priority"], serde_json::json!("2"));
+
+        // 幂等:再跑一轮无文件改动。
+        let pool2 = read_pool(&dir);
+        assert!(!apply_failover_priorities(&dir, &pool2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_proxy_priorities_removes_only_that_key_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_clearpri_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        // a:有 attributes.priority + 其它 attributes 键 + 手动顺序;b:干净。
+        std::fs::write(
+            dir.join("codex-a.json"),
+            format!("{{{base},\"quotio_priority\":1,\"attributes\":{{\"priority\":\"2\",\"label\":\"keep\"}}}}"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("codex-b.json"), format!("{{{base}}}")).unwrap();
+
+        assert!(clear_proxy_priorities_in(&dir));
+
+        let raw = std::fs::read_to_string(dir.join("codex-a.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // attributes.priority 清掉,但 attributes 里其它键 + 用户手动顺序 quotio_priority 保留。
+        assert!(value["attributes"].get("priority").is_none());
+        assert_eq!(value["attributes"]["label"], serde_json::json!("keep"));
+        assert_eq!(value["quotio_priority"], serde_json::json!(1));
+        // 幂等:已清干净再调无改动。
+        assert!(!clear_proxy_priorities_in(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_proxy_priority_replaces_non_object_attributes_without_churn() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_nonobj_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        // 坏文件:attributes 是字符串而非对象。
+        std::fs::write(
+            dir.join("codex-x.json"),
+            format!("{{{base},\"attributes\":\"oops\"}}"),
+        )
+        .unwrap();
+        let path = dir.join("codex-x.json");
+
+        set_proxy_priority(&path, Some(3)).unwrap();
+        // 非对象 attributes 被换成对象并写入 priority(字符串);否则会写不进 → 反复重写。
+        let proxy_priority = read_pool(&dir)
+            .into_iter()
+            .find(|f| f.file_name == "codex-x.json")
+            .unwrap()
+            .proxy_priority;
+        assert_eq!(proxy_priority, Some(3));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn build_order_numbers_rotation_and_skips_bound_and_user_disabled() {
         let pool_file = |key: &str, disabled: bool, bound: bool, priority: Option<u32>| PoolFile {
             file_name: format!("codex-{key}.json"),
@@ -862,6 +1094,7 @@ mod tests {
             health_isolated_reason: None,
             bound,
             priority,
+            proxy_priority: None,
         };
         let cand = |key: &str, reset: Option<i64>, eligible: bool, priority: Option<u32>| {
             let mut c = candidate(key, reset, 50.0, eligible);
@@ -905,6 +1138,7 @@ mod tests {
                 health_isolated_reason: None,
                 bound: false,
                 priority: None,
+                proxy_priority: None,
             },
             PoolFile {
                 file_name: "codex-b.json".into(),
@@ -915,6 +1149,7 @@ mod tests {
                 health_isolated_reason: None,
                 bound: false,
                 priority: None,
+                proxy_priority: None,
             },
         ];
         let quota = |key: &str, reset: Option<i64>, forbidden: bool| AccountQuota {

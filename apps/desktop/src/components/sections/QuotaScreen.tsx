@@ -3,7 +3,6 @@ import type { AccountQuota, AppSettings, AppState, AuthFile, ProviderSummary, Qu
 import { maskEmail, quotaTone, parsePlan, parseResetCredits, planTier, matchAuthFile } from "../../lib/format";
 import { RefreshIcon } from "../icons";
 import { HealthDots } from "../HealthDots";
-import { Switch } from "../Switch";
 import { useT } from "../../i18n";
 import { invoke } from "../../lib/tauri";
 
@@ -32,7 +31,7 @@ type QuotaGroup = {
   accounts: AccountQuota[];
 };
 
-export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSettings }: QuotaScreenProps) {
+export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSettings, onRunManagementStateAction }: QuotaScreenProps) {
   const t = useT();
   const groups = useMemo(() => buildGroups(appState.quotas, appState.providers), [appState.quotas, appState.providers]);
   const authFiles = appState.management.auth_files ?? appState.auth_files ?? [];
@@ -77,7 +76,7 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
         </button>
       </header>
 
-      <SchedulerCard appState={appState} onSaveSettings={onSaveSettings} activeProviderId={active?.id ?? null} />
+      <SchedulerCard appState={appState} onSaveSettings={onSaveSettings} onRunManagementStateAction={onRunManagementStateAction} activeProviderId={active?.id ?? null} />
 
       {proxyUnreachable ? (
         <div className="state-banner state-banner--warn">
@@ -159,15 +158,18 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
 function SchedulerCard({
   appState,
   onSaveSettings,
+  onRunManagementStateAction,
   activeProviderId,
 }: {
   appState: AppState;
   onSaveSettings: (settings: AppSettings) => void;
+  onRunManagementStateAction: (command: string, args?: Record<string, unknown>) => void;
   activeProviderId: string | null;
 }) {
   const t = useT();
   const scheduler = appState.scheduler;
-  const schedulerOn = (appState.settings.scheduler_rule || "off") !== "off";
+  const rule = appState.settings.scheduler_rule || "off";
+  const schedulerOn = rule !== "off";
 
   const providerEntry = useMemo(() => {
     if (!activeProviderId || !scheduler?.providers) return null;
@@ -180,12 +182,24 @@ function SchedulerCard({
     return p?.display_name ?? activeProviderId;
   }, [activeProviderId, appState.providers]);
 
-  function toggleScheduler() {
+  function selectMode(mode: "off" | "reset_soonest" | "priority_failover") {
+    if (mode === rule) return;
+    // 顺序故障转移要让代理按 attributes.priority 顺位用号 → fill-first;其余模式回 round-robin。
+    const nextRouting = mode === "priority_failover" ? "fill-first" : "round-robin";
     onSaveSettings({
       ...appState.settings,
-      scheduler_rule: schedulerOn ? "off" : "reset_soonest",
+      scheduler_rule: mode,
+      routing_strategy: nextRouting,
       remote_management_key: null,
     });
+    // onSaveSettings 只写 config.yaml(下次启动生效);路由还要经管理 API 推给运行中的代理,
+    // 否则切到 failover 后活代理仍是旧路由、要重启才认 fill-first。仅在代理可达
+    //(management.config 非空)且活代理当前路由确实不同才推:代理没运行时别空推弹错;
+    // 且按「活代理的真实路由」比对(而非持久化设置,两者可能不一致)以免漏推。
+    const liveConfig = appState.management.config;
+    if (liveConfig && liveConfig.routing_strategy !== nextRouting) {
+      onRunManagementStateAction("set_management_routing_strategy", { strategy: nextRouting });
+    }
   }
 
   let resetText: string | null = null;
@@ -203,12 +217,36 @@ function SchedulerCard({
   const activeStandby = providerEntry?.standby_count ?? scheduler?.standby_count ?? 0;
   const totalScheduled = scheduler?.providers?.length ?? 0;
 
+  // 当前服务商有数据就只数它自己(order 缺失算 0);没有选中服务商时才退回汇总所有服务商,
+  // 避免「providerEntry 在、但 order 缺失」时 ?? 跳到跨服务商求和、报出虚高的数字。
+  const failoverChainCount = providerEntry
+    ? providerEntry.order?.filter((o) => o.eligible).length ?? 0
+    : (scheduler?.providers ?? []).reduce(
+        (n, p) => n + (p.order?.filter((o) => o.eligible).length ?? 0),
+        0,
+      );
+
   let statusText: string;
   if (!schedulerOn) {
     statusText = t(
       "quota.scheduler.descOff",
-      "开启后只让「额度最快刷新」的账号进代理池,其余临时待命;到点自动换号,余量不浪费。",
+      "智能调度:只让「额度最快刷新」的号进池,余者待命、到点自动换号。顺序故障转移:按你排的顺序用号,坏一个无感切下一个(不报错)。",
     );
+  } else if (rule === "priority_failover") {
+    if (activeLabel) {
+      const chain = t(
+        "quota.scheduler.failoverChain",
+        "共 {count} 个按序待命,坏一个自动顺延(不返回错误)",
+      ).replace("{count}", String(failoverChainCount));
+      statusText = `${t("quota.scheduler.failoverPrimary", "主用")}:${activeLabel} · ${chain}`;
+    } else if (totalScheduled > 0) {
+      statusText = t("quota.scheduler.noProviderMatch", "此服务商账号不足 2 个,无需调度。");
+    } else {
+      statusText = t(
+        "quota.scheduler.failoverPending",
+        "已开启,按你设定的账号顺序请求,坏号自动顺延到下一个(在「服务商」页拖动排序)。",
+      );
+    }
   } else if (activeLabel) {
     const windowText = resetText
       ? t("quota.scheduler.resetIn", "{time} 后刷新").replace("{time}", resetText)
@@ -224,17 +262,43 @@ function SchedulerCard({
     statusText = t("quota.scheduler.pending", "已开启,等待下一次额度刷新后选号(可点右上角立即刷新)。");
   }
 
-  const tagText = schedulerOn && totalScheduled > 0
-    ? t("quota.scheduler.rule", "临近刷新优先") + (providerEntry ? ` · ${providerLabel}` : ` · ${totalScheduled} 个服务商`)
-    : t("quota.scheduler.ruleGeneric", "临近刷新优先");
+  let tagText: string | null = null;
+  if (rule === "priority_failover") {
+    tagText =
+      t("quota.scheduler.ruleFailover", "按序故障转移") +
+      (providerEntry ? ` · ${providerLabel}` : totalScheduled > 0 ? ` · ${totalScheduled} 个服务商` : "");
+  } else if (rule === "reset_soonest") {
+    tagText =
+      t("quota.scheduler.rule", "临近刷新优先") +
+      (providerEntry ? ` · ${providerLabel}` : totalScheduled > 0 ? ` · ${totalScheduled} 个服务商` : "");
+  }
+
+  const modes: { id: "off" | "reset_soonest" | "priority_failover"; label: string }[] = [
+    { id: "off", label: t("quota.scheduler.modeOff", "关闭") },
+    { id: "reset_soonest", label: t("quota.scheduler.modeResetSoonest", "智能调度") },
+    { id: "priority_failover", label: t("quota.scheduler.modeFailover", "顺序故障转移") },
+  ];
 
   return (
     <div className="scheduler-block">
       <div className="scheduler-head">
-        <strong>{t("quota.scheduler.title", "智能调度")}</strong>
-        <span className="scheduler-tag">{tagText}</span>
-        <div className="scheduler-switch">
-          <Switch on={schedulerOn} onChange={toggleScheduler} label="scheduler" />
+        <strong>{t("quota.scheduler.cardTitle", "账号调度")}</strong>
+        {tagText && <span className="scheduler-tag">{tagText}</span>}
+        <div
+          className="scheduler-modes"
+          role="group"
+          aria-label={t("quota.scheduler.cardTitle", "账号调度")}
+        >
+          {modes.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              className={`scheduler-mode-btn${rule === m.id ? " is-active" : ""}`}
+              onClick={() => selectMode(m.id)}
+            >
+              {m.label}
+            </button>
+          ))}
         </div>
       </div>
       <p className="scheduler-desc">{statusText}</p>

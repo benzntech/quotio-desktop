@@ -10,6 +10,12 @@ import { AddAccountModal } from "../AddAccountModal";
 type ProviderKey = { id: string; label: string; api_key: string; enabled: boolean; weight: number };
 type CustomProvider = { id: string; name: string; base_url: string; api_key: string; kind: string; prefix?: string; keys: ProviderKey[]; default_model?: string; models?: string[]; proxy_mode?: string };
 
+// 这两种调度模式都会算「请求顺序」并允许手动排序:reset_soonest(按额度刷新选号)、
+// priority_failover(按手动顺序故障转移)。徽章 + 排序控件在这两种模式下都显示。
+function schedulerOrdersAccounts(rule: string | undefined | null): boolean {
+  return rule === "reset_soonest" || rule === "priority_failover";
+}
+
 type ProvidersScreenProps = {
   appState: AppState;
   isManagementBusy: boolean;
@@ -245,11 +251,12 @@ export function ProvidersScreen({
   }, [proxyAuthFiles, localAccounts]);
   const groups = useMemo(() => groupAccounts(authFiles, appState.providers), [authFiles, appState.providers]);
   // 智能调度算出的「请求顺序」:file_name → 顺序项(全 provider 合并;file_name 全局唯一)。
-  // 仅智能调度(reset_soonest)开启时有数据,关闭时为空 → 不显示徽章。
+  // 仅排序型调度(智能调度 / 顺序故障转移)开启时有数据,关闭时为空 → 不显示徽章。
   const orderByFile = useMemo(() => {
     const map = new Map<string, SchedulerOrderItem>();
-    if (appState.scheduler?.rule === "reset_soonest") {
-      for (const entry of appState.scheduler.providers ?? []) {
+    const sched = appState.scheduler;
+    if (sched && schedulerOrdersAccounts(sched.rule)) {
+      for (const entry of sched.providers ?? []) {
         for (const item of entry.order ?? []) {
           map.set(item.file_name, item);
         }
@@ -263,7 +270,7 @@ export function ProvidersScreen({
   const onReorderAccount = useCallback(
     (fileName: string, op: "up" | "down" | "top" | "reset") => {
       const sched = appState.scheduler;
-      if (sched?.rule !== "reset_soonest") return;
+      if (!sched || !schedulerOrdersAccounts(sched.rule)) return;
       const entry = (sched.providers ?? []).find((e) =>
         (e.order ?? []).some((i) => i.file_name === fileName),
       );
@@ -303,7 +310,7 @@ export function ProvidersScreen({
     (draggedFileName: string, targetFileName: string) => {
       if (draggedFileName === targetFileName) return;
       const sched = appState.scheduler;
-      if (sched?.rule !== "reset_soonest") return;
+      if (!sched || !schedulerOrdersAccounts(sched.rule)) return;
       const entry = (sched.providers ?? []).find((e) =>
         (e.order ?? []).some((i) => i.file_name === draggedFileName),
       );
