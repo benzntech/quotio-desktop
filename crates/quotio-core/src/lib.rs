@@ -114,6 +114,9 @@ struct ProviderSchedulerState {
     current_reset_at: Option<i64>,
     standby_count: u32,
     failure_recheck_at: Option<Instant>,
+    /// 当前目标号「非鉴权」连续失败计数(5xx / 网络抖动等)。累计到阈值才切换,
+    /// 期间出现一次成功即清零;鉴权失败(401/403)不走计数、直接切。
+    consecutive_target_failures: u32,
     /// 账号 key → 因额度耗尽(余量 ≤ 3%)被踢出可选集的账号。带迟滞:余量回到
     /// > 5%(刷新后)才移除。避免在阈值边界反复横跳。
     exhausted: std::collections::HashSet<String>,
@@ -544,6 +547,7 @@ impl AppCore {
                     current_reset_at: None,
                     standby_count: 0,
                     failure_recheck_at: None,
+                    consecutive_target_failures: 0,
                     exhausted: Default::default(),
                 });
 
@@ -574,6 +578,8 @@ impl AppCore {
                 .unwrap_or(true);
             if target_changed {
                 state.current = Some((target.clone(), Instant::now()));
+                // 换了目标号:旧号的失败连击清零,新号从头计。
+                state.consecutive_target_failures = 0;
             }
             let (pool_changed, standby_count) = scheduler::apply_target_in(&dir, &pool, &target);
 
@@ -586,8 +592,12 @@ impl AppCore {
         any_changed
     }
 
-    /// 用量事件里出现了**当前目标账号**的失败请求：
-    /// 返回 true 表示该立刻重拉配额重选。带 60 秒冷却。
+    /// 用量事件里出现**当前目标账号**的失败请求 → 返回 true 表示该立刻重拉配额重选。
+    ///
+    /// 混合策略:鉴权失败(401/403)token 不会自愈 → **第 1 次就切**,且不受 60s 冷却限制;
+    /// 其它失败(5xx / 网络抖动)可能只是上游瞬时抖动 → **连续累计到阈值才切**,并带 60s
+    /// 冷却,防上游全局抖动时反复空切。目标号出现一次成功即把非鉴权连击清零。
+    /// (真正切不切由随后的重探测 + reconcile 自校验决定,这里只负责「该不该重评估」。)
     pub fn scheduler_should_recheck_for_failures(
         &mut self,
         events: &[quotio_types::UsageEvent],
@@ -595,24 +605,49 @@ impl AppCore {
         if self.settings.scheduler_rule != "reset_soonest" {
             return false;
         }
+        /// 非鉴权失败连续多少次才触发重选(鉴权 401/403 不走计数,直接切)。
+        const NON_AUTH_SWITCH_AFTER: u32 = 3;
         let mut should_recheck = false;
         for state in self.schedulers.values_mut() {
-            let Some(label) = state.target_label.as_deref() else {
+            let Some(label) = state.target_label.clone() else {
+                state.consecutive_target_failures = 0;
                 continue;
             };
-            let target_failed = events
+            // 只看当前目标号的事件,按时间顺序:成功清零、非鉴权失败累加、鉴权失败立即切。
+            let mut target_events: Vec<&quotio_types::UsageEvent> = events
                 .iter()
-                .any(|event| event.failed && event.source.as_deref() == Some(label));
-            if !target_failed {
-                continue;
-            }
-            if let Some(last) = state.failure_recheck_at {
-                if last.elapsed() < Duration::from_secs(60) {
-                    continue;
+                .filter(|event| event.source.as_deref() == Some(label.as_str()))
+                .collect();
+            target_events.sort_by_key(|event| event.timestamp_ms);
+
+            let mut auth_failure = false;
+            for event in target_events {
+                if !event.failed {
+                    state.consecutive_target_failures = 0;
+                } else if matches!(event.status_code, Some(401) | Some(403)) {
+                    auth_failure = true;
+                    break;
+                } else {
+                    state.consecutive_target_failures =
+                        state.consecutive_target_failures.saturating_add(1);
                 }
             }
-            state.failure_recheck_at = Some(Instant::now());
-            should_recheck = true;
+
+            let cooled = state
+                .failure_recheck_at
+                .map(|last| last.elapsed() >= Duration::from_secs(60))
+                .unwrap_or(true);
+
+            if auth_failure {
+                // 鉴权失败:绕过冷却,立即重选。
+                state.failure_recheck_at = Some(Instant::now());
+                state.consecutive_target_failures = 0;
+                should_recheck = true;
+            } else if state.consecutive_target_failures >= NON_AUTH_SWITCH_AFTER && cooled {
+                state.failure_recheck_at = Some(Instant::now());
+                state.consecutive_target_failures = 0;
+                should_recheck = true;
+            }
         }
         should_recheck
     }
@@ -4469,39 +4504,77 @@ mod tests {
         }
     }
 
+    fn usage_event_status(source: &str, status_code: u16) -> quotio_types::UsageEvent {
+        let mut event = usage_event_for_test(source, status_code >= 400);
+        event.status_code = Some(status_code);
+        event
+    }
+
+    fn codex_target_state() -> ProviderSchedulerState {
+        ProviderSchedulerState {
+            current: Some(("codex-a.json".to_string(), Instant::now())),
+            target_label: Some("a@example.com".to_string()),
+            current_reset_at: None,
+            standby_count: 0,
+            failure_recheck_at: None,
+            consecutive_target_failures: 0,
+            exhausted: Default::default(),
+        }
+    }
+
     #[test]
-    fn scheduler_rechecks_on_target_failures_with_cooldown() {
+    fn scheduler_recheck_immediate_on_auth_failure_and_debounced_on_others() {
         let mut core = AppCore::default();
         core.settings.scheduler_rule = "reset_soonest".to_string();
-        core.schedulers.insert(
-            "codex".to_string(),
-            ProviderSchedulerState {
-                current: Some(("codex-a.json".to_string(), Instant::now())),
-                target_label: Some("a@example.com".to_string()),
-                current_reset_at: None,
-                standby_count: 0,
-                failure_recheck_at: None,
-                exhausted: Default::default(),
-            },
-        );
+        core.schedulers.insert("codex".to_string(), codex_target_state());
 
         // 别的账号失败 / 目标成功:不触发。
         assert!(!core.scheduler_should_recheck_for_failures(&[
-            usage_event_for_test("b@example.com", true),
-            usage_event_for_test("a@example.com", false),
+            usage_event_status("b@example.com", 401),
+            usage_event_status("a@example.com", 200),
         ]));
-        // 目标失败:触发一次。
+
+        // 鉴权失败(401):目标第 1 次就触发。
         assert!(core
-            .scheduler_should_recheck_for_failures(&[usage_event_for_test("a@example.com", true)]));
-        // 冷却期内再失败:不重复触发。
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 401)]));
+        // 鉴权失败绕过 60s 冷却:紧接着 403 仍立即触发。
+        assert!(core
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 403)]));
+
+        // 非鉴权(5xx):前 2 次不切,第 3 次才切。
+        core.schedulers.insert("codex".to_string(), codex_target_state());
         assert!(!core
-            .scheduler_should_recheck_for_failures(&[usage_event_for_test("a@example.com", true)]));
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 500)]));
+        assert!(!core
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 500)]));
+        assert!(core
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 500)]));
+
+        // 非鉴权累计中途出现一次成功 → 连击清零,需重新累计 3 次。
+        core.schedulers.insert("codex".to_string(), codex_target_state());
+        assert!(!core.scheduler_should_recheck_for_failures(&[
+            usage_event_status("a@example.com", 500),
+            usage_event_status("a@example.com", 500),
+            usage_event_status("a@example.com", 200),
+        ]));
+        assert!(!core.scheduler_should_recheck_for_failures(&[
+            usage_event_status("a@example.com", 500),
+            usage_event_status("a@example.com", 500),
+        ]));
+
+        // 一个批次内直接攒够 3 次非鉴权失败:触发。
+        core.schedulers.insert("codex".to_string(), codex_target_state());
+        assert!(core.scheduler_should_recheck_for_failures(&[
+            usage_event_status("a@example.com", 500),
+            usage_event_status("a@example.com", 502),
+            usage_event_status("a@example.com", 503),
+        ]));
 
         // 规则关闭:永不触发。
         core.settings.scheduler_rule = "off".to_string();
-        core.schedulers.get_mut("codex").unwrap().failure_recheck_at = None;
+        core.schedulers.insert("codex".to_string(), codex_target_state());
         assert!(!core
-            .scheduler_should_recheck_for_failures(&[usage_event_for_test("a@example.com", true)]));
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 401)]));
     }
 
     #[test]
