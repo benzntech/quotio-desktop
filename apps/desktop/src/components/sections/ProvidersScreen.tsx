@@ -865,6 +865,9 @@ function ProviderCard({
   const beginRowDrag = (e: React.PointerEvent, file: string) => {
     if (isBusy || !order.get(file)) return;
     if ((e.target as HTMLElement).closest("button")) return; // 让行内按钮正常点击,不抢
+    // 关键:压掉 pointerdown 之后的 compatibility mousedown —— 否则 WebView2 无边框窗口
+    // 会把它当作窗体拖拽,和账号行拖拽打架。按钮区已在上面提前 return,不受影响。
+    e.preventDefault();
     dragRef.current = { file, startY: e.clientY, dragging: false, over: null };
   };
   const moveRowDrag = (e: React.PointerEvent) => {
