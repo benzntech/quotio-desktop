@@ -1544,20 +1544,29 @@ fn spawn_usage_collector(app: AppHandle) {
                 }
             }
 
-            // 智能调度（每 ~30s 查一次，纯内存判断）：当前账号的 5h 窗口到点
-            // 刷新后，提前重拉配额并重评估，不必干等前端的 5 分钟轮询。
+            // 智能调度（每 ~30s）：① 当前号 5h 窗口到点刷新（纯内存判断）→ 提前重评估;
+            // ② 主动探一次当前目标号的 token——过期/被禁就提前切,把「闲置一段时间后
+            // 首个请求」的报错也省掉(只探目标号、不全量,几乎不增上游负担)。
             if tick % 20 == 10 {
-                let due = app
+                let (due, targets, proxy_url) = app
                     .try_state::<DesktopState>()
                     .and_then(|state| {
-                        state
-                            .core
-                            .lock()
-                            .ok()
-                            .map(|core| core.scheduler_reset_due())
+                        state.core.lock().ok().map(|core| {
+                            (
+                                core.scheduler_reset_due(),
+                                core.scheduler_active_target_files(),
+                                core.proxy_upstream_url(),
+                            )
+                        })
                     })
-                    .unwrap_or(false);
-                if due {
+                    .unwrap_or((false, Vec::new(), None));
+                // 网络探测在锁外执行,不阻塞 UI 命令。None(网络抖动)不切,避免误判。
+                let target_unhealthy = targets.iter().any(|(provider_id, file)| {
+                    quotio_core::quota::fetch_quota_for_file(provider_id, file, proxy_url.as_deref())
+                        .map(|quota| quota.is_forbidden || quota.is_auth_failure())
+                        .unwrap_or(false)
+                });
+                if due || target_unhealthy {
                     refresh_quotas_and_reschedule(&app);
                 }
             }

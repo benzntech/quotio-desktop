@@ -667,6 +667,24 @@ impl AppCore {
         })
     }
 
+    /// 智能调度开启时,各服务商当前选中的目标账号文件 `(provider_id, file_name)`。
+    /// 后台主动健康探测用:只探这些目标号(不全量),过期/被禁就提前触发重选,
+    /// 把「闲置一段时间后首个请求」的报错也省掉。
+    pub fn scheduler_active_target_files(&self) -> Vec<(String, String)> {
+        if self.settings.scheduler_rule != "reset_soonest" {
+            return Vec::new();
+        }
+        self.schedulers
+            .iter()
+            .filter_map(|(provider_id, state)| {
+                state
+                    .current
+                    .as_ref()
+                    .map(|(file, _)| (provider_id.clone(), file.clone()))
+            })
+            .collect()
+    }
+
     /// 调度状态快照（给前端展示）。
     fn scheduler_status(&self) -> quotio_types::SchedulerStatus {
         let entries: Vec<quotio_types::ProviderSchedulerEntry> = self

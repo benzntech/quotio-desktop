@@ -120,6 +120,27 @@ pub fn fetch_all_quotas_streaming(
     quotas
 }
 
+/// 探测**单个**账号文件的配额(后台主动健康检查用:只打这一个号、不全量,避免给
+/// 上游 API 增负)。仅支持「每文件一账号」的 OAuth 服务商;其它(glm 共享密钥池 /
+/// trae 单账号 / cursor 监控)返回 None,让调用方退回反应式失败重选路径。
+pub fn fetch_quota_for_file(
+    provider_id: &str,
+    file_name: &str,
+    proxy_url: Option<&str>,
+) -> Option<AccountQuota> {
+    let path = auth_dir()?.join(file_name);
+    let agent = build_agent(proxy_url);
+    match provider_id {
+        "codex" => fetch_codex_one(&agent, &path, file_name),
+        "claude" => fetch_claude_one(&agent, &path, file_name),
+        "gemini-cli" | "gemini" => fetch_gemini_one(&agent, &path, file_name),
+        "github-copilot" | "copilot" => fetch_copilot_one(&agent, &path, file_name),
+        "kiro" => fetch_kiro_one(&agent, &path, file_name),
+        "antigravity" => fetch_antigravity_one(&agent, &path, file_name),
+        _ => None,
+    }
+}
+
 /// Format an epoch reset time (seconds or milliseconds) as a relative label.
 fn format_reset_epoch(value: f64) -> Option<String> {
     if value <= 0.0 {
