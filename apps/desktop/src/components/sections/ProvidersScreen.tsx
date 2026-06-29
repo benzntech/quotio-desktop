@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useMemo, memo, type ChangeEvent } from "react";
-import type { AccountAuthHealth, AppState, AuthFile, OAuthStatusResponse, OAuthUrlResponse, ProviderSummary } from "../../types";
+import { useState, useEffect, useRef, useMemo, useCallback, memo, type ChangeEvent } from "react";
+import type { AccountAuthHealth, AppState, AuthFile, OAuthStatusResponse, OAuthUrlResponse, ProviderSummary, SchedulerOrderItem } from "../../types";
 import { maskEmail, matchAuthFile } from "../../lib/format";
 import { EyeIcon, EyeOffIcon, PlusIcon, RefreshIcon, TrashIcon } from "../icons";
 import { useT } from "../../i18n";
@@ -244,6 +244,86 @@ export function ProvidersScreen({
     return extra.length > 0 ? [...proxyAuthFiles, ...extra] : proxyAuthFiles;
   }, [proxyAuthFiles, localAccounts]);
   const groups = useMemo(() => groupAccounts(authFiles, appState.providers), [authFiles, appState.providers]);
+  // 智能调度算出的「请求顺序」:file_name → 顺序项(全 provider 合并;file_name 全局唯一)。
+  // 仅智能调度(reset_soonest)开启时有数据,关闭时为空 → 不显示徽章。
+  const orderByFile = useMemo(() => {
+    const map = new Map<string, SchedulerOrderItem>();
+    if (appState.scheduler?.rule === "reset_soonest") {
+      for (const entry of appState.scheduler.providers ?? []) {
+        for (const item of entry.order ?? []) {
+          map.set(item.file_name, item);
+        }
+      }
+    }
+    return map;
+  }, [appState.scheduler]);
+
+  // 调整某账号在请求顺序里的位置(上移/下移/置顶/重置为自动)。基于当前调度顺序算出
+  // 新的完整文件名顺序,交给后端写 quotio_priority=1..N(reset = 空列表清掉优先级)。
+  const onReorderAccount = useCallback(
+    (fileName: string, op: "up" | "down" | "top" | "reset") => {
+      const sched = appState.scheduler;
+      if (sched?.rule !== "reset_soonest") return;
+      const entry = (sched.providers ?? []).find((e) =>
+        (e.order ?? []).some((i) => i.file_name === fileName),
+      );
+      if (!entry) return;
+      const ordered = [...(entry.order ?? [])]
+        .sort((a, b) => a.position - b.position)
+        .map((i) => i.file_name);
+      let next = ordered;
+      if (op === "reset") {
+        next = [];
+      } else {
+        const idx = ordered.indexOf(fileName);
+        if (idx < 0) return;
+        next = [...ordered];
+        if (op === "top") {
+          if (idx === 0) return;
+          next.splice(idx, 1);
+          next.unshift(fileName);
+        } else if (op === "up") {
+          if (idx === 0) return;
+          [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+        } else if (op === "down") {
+          if (idx >= next.length - 1) return;
+          [next[idx + 1], next[idx]] = [next[idx], next[idx + 1]];
+        }
+      }
+      onRunManagementStateAction("reorder_provider_accounts", {
+        providerId: entry.provider_id,
+        orderedFileNames: next,
+      });
+    },
+    [appState.scheduler, onRunManagementStateAction],
+  );
+
+  // 拖拽重排:把 dragged 号插到 target 号的位置。
+  const onReorderMove = useCallback(
+    (draggedFileName: string, targetFileName: string) => {
+      if (draggedFileName === targetFileName) return;
+      const sched = appState.scheduler;
+      if (sched?.rule !== "reset_soonest") return;
+      const entry = (sched.providers ?? []).find((e) =>
+        (e.order ?? []).some((i) => i.file_name === draggedFileName),
+      );
+      if (!entry) return;
+      const ordered = [...(entry.order ?? [])]
+        .sort((a, b) => a.position - b.position)
+        .map((i) => i.file_name);
+      const from = ordered.indexOf(draggedFileName);
+      const to = ordered.indexOf(targetFileName);
+      if (from < 0 || to < 0) return;
+      const next = [...ordered];
+      next.splice(from, 1);
+      next.splice(to, 0, draggedFileName);
+      onRunManagementStateAction("reorder_provider_accounts", {
+        providerId: entry.provider_id,
+        orderedFileNames: next,
+      });
+    },
+    [appState.scheduler, onRunManagementStateAction],
+  );
   // Accounts whose quota fetch hit a genuine auth failure (unrecoverable 401/403,
   // refresh failed, invalid key) — flagged by the backend with a fixed sentinel in
   // status_message. Unlike the proxy's recent-request health (which resets on
@@ -489,6 +569,9 @@ export function ProvidersScreen({
               isBusy={isManagementBusy}
               authFailedNames={authFailedNames}
               authHealth={authHealth}
+              order={orderByFile}
+              onReorder={onReorderAccount}
+              onReorderMove={onReorderMove}
               onDelete={(account) => onRunManagementStateAction("delete_management_auth_file", { name: account.name })}
               onReauth={reauthAccount}
               onAddAccount={() => {
@@ -745,36 +828,55 @@ function ProviderCard({
   isBusy,
   authFailedNames,
   authHealth,
+  order,
   onDelete,
   onReauth,
   onAddAccount,
   onExport,
   onDeleteAll,
   onToggleDisableAll,
+  onReorder,
+  onReorderMove,
 }: {
   group: AccountGroupData;
   isBusy: boolean;
   authFailedNames: Set<string>;
   authHealth: Map<string, AccountAuthHealth>;
+  order: Map<string, SchedulerOrderItem>;
   onDelete: (account: AuthFile) => void;
   onReauth: (account: AuthFile) => void;
   onAddAccount: () => void;
   onExport: () => void;
   onDeleteAll: () => void;
   onToggleDisableAll: () => void;
+  onReorder: (fileName: string, op: "up" | "down" | "top" | "reset") => void;
+  onReorderMove: (draggedFileName: string, targetFileName: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [draggingFile, setDraggingFile] = useState<string | null>(null);
+  const [dragOverFile, setDragOverFile] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const initial = group.label.trim().charAt(0).toUpperCase() || "?";
-  const accounts = group.accounts
-    .map((account) => ({
-      account,
-      needsReauth: accountState(account, authFailedNames.has(account.name), healthFor(account, authHealth)).needsReauth,
-    }))
-    .sort((a, b) => Number(b.needsReauth) - Number(a.needsReauth))
-    .map((entry) => entry.account);
+  const accounts =
+    order.size > 0
+      ? // 智能调度:按生效请求顺序排(无序号的绑定/用户禁用号垫后)。
+        [...group.accounts].sort(
+          (a, b) =>
+            (order.get(a.name)?.position ?? Number.MAX_SAFE_INTEGER) -
+            (order.get(b.name)?.position ?? Number.MAX_SAFE_INTEGER),
+        )
+      : group.accounts
+          .map((account) => ({
+            account,
+            needsReauth: accountState(account, authFailedNames.has(account.name), healthFor(account, authHealth)).needsReauth,
+          }))
+          .sort((a, b) => Number(b.needsReauth) - Number(a.needsReauth))
+          .map((entry) => entry.account);
+
+  const orderCount = accounts.filter((a) => order.get(a.name)).length;
+  const hasManualOrder = accounts.some((a) => order.get(a.name)?.priority != null);
 
   const goodCount = accounts.filter((a) => {
     const s = accountState(a, authFailedNames.has(a.name), healthFor(a, authHealth));
@@ -853,18 +955,64 @@ function ProviderCard({
       <span className="pv-card-meta">{group.accounts.length} 个账户</span>
 
       <div className="pv-card-accounts">
-        {previewAccounts.map((account) => (
-          <AccountRow
-            key={account.id}
-            account={account}
-            colorHex={group.colorHex}
-            isBusy={isBusy}
-            authFailed={authFailedNames.has(account.name)}
-            health={healthFor(account, authHealth)}
-            onDelete={() => onDelete(account)}
-            onReauth={() => onReauth(account)}
-          />
-        ))}
+        {previewAccounts.map((account) => {
+          const canDrag = !isBusy && !!order.get(account.name);
+          const isOver = dragOverFile === account.name && !!draggingFile && draggingFile !== account.name;
+          return (
+            <div
+              key={account.id}
+              draggable={canDrag}
+              onDragStart={
+                canDrag
+                  ? (e) => {
+                      setDraggingFile(account.name);
+                      e.dataTransfer.effectAllowed = "move";
+                    }
+                  : undefined
+              }
+              onDragOver={
+                canDrag
+                  ? (e) => {
+                      e.preventDefault();
+                      if (draggingFile && draggingFile !== account.name) setDragOverFile(account.name);
+                    }
+                  : undefined
+              }
+              onDragLeave={() => {
+                if (dragOverFile === account.name) setDragOverFile(null);
+              }}
+              onDrop={
+                canDrag
+                  ? (e) => {
+                      e.preventDefault();
+                      if (draggingFile) onReorderMove(draggingFile, account.name);
+                      setDraggingFile(null);
+                      setDragOverFile(null);
+                    }
+                  : undefined
+              }
+              onDragEnd={() => {
+                setDraggingFile(null);
+                setDragOverFile(null);
+              }}
+              className={`account-row-drag${draggingFile === account.name ? " account-row-drag--dragging" : ""}`}
+              style={isOver ? { boxShadow: `inset 0 2px 0 0 #${group.colorHex}`, borderRadius: "8px" } : undefined}
+            >
+              <AccountRow
+                account={account}
+                colorHex={group.colorHex}
+                isBusy={isBusy}
+                authFailed={authFailedNames.has(account.name)}
+                health={healthFor(account, authHealth)}
+                order={order.get(account.name)}
+                orderCount={orderCount}
+                onReorder={onReorder}
+                onDelete={() => onDelete(account)}
+                onReauth={() => onReauth(account)}
+              />
+            </div>
+          );
+        })}
       </div>
 
       {accounts.length > PREVIEW_COUNT ? (
@@ -873,6 +1021,19 @@ function ProviderCard({
             <svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", transition: "transform 0.2s", transform: expanded ? "rotate(180deg)" : "rotate(0)" }}>
               <path d="M2.5 4.5 6 8l3.5-3.5" />
             </svg>
+        </button>
+      ) : null}
+      {hasManualOrder ? (
+        <button
+          className="pv-order-reset"
+          type="button"
+          title="清除手动顺序,恢复按额度自动排"
+          onClick={() => {
+            const first = accounts.find((a) => order.get(a.name));
+            if (first) onReorder(first.name, "reset");
+          }}
+        >
+          ↺ 重置为自动顺序
         </button>
       ) : null}
     </div>
@@ -885,6 +1046,9 @@ type AccountRowProps = {
   isBusy: boolean;
   authFailed: boolean;
   health: AccountAuthHealth | undefined;
+  order?: SchedulerOrderItem;
+  orderCount: number;
+  onReorder: (fileName: string, op: "up" | "down" | "top" | "reset") => void;
   onDelete: () => void;
   onReauth: () => void;
 };
@@ -916,6 +1080,14 @@ function areAccountRowPropsEqual(a: AccountRowProps, b: AccountRowProps): boolea
   if (a.colorHex !== b.colorHex || a.isBusy !== b.isBusy || a.authFailed !== b.authFailed) {
     return false;
   }
+  if (
+    a.order?.position !== b.order?.position ||
+    a.order?.active !== b.order?.active ||
+    a.order?.eligible !== b.order?.eligible ||
+    a.orderCount !== b.orderCount
+  ) {
+    return false;
+  }
   if (healthSignature(a.health) !== healthSignature(b.health)) {
     return false;
   }
@@ -943,6 +1115,9 @@ const AccountRow = memo(function AccountRow({
   isBusy,
   authFailed,
   health,
+  order,
+  orderCount,
+  onReorder,
   onDelete,
   onReauth,
 }: AccountRowProps) {
@@ -954,6 +1129,16 @@ const AccountRow = memo(function AccountRow({
 
   return (
     <div className="account-row">
+      {order ? (
+        <span
+          className={`account-order-badge${order.active ? " account-order-badge--active" : order.eligible ? " account-order-badge--eligible" : " account-order-badge--skipped"}`}
+          style={order.active ? { background: `#${colorHex}`, borderColor: `#${colorHex}` } : { borderColor: `#${colorHex}`, color: `#${colorHex}` }}
+          title={order.active ? `当前激活 · 请求顺序 #${order.position}` : order.eligible ? `请求顺序 #${order.position}` : `请求顺序 #${order.position} · 暂不可用,本轮跳过`}
+          aria-label={`请求顺序 ${order.position}`}
+        >
+          {order.position}
+        </span>
+      ) : null}
       <span className="account-logo account-logo--sm" style={{ color: `#${colorHex}`, background: `#${colorHex}22` }} aria-hidden="true">
         {initial}
       </span>
@@ -964,6 +1149,13 @@ const AccountRow = memo(function AccountRow({
         <span className={`account-row-status account-row-status--${state.tone}`}>{t(state.key, state.fallback)}</span>
       </div>
       <div className="account-row-actions">
+        {order ? (
+          <div className="account-reorder">
+            <button className="reorder-btn" type="button" title="置顶" aria-label="置顶" disabled={isBusy || order.position <= 1} onClick={() => onReorder(account.name, "top")}>⤒</button>
+            <button className="reorder-btn" type="button" title="上移" aria-label="上移" disabled={isBusy || order.position <= 1} onClick={() => onReorder(account.name, "up")}>↑</button>
+            <button className="reorder-btn" type="button" title="下移" aria-label="下移" disabled={isBusy || order.position >= orderCount} onClick={() => onReorder(account.name, "down")}>↓</button>
+          </div>
+        ) : null}
         {state.needsReauth ? (
           <button className="account-reauth-btn" type="button" onClick={onReauth} disabled={isBusy}>
             {t("providers.reauth", "重新授权")}

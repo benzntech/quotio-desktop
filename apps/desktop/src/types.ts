@@ -53,11 +53,23 @@ export type AppSettings = {
   scheduler_switch_margin_minutes: number;
 };
 
+// Mirrors crates/quotio-types `SchedulerOrderItem`(请求顺序里的一项,给徽章用).
+export type SchedulerOrderItem = {
+  file_name: string;
+  key: string;
+  label: string;
+  position: number;
+  active: boolean;
+  eligible: boolean;
+  priority?: number | null;
+};
+
 export type ProviderSchedulerEntry = {
   provider_id: string;
   target_label: string | null;
   target_reset_at_unix: number | null;
   standby_count: number;
+  order?: SchedulerOrderItem[];
 };
 
 // Mirrors crates/quotio-types `SchedulerStatus`(智能账号调度状态).
@@ -189,6 +201,7 @@ export type AuthFile = {
   quotio_scheduler_standby?: boolean | null;
   quotio_health_isolated?: boolean | null;
   quotio_health_isolated_reason?: string | null;
+  quotio_priority?: number | null;
   active_in_ide?: boolean | null;
   success?: number | null;
   failed?: number | null;

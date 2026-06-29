@@ -1386,6 +1386,26 @@ impl Default for ManagementSnapshot {
     }
 }
 
+/// 一个账号在某服务商「请求顺序」里的一项(给前端画圆圈数字徽章)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SchedulerOrderItem {
+    /// 账号文件名(与 `AuthFile.name` 对应,前端据此匹配)。
+    pub file_name: String,
+    /// 清洗名(去前缀/后缀)。
+    pub key: String,
+    /// 展示名(email)。
+    pub label: String,
+    /// 1 起的顺序位置(圆圈里的数字)。
+    pub position: u32,
+    /// 是否当前激活号(徽章高亮)。
+    pub active: bool,
+    /// 当前是否可用(false = 额度耗尽/需重登等 → 徽章变暗、本轮跳过)。
+    pub eligible: bool,
+    /// 手动优先级(设了的话);前端用来区分「手动定的」与「自动排的」。
+    pub priority: Option<u32>,
+}
+
 /// 单个服务商的调度状态。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
@@ -1397,6 +1417,8 @@ pub struct ProviderSchedulerEntry {
     pub target_reset_at_unix: Option<i64>,
     /// 被调度临时禁用（待命）的账号数。
     pub standby_count: u32,
+    /// 该服务商账号的请求顺序(已排好序;前端按 `file_name` 匹配画徽章)。
+    pub order: Vec<SchedulerOrderItem>,
 }
 
 /// 智能账号调度的当前状态（给前端展示）。

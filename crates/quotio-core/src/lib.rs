@@ -120,6 +120,8 @@ struct ProviderSchedulerState {
     /// 账号 key → 因额度耗尽(余量 ≤ 3%)被踢出可选集的账号。带迟滞:余量回到
     /// > 5%(刷新后)才移除。避免在阈值边界反复横跳。
     exhausted: std::collections::HashSet<String>,
+    /// 上一轮算出的请求顺序(给前端画徽章;每次 reconcile 刷新)。
+    order: Vec<quotio_types::SchedulerOrderItem>,
 }
 
 /// Codex 监控的进程探测目标。由 [`AppCore::codex_monitor_probe`] 在锁内产出，
@@ -549,6 +551,7 @@ impl AppCore {
                     failure_recheck_at: None,
                     consecutive_target_failures: 0,
                     exhausted: Default::default(),
+                    order: Vec::new(),
                 });
 
             // 额度耗尽迟滞:把余量 ≤3% 的号踢出可选(状态记在 state.exhausted,余量
@@ -567,6 +570,8 @@ impl AppCore {
                 state.target_label = None;
                 state.current_reset_at = None;
                 state.standby_count = 0;
+                // 无可用目标也展示顺序(全部变暗、无激活号)。
+                state.order = scheduler::build_order(&pool, &candidates, None);
                 any_changed |= changed;
                 continue;
             };
@@ -587,6 +592,7 @@ impl AppCore {
             state.target_label = picked.map(|c| c.label.clone());
             state.current_reset_at = picked.and_then(|c| c.session_reset_at);
             state.standby_count = standby_count;
+            state.order = scheduler::build_order(&pool, &candidates, Some(&target));
             any_changed |= target_changed || pool_changed;
         }
         any_changed
@@ -695,6 +701,7 @@ impl AppCore {
                 target_label: state.target_label.clone(),
                 target_reset_at_unix: state.current_reset_at,
                 standby_count: state.standby_count,
+                order: state.order.clone(),
             })
             .collect();
         let first = entries.first();
@@ -4537,6 +4544,7 @@ mod tests {
             failure_recheck_at: None,
             consecutive_target_failures: 0,
             exhausted: Default::default(),
+            order: Vec::new(),
         }
     }
 

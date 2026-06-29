@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use quotio_types::AccountQuota;
+use quotio_types::{AccountQuota, SchedulerOrderItem};
 use serde_json::Value;
 
 use crate::codex_launch;
@@ -30,6 +30,8 @@ pub(crate) const HEALTH_ISOLATED_FIELD: &str = "quotio_health_isolated";
 const HEALTH_ISOLATED_REASON_FIELD: &str = "quotio_health_isolated_reason";
 /// Codex 一键启动绑定标记（codex_launch 写入），带它的账号调度器不碰。
 const BOUND_FIELD: &str = "quotio_bound_login_only";
+/// 用户手动指定的请求优先级(整数,越小越先选);无 = 自动档(按 reset-soonest 排)。
+const PRIORITY_FIELD: &str = "quotio_priority";
 
 /// 池中一个 auth 文件的调度视角。
 #[derive(Debug, Clone)]
@@ -47,6 +49,8 @@ pub struct PoolFile {
     pub health_isolated_reason: Option<String>,
     /// 是否被 Codex 一键启动绑定占用。
     pub bound: bool,
+    /// 用户手动请求优先级(越小越先);None = 自动档。
+    pub priority: Option<u32>,
 }
 
 impl PoolFile {
@@ -68,6 +72,8 @@ pub struct Candidate {
     pub weekly_remaining: f64,
     /// 是否可被选为目标（打满/鉴权失败/用户禁用/绑定占用 → false）。
     pub eligible: bool,
+    /// 用户手动请求优先级(越小越先);None = 自动档(按 reset-soonest 排)。
+    pub priority: Option<u32>,
 }
 
 fn key_for_provider_file(file_name: &str, prefix: &str) -> String {
@@ -121,6 +127,10 @@ pub fn read_pool_for_provider(dir: &Path, provider_id: &str) -> Vec<PoolFile> {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             bound: flag(BOUND_FIELD),
+            priority: value
+                .get(PRIORITY_FIELD)
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
         });
     }
     pool.sort_by(|a, b| a.file_name.cmp(&b.file_name));
@@ -204,6 +214,7 @@ pub fn build_candidates(
                 session_reset_at,
                 weekly_remaining,
                 eligible,
+                priority: file.priority,
             }
         })
         .collect()
@@ -242,22 +253,31 @@ pub fn apply_exhaustion_hysteresis(
     exhausted.retain(|k| present.contains(k.as_str()));
 }
 
-/// 排序键：活跃窗口在前（按刷新时间升序），闲置垫后；平手看 Weekly 剩余多者优先。
-fn rank(candidate: &Candidate) -> (u8, i64, i64, String) {
-    match candidate.session_reset_at {
-        Some(reset) => (
-            0,
-            reset,
-            -(candidate.weekly_remaining.round() as i64),
-            candidate.key.clone(),
-        ),
-        None => (
-            1,
-            i64::MAX,
-            -(candidate.weekly_remaining.round() as i64),
-            candidate.key.clone(),
-        ),
+/// 手动优先级排序键:设了的在前(0)、按数值升序;没设的(1)排其后。
+/// 单独抽出,pick_target 用它判断「best 是否被手动优先级严格更偏好」。
+fn priority_rank(candidate: &Candidate) -> (u8, u32) {
+    match candidate.priority {
+        Some(p) => (0, p),
+        None => (1, 0),
     }
+}
+
+/// 排序键：① 手动优先级最先（设了的在前、升序）；② 再活跃窗口在前（按刷新时间升序），
+/// 闲置垫后；③ 平手看 Weekly 剩余多者优先。
+fn rank(candidate: &Candidate) -> (u8, u32, u8, i64, i64, String) {
+    let (has_priority, priority) = priority_rank(candidate);
+    let (window, reset) = match candidate.session_reset_at {
+        Some(reset) => (0, reset),
+        None => (1, i64::MAX),
+    };
+    (
+        has_priority,
+        priority,
+        window,
+        reset,
+        -(candidate.weekly_remaining.round() as i64),
+        candidate.key.clone(),
+    )
 }
 
 /// 纯函数规则引擎：从候选里选目标（返回文件名）。
@@ -279,6 +299,11 @@ pub fn pick_target(
             if best.file_name == current.file_name {
                 return Some(current.file_name.clone());
             }
+            // 手动优先级是硬偏好:best 的优先级严格高于当前号 → 立即切,不受
+            // min-hold / 切换余量限制(防抖只在同档/自动档内防 reset 边界抖动)。
+            if priority_rank(best) < priority_rank(current) {
+                return Some(best.file_name.clone());
+            }
             if held < min_hold {
                 return Some(current.file_name.clone());
             }
@@ -296,6 +321,36 @@ pub fn pick_target(
         }
     }
     Some(best.file_name.clone())
+}
+
+/// 计算某服务商的「请求顺序」(给前端画圆圈数字徽章):把**参与轮换**的号(排除绑定
+/// 占用 + 用户手动禁用)按 rank 排好,标出 1 起的位置、是否激活、是否可用、手动优先级。
+/// `pool` 与 `candidates` 同序一一对应(build_candidates 是 1:1 映射)。
+pub fn build_order(
+    pool: &[PoolFile],
+    candidates: &[Candidate],
+    active_file: Option<&str>,
+) -> Vec<SchedulerOrderItem> {
+    let mut rotation: Vec<&Candidate> = pool
+        .iter()
+        .zip(candidates.iter())
+        .filter(|(file, _)| !file.bound && !file.user_disabled())
+        .map(|(_, candidate)| candidate)
+        .collect();
+    rotation.sort_by(|a, b| rank(a).cmp(&rank(b)));
+    rotation
+        .iter()
+        .enumerate()
+        .map(|(idx, candidate)| SchedulerOrderItem {
+            file_name: candidate.file_name.clone(),
+            key: candidate.key.clone(),
+            label: candidate.label.clone(),
+            position: (idx + 1) as u32,
+            active: active_file == Some(candidate.file_name.as_str()),
+            eligible: candidate.eligible,
+            priority: candidate.priority,
+        })
+        .collect()
 }
 
 /// 守门执行：让池子里只有 `target_file` 可用。
@@ -514,6 +569,41 @@ fn set_health_isolated(path: &Path, isolated: bool, reason: Option<&str>) -> Res
     codex_launch::write_proxy_account_to(path, &value)
 }
 
+/// 按给定文件名顺序把 `quotio_priority` 写成 1..N(用户手动请求顺序)。空列表 = 全部
+/// 清掉优先级(恢复自动顺序)。同时清掉该服务商里没在列表中的残留优先级。返回是否有改动。
+pub fn reorder_provider_in(dir: &Path, provider_id: &str, ordered_file_names: &[String]) -> bool {
+    let mut changed = false;
+    let listed: std::collections::HashSet<&str> =
+        ordered_file_names.iter().map(String::as_str).collect();
+    for (idx, file_name) in ordered_file_names.iter().enumerate() {
+        changed |= set_priority(&dir.join(file_name), Some((idx + 1) as u32)).is_ok();
+    }
+    // 列表外仍带优先级的(理论上只有 bound / 用户手动禁用,或刚被移出列表的)→ 清掉。
+    for file in read_pool_for_provider(dir, provider_id) {
+        if file.priority.is_some() && !listed.contains(file.file_name.as_str()) {
+            changed |= set_priority(&dir.join(&file.file_name), None).is_ok();
+        }
+    }
+    changed
+}
+
+/// 写 / 删单个账号的手动优先级,保留其它字段(原子写)。
+fn set_priority(path: &Path, priority: Option<u32>) -> Result<(), String> {
+    let mut value = codex_launch::read_proxy_account_from(path)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("账号文件不是 JSON 对象: {}", path.display()))?;
+    match priority {
+        Some(p) => {
+            object.insert(PRIORITY_FIELD.to_string(), Value::from(p));
+        }
+        None => {
+            object.remove(PRIORITY_FIELD);
+        }
+    }
+    codex_launch::write_proxy_account_to(path, &value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +626,7 @@ mod tests {
             session_reset_at,
             weekly_remaining,
             eligible,
+            priority: None,
         }
     }
 
@@ -680,6 +771,129 @@ mod tests {
     }
 
     #[test]
+    fn manual_priority_orders_first_and_preempts_current_immediately() {
+        let prio = |key: &str, reset: Option<i64>, priority: Option<u32>| {
+            let mut c = candidate(key, reset, 50.0, true);
+            c.priority = priority;
+            c
+        };
+
+        // a 无优先级但窗口最早;b 设了优先级 1 → b 排第一(优先级优先于 reset-soonest)。
+        let candidates = vec![prio("a", Some(1_000), None), prio("b", Some(9_000), Some(1))];
+        assert_eq!(
+            pick_target(&candidates, None, HOLD, MARGIN).as_deref(),
+            Some("codex-b.json"),
+            "手动优先级 1 的号应优先于窗口更早的自动号"
+        );
+
+        // 当前在自动号 a、b 设了优先级 → 即使没到 min-hold 也立即切到 b(硬偏好)。
+        let held_short = Some(("codex-a.json", Duration::from_secs(1)));
+        assert_eq!(
+            pick_target(&candidates, held_short, HOLD, MARGIN).as_deref(),
+            Some("codex-b.json"),
+            "更高手动优先级应绕过 min-hold 立即切"
+        );
+
+        // 都设了优先级:数值小的在前。
+        let candidates = vec![prio("a", Some(1_000), Some(2)), prio("b", Some(9_000), Some(1))];
+        assert_eq!(
+            pick_target(&candidates, None, HOLD, MARGIN).as_deref(),
+            Some("codex-b.json")
+        );
+
+        // 最高优先级(b=1)不可用 → 跳过,激活下一个可用(a=2)。
+        let mut candidates =
+            vec![prio("a", Some(1_000), Some(2)), prio("b", Some(9_000), Some(1))];
+        candidates[1].eligible = false;
+        assert_eq!(
+            pick_target(&candidates, None, HOLD, MARGIN).as_deref(),
+            Some("codex-a.json"),
+            "最高优先级号不可用时跳过,激活下一个可用号"
+        );
+    }
+
+    #[test]
+    fn reorder_writes_priority_and_empty_list_resets() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_reorder_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        for name in ["codex-a.json", "codex-b.json", "codex-c.json"] {
+            std::fs::write(dir.join(name), format!("{{{base}}}")).unwrap();
+        }
+
+        // 顺序定为 b, a(c 不在列表 → 保持无优先级/自动档)。
+        assert!(reorder_provider_in(
+            &dir,
+            "codex",
+            &["codex-b.json".to_string(), "codex-a.json".to_string()],
+        ));
+        let by = |name: &str| {
+            read_pool(&dir)
+                .into_iter()
+                .find(|f| f.file_name == name)
+                .unwrap()
+        };
+        assert_eq!(by("codex-b.json").priority, Some(1));
+        assert_eq!(by("codex-a.json").priority, Some(2));
+        assert_eq!(by("codex-c.json").priority, None);
+
+        // 空列表 = 重置为自动:清掉全部优先级。
+        assert!(reorder_provider_in(&dir, "codex", &[]));
+        assert!(read_pool(&dir).iter().all(|f| f.priority.is_none()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_order_numbers_rotation_and_skips_bound_and_user_disabled() {
+        let pool_file = |key: &str, disabled: bool, bound: bool, priority: Option<u32>| PoolFile {
+            file_name: format!("codex-{key}.json"),
+            key: key.to_string(),
+            disabled,
+            standby: false,
+            health_isolated: false,
+            health_isolated_reason: None,
+            bound,
+            priority,
+        };
+        let cand = |key: &str, reset: Option<i64>, eligible: bool, priority: Option<u32>| {
+            let mut c = candidate(key, reset, 50.0, eligible);
+            c.priority = priority;
+            c
+        };
+        // a:自动可用;pinned:手动优先级 1;off:用户禁用;bound:绑定占用。pool 与 candidates 同序。
+        let pool = vec![
+            pool_file("a", false, false, None),
+            pool_file("pinned", false, false, Some(1)),
+            pool_file("off", true, false, None),
+            pool_file("bound", true, true, None),
+        ];
+        let candidates = vec![
+            cand("a", Some(2_000), true, None),
+            cand("pinned", Some(9_000), true, Some(1)),
+            cand("off", None, false, None),
+            cand("bound", None, false, None),
+        ];
+
+        let order = build_order(&pool, &candidates, Some("codex-pinned.json"));
+        let names: Vec<&str> = order.iter().map(|o| o.file_name.as_str()).collect();
+        // 只含轮换号;绑定 + 用户禁用被排除;优先级 1 的 pinned 排第一。
+        assert_eq!(names, vec!["codex-pinned.json", "codex-a.json"]);
+        assert_eq!(order[0].position, 1);
+        assert!(order[0].active, "激活号徽章应标 active");
+        assert_eq!(order[0].priority, Some(1));
+        assert_eq!(order[1].position, 2);
+        assert!(!order[1].active);
+    }
+
+    #[test]
     fn build_candidates_joins_quota_and_normalizes_expired_window() {
         let pool = vec![
             PoolFile {
@@ -690,6 +904,7 @@ mod tests {
                 health_isolated: false,
                 health_isolated_reason: None,
                 bound: false,
+                priority: None,
             },
             PoolFile {
                 file_name: "codex-b.json".into(),
@@ -699,6 +914,7 @@ mod tests {
                 health_isolated: false,
                 health_isolated_reason: None,
                 bound: false,
+                priority: None,
             },
         ];
         let quota = |key: &str, reset: Option<i64>, forbidden: bool| AccountQuota {

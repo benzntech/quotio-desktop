@@ -3589,6 +3589,97 @@ h3 {
   background: rgba(118, 118, 128, 0.05);
 }
 
+/* 请求顺序徽章:圆圈数字。激活=实心高亮(provider 色),候补=描边,不可用=虚线半透明。 */
+.account-order-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 19px;
+  height: 19px;
+  border-radius: 50%;
+  border: 1.5px solid;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.account-order-badge--active {
+  color: #fff;
+}
+
+.account-order-badge--skipped {
+  border-style: dashed;
+  opacity: 0.4;
+}
+
+/* 请求顺序调整:↑ ↓ 置顶 小按钮(悬停账号行时出现)。 */
+.account-reorder {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.account-row:hover .account-reorder {
+  opacity: 1;
+}
+
+.reorder-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  color: var(--quotio-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.reorder-btn:hover:not(:disabled) {
+  background: rgba(118, 118, 128, 0.12);
+  color: var(--quotio-text);
+}
+
+.reorder-btn:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+.pv-order-reset {
+  margin-top: 6px;
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  color: var(--quotio-muted);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 5px;
+}
+
+.pv-order-reset:hover {
+  background: rgba(118, 118, 128, 0.1);
+  color: var(--quotio-text);
+}
+
+.account-row-drag[draggable="true"] {
+  cursor: grab;
+}
+
+.account-row-drag--dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
 .account-row-info {
   display: grid;
   gap: 1px;

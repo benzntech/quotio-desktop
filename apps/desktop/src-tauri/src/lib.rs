@@ -1230,6 +1230,26 @@ async fn set_management_auth_file_disabled(
     refresh_snapshot_with_client(&state, client, "无法刷新账号状态更新后的状态").await
 }
 
+/// 调整某服务商账号的请求顺序:按 `ordered_file_names` 写 quotio_priority=1..N
+/// (空列表 = 重置为自动顺序),随即重跑一轮调度让激活号按新优先级更新。
+#[tauri::command]
+async fn reorder_provider_accounts(
+    provider_id: String,
+    ordered_file_names: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<AppState, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = quotio_platform::proxy_auth_dir();
+        let mut core = lock_core(&core);
+        quotio_core::scheduler::reorder_provider_in(&dir, &provider_id, &ordered_file_names);
+        core.scheduler_reconcile();
+        core.app_state()
+    })
+    .await
+    .map_err(|error| format!("调整账号顺序任务异常：{}", error))
+}
+
 #[tauri::command]
 async fn delete_management_auth_file(
     name: String,
@@ -1832,6 +1852,7 @@ pub fn run() {
             delete_management_api_key,
             delete_management_api_key_by_index,
             set_management_auth_file_disabled,
+            reorder_provider_accounts,
             delete_management_auth_file,
             delete_all_management_auth_files,
             start_management_oauth,
