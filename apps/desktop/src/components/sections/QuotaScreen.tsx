@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import type { AccountQuota, AppSettings, AppState, AuthFile, ProviderSummary, QuotaModelUsage } from "../../types";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { AccountQuota, AppSettings, AppState, AuthFile, ProviderSummary, QuotaModelUsage, SchedulerOrderItem } from "../../types";
 import { maskEmail, quotaTone, parsePlan, parseResetCredits, planTier, matchAuthFile } from "../../lib/format";
 import { RefreshIcon } from "../icons";
 import { HealthDots } from "../HealthDots";
@@ -43,6 +43,43 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
   const [activeId, setActiveId] = useState<string | null>(null);
   const active = groups.find((group) => group.id === activeId) ?? groups[0] ?? null;
   const activeCustom = customProviders.find((cp) => `cp:${cp.id}` === activeId) ?? null;
+
+  // 排序型调度(智能调度 / 顺序故障转移)算出的请求顺序:file_name → 顺序项。用来把额度
+  // 卡片按该顺序排 + 画圆圈序号徽章;关闭调度时为空,卡片保持原序、无徽章。
+  const orderByFile = useMemo(() => {
+    const map = new Map<string, SchedulerOrderItem>();
+    const sched = appState.scheduler;
+    if (sched && (sched.rule === "reset_soonest" || sched.rule === "priority_failover")) {
+      for (const entry of sched.providers ?? []) {
+        for (const item of entry.order ?? []) map.set(item.file_name, item);
+      }
+    }
+    return map;
+  }, [appState.scheduler]);
+
+  const orderForAccount = useCallback(
+    (account: AccountQuota): SchedulerOrderItem | null => {
+      if (orderByFile.size === 0) return null;
+      const file = matchAuthFile(account, authFiles);
+      return (file && orderByFile.get(file.name)) || null;
+    },
+    [orderByFile, authFiles],
+  );
+
+  // 故障转移 / 智能调度开启时,额度卡片按请求顺序排(无序号的绑定号垫后)。每账号只匹配
+  // 一次、预存位置,避免在比较器里反复跑 matchAuthFile。
+  const sortedAccounts = useMemo(() => {
+    const accounts = active?.accounts ?? [];
+    if (orderByFile.size === 0) return accounts;
+    const positionByKey = new Map(
+      accounts.map((a) => [a.account_key, orderForAccount(a)?.position ?? Number.MAX_SAFE_INTEGER]),
+    );
+    return [...accounts].sort(
+      (a, b) =>
+        (positionByKey.get(a.account_key) ?? Number.MAX_SAFE_INTEGER) -
+        (positionByKey.get(b.account_key) ?? Number.MAX_SAFE_INTEGER),
+    );
+  }, [active, orderByFile, orderForAccount]);
   // Heuristic proxy-unreachable hint: a refresh finished but every account came
   // back blank (no quota, not exhausted, not auth-failed) — almost always the
   // upstream proxy being wrong/down rather than a real per-account state.
@@ -138,11 +175,13 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
             <CustomProviderKeyPool provider={activeCustom} />
           ) : (
           <div className="quota-accounts">
-            {active?.accounts.map((account) => (
+            {sortedAccounts.map((account) => (
               <AccountQuotaCard
                 key={account.account_key}
                 account={account}
                 authFiles={authFiles}
+                order={orderForAccount(account)}
+                colorHex={active?.colorHex ?? "8a8a8e"}
                 onRefreshQuotas={onRefreshQuotas}
               />
             ))}
@@ -309,10 +348,14 @@ function SchedulerCard({
 function AccountQuotaCard({
   account,
   authFiles,
+  order,
+  colorHex,
   onRefreshQuotas,
 }: {
   account: AccountQuota;
   authFiles: AuthFile[];
+  order?: SchedulerOrderItem | null;
+  colorHex?: string;
   onRefreshQuotas: () => void;
 }) {
   const t = useT();
@@ -367,6 +410,16 @@ function AccountQuotaCard({
   return (
     <article className="panel quota-card">
       <div className="quota-card-head">
+        {order ? (
+          <span
+            className={`account-order-badge${order.active ? " account-order-badge--active" : order.eligible ? " account-order-badge--eligible" : " account-order-badge--skipped"}`}
+            style={order.active ? { background: `#${colorHex}`, borderColor: `#${colorHex}` } : { borderColor: `#${colorHex}`, color: `#${colorHex}` }}
+            title={order.active ? `当前主用 · 请求顺序 #${order.position}` : order.eligible ? `请求顺序 #${order.position}` : `请求顺序 #${order.position} · 暂不可用,本轮跳过`}
+            aria-label={`请求顺序 ${order.position}`}
+          >
+            {order.position}
+          </span>
+        ) : null}
         {plan ? (
           <span className={planClass}>{plan.toUpperCase()}</span>
         ) : account.account_type ? (
