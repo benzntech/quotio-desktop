@@ -226,8 +226,23 @@ function SchedulerCard({
     return p?.display_name ?? activeProviderId;
   }, [activeProviderId, appState.providers]);
 
+  // 切换中的目标模式(为空 = 没在切)。切到 failover 要写 config + 重启代理 ~2-3 秒,
+  // saveSettings 非乐观更新(等后端跑完才刷 appState),这期间给被点的按钮转圈、其它禁用。
+  const [switchingTo, setSwitchingTo] = useState<string | null>(null);
+  useEffect(() => {
+    // 后端跑完、rule 已切到目标 → 清掉 loading。
+    if (switchingTo && rule === switchingTo) setSwitchingTo(null);
+  }, [rule, switchingTo]);
+  useEffect(() => {
+    // 兜底:后端异常没切过去也别让转圈卡死。
+    if (!switchingTo) return;
+    const timer = window.setTimeout(() => setSwitchingTo(null), 15000);
+    return () => window.clearTimeout(timer);
+  }, [switchingTo]);
+
   function selectMode(mode: "off" | "reset_soonest" | "priority_failover") {
-    if (mode === rule) return;
+    if (mode === rule || switchingTo) return;
+    setSwitchingTo(mode);
     const isFailover = mode === "priority_failover";
     // 顺序故障转移要让代理按 attributes.priority 顺位用号 → fill-first;其余模式回 round-robin。
     // 同时该模式要关掉冷却(坏号只临时绕过、不被惩罚性冷落,否则一次 5xx 就把高优先级号锁死最长
@@ -353,9 +368,11 @@ function SchedulerCard({
             <button
               key={m.id}
               type="button"
-              className={`scheduler-mode-btn${rule === m.id ? " is-active" : ""}`}
+              className={`scheduler-mode-btn${rule === m.id ? " is-active" : ""}${switchingTo === m.id ? " is-loading" : ""}`}
               onClick={() => selectMode(m.id)}
+              disabled={switchingTo !== null}
             >
+              {switchingTo === m.id ? <span className="scheduler-mode-spinner" aria-hidden="true" /> : null}
               {m.label}
             </button>
           ))}

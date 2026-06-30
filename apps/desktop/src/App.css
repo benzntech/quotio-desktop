@@ -2368,6 +2368,34 @@ h3 {
   color: #fff;
 }
 
+/* 切换中:被点的按钮转圈 + 全部禁用(非当前的淡一点提示不可点)。 */
+.scheduler-mode-btn:disabled {
+  cursor: default;
+}
+.scheduler-mode-btn:disabled:not(.is-active):not(.is-loading) {
+  opacity: 0.45;
+}
+.scheduler-mode-btn.is-loading {
+  display: inline-flex;
+  align-items: center;
+  color: #4f46e5;
+}
+.scheduler-mode-spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 5px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: scheduler-mode-spin 0.6s linear infinite;
+}
+@keyframes scheduler-mode-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .scheduler-desc {
   margin: 0;
   font-size: 12px;
