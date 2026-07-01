@@ -1054,7 +1054,17 @@ mod tests {
     #[test]
     fn usage_timeseries_groups_by_twenty_minute_windows() {
         let store = UsageStore::open_in_memory();
-        let base = 1_764_633_600_000;
+        let local_offset_ms: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (strftime('%s', 'now', 'localtime') - strftime('%s', 'now')) * 1000",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let base = 1_764_633_600_000 - local_offset_ms;
         store.insert_events(&[
             event(
                 "ts-20-a",

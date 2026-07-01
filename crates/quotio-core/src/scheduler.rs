@@ -17,15 +17,25 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-use quotio_types::AccountQuota;
+use quotio_types::{AccountQuota, SchedulerOrderItem};
 use serde_json::Value;
 
 use crate::codex_launch;
 
 /// 调度器临时禁用（待命）标记，写在账号 auth JSON 里，可还原。
 pub(crate) const STANDBY_FIELD: &str = "quotio_scheduler_standby";
+/// 账号健康隔离标记：401/403/auth_failed 时即使未启用智能调度也临时禁用。
+pub(crate) const HEALTH_ISOLATED_FIELD: &str = "quotio_health_isolated";
+/// 健康隔离原因标记："auth"(需重新授权)/"quota"(额度耗尽,等刷新)——供 UI 区分提示。
+const HEALTH_ISOLATED_REASON_FIELD: &str = "quotio_health_isolated_reason";
 /// Codex 一键启动绑定标记（codex_launch 写入），带它的账号调度器不碰。
 const BOUND_FIELD: &str = "quotio_bound_login_only";
+/// 用户手动指定的请求优先级(整数,越小越先选);无 = 自动档(按 reset-soonest 排)。
+const PRIORITY_FIELD: &str = "quotio_priority";
+/// CLIProxyAPI 认的优先级字段:**auth 文件【顶层】键**(和 `disabled` 同级,不是嵌在
+/// `attributes` 里!源码 `synthesizer/file.go` 读的是 `metadata["priority"]` = 顶层 priority,
+/// `selector.go` 取 priority 最大那组先用、组内按 ID 字母序)。数字大 = 先用,默认 0。
+const PROXY_PRIORITY_FIELD: &str = "priority";
 
 /// 池中一个 auth 文件的调度视角。
 #[derive(Debug, Clone)]
@@ -37,14 +47,22 @@ pub struct PoolFile {
     pub disabled: bool,
     /// 是否调度器自己标记的临时禁用。
     pub standby: bool,
+    /// 是否因账号健康失败被临时隔离。
+    pub health_isolated: bool,
+    /// 健康隔离原因："auth" / "quota" / None(未隔离或升级前的旧文件)。
+    pub health_isolated_reason: Option<String>,
     /// 是否被 Codex 一键启动绑定占用。
     pub bound: bool,
+    /// 用户手动请求优先级(越小越先);None = 自动档。
+    pub priority: Option<u32>,
+    /// 代理(CLIProxyAPI)读的【顶层】`priority`(数字大=先用,和 disabled 同级);failover 模式写入。
+    pub proxy_priority: Option<u32>,
 }
 
 impl PoolFile {
     /// 用户手动禁用（不是调度器禁的）——调度器永远不碰。
     fn user_disabled(&self) -> bool {
-        self.disabled && !self.standby
+        self.disabled && !self.standby && !self.health_isolated
     }
 }
 
@@ -60,6 +78,8 @@ pub struct Candidate {
     pub weekly_remaining: f64,
     /// 是否可被选为目标（打满/鉴权失败/用户禁用/绑定占用 → false）。
     pub eligible: bool,
+    /// 用户手动请求优先级(越小越先);None = 自动档(按 reset-soonest 排)。
+    pub priority: Option<u32>,
 }
 
 fn key_for_provider_file(file_name: &str, prefix: &str) -> String {
@@ -107,7 +127,22 @@ pub fn read_pool_for_provider(dir: &Path, provider_id: &str) -> Vec<PoolFile> {
             file_name,
             disabled: flag("disabled"),
             standby: flag(STANDBY_FIELD),
+            health_isolated: flag(HEALTH_ISOLATED_FIELD),
+            health_isolated_reason: value
+                .get(HEALTH_ISOLATED_REASON_FIELD)
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             bound: flag(BOUND_FIELD),
+            priority: value
+                .get(PRIORITY_FIELD)
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+            // 顶层 `priority`(代理读这个)。代理写 / 接受数字或纯数字字符串,这里两者都认。
+            proxy_priority: value.get(PROXY_PRIORITY_FIELD).and_then(|p| {
+                p.as_u64()
+                    .map(|n| n as u32)
+                    .or_else(|| p.as_str().and_then(|s| s.trim().parse::<u32>().ok()))
+            }),
         });
     }
     pool.sort_by(|a, b| a.file_name.cmp(&b.file_name));
@@ -191,6 +226,7 @@ pub fn build_candidates(
                 session_reset_at,
                 weekly_remaining,
                 eligible,
+                priority: file.priority,
             }
         })
         .collect()
@@ -229,22 +265,31 @@ pub fn apply_exhaustion_hysteresis(
     exhausted.retain(|k| present.contains(k.as_str()));
 }
 
-/// 排序键：活跃窗口在前（按刷新时间升序），闲置垫后；平手看 Weekly 剩余多者优先。
-fn rank(candidate: &Candidate) -> (u8, i64, i64, String) {
-    match candidate.session_reset_at {
-        Some(reset) => (
-            0,
-            reset,
-            -(candidate.weekly_remaining.round() as i64),
-            candidate.key.clone(),
-        ),
-        None => (
-            1,
-            i64::MAX,
-            -(candidate.weekly_remaining.round() as i64),
-            candidate.key.clone(),
-        ),
+/// 手动优先级排序键:设了的在前(0)、按数值升序;没设的(1)排其后。
+/// 单独抽出,pick_target 用它判断「best 是否被手动优先级严格更偏好」。
+fn priority_rank(candidate: &Candidate) -> (u8, u32) {
+    match candidate.priority {
+        Some(p) => (0, p),
+        None => (1, 0),
     }
+}
+
+/// 排序键：① 手动优先级最先（设了的在前、升序）；② 再活跃窗口在前（按刷新时间升序），
+/// 闲置垫后；③ 平手看 Weekly 剩余多者优先。
+fn rank(candidate: &Candidate) -> (u8, u32, u8, i64, i64, String) {
+    let (has_priority, priority) = priority_rank(candidate);
+    let (window, reset) = match candidate.session_reset_at {
+        Some(reset) => (0, reset),
+        None => (1, i64::MAX),
+    };
+    (
+        has_priority,
+        priority,
+        window,
+        reset,
+        -(candidate.weekly_remaining.round() as i64),
+        candidate.key.clone(),
+    )
 }
 
 /// 纯函数规则引擎：从候选里选目标（返回文件名）。
@@ -266,6 +311,11 @@ pub fn pick_target(
             if best.file_name == current.file_name {
                 return Some(current.file_name.clone());
             }
+            // 手动优先级是硬偏好:best 的优先级严格高于当前号 → 立即切,不受
+            // min-hold / 切换余量限制(防抖只在同档/自动档内防 reset 边界抖动)。
+            if priority_rank(best) < priority_rank(current) {
+                return Some(best.file_name.clone());
+            }
             if held < min_hold {
                 return Some(current.file_name.clone());
             }
@@ -283,6 +333,36 @@ pub fn pick_target(
         }
     }
     Some(best.file_name.clone())
+}
+
+/// 计算某服务商的「请求顺序」(给前端画圆圈数字徽章):把**参与轮换**的号(排除绑定
+/// 占用 + 用户手动禁用)按 rank 排好,标出 1 起的位置、是否激活、是否可用、手动优先级。
+/// `pool` 与 `candidates` 同序一一对应(build_candidates 是 1:1 映射)。
+pub fn build_order(
+    pool: &[PoolFile],
+    candidates: &[Candidate],
+    active_file: Option<&str>,
+) -> Vec<SchedulerOrderItem> {
+    let mut rotation: Vec<&Candidate> = pool
+        .iter()
+        .zip(candidates.iter())
+        .filter(|(file, _)| !file.bound && !file.user_disabled())
+        .map(|(_, candidate)| candidate)
+        .collect();
+    rotation.sort_by(|a, b| rank(a).cmp(&rank(b)));
+    rotation
+        .iter()
+        .enumerate()
+        .map(|(idx, candidate)| SchedulerOrderItem {
+            file_name: candidate.file_name.clone(),
+            key: candidate.key.clone(),
+            label: candidate.label.clone(),
+            position: (idx + 1) as u32,
+            active: active_file == Some(candidate.file_name.as_str()),
+            eligible: candidate.eligible,
+            priority: candidate.priority,
+        })
+        .collect()
 }
 
 /// 守门执行：让池子里只有 `target_file` 可用。
@@ -355,6 +435,99 @@ pub fn release_all_in(dir: &Path) -> bool {
     changed
 }
 
+/// 只有 codex 会在探测软失败时仍把账号以「空 models」占位列进 quotas(避免账号在 UI 里
+/// 凭空消失);其余 provider 探测失败一律返回 `None`。因此对非-codex 而言,账号能以
+/// `is_forbidden=false` 出现在 quotas 本身就证明探测成功、账号健康——空 models 也足以确证、
+/// 解除隔离;对 codex 则必须有 model 数据才算确证(空 models 可能只是软失败占位)。
+fn provider_lists_blank_on_probe_failure(provider_id: &str) -> bool {
+    provider_id == "codex"
+}
+
+/// 根据最新配额健康状态隔离/恢复账号。
+///
+/// 这层不依赖智能调度：即使调度规则关闭，明确 403/鉴权失败的账号也会临时
+/// `disabled=true`，避免代理默认选择器继续打到坏号；健康恢复后再自动放回。
+pub fn reconcile_health_isolation_in(dir: &Path, quotas: &[AccountQuota]) -> bool {
+    let mut providers: Vec<String> = quotas.iter().map(|quota| quota.provider_id.clone()).collect();
+    providers.sort();
+    providers.dedup();
+
+    let mut changed = false;
+    for provider_id in providers {
+        let pool = read_pool_for_provider(dir, &provider_id);
+        for file in pool {
+            if file.bound || file.user_disabled() {
+                continue;
+            }
+            let Some(quota) = quotas
+                .iter()
+                .find(|quota| quota.provider_id == provider_id && quota.account_key == file.key)
+            else {
+                continue;
+            };
+            let should_isolate = quota.is_forbidden || quota.is_auth_failure();
+            // 「健康已知」才允许解除隔离,避免一次失败探测就误把坏号放回。codex 的空 models
+            // 可能只是软失败占位,不算确证;非-codex 能出现在 quotas 即代表探测成功(失败会返
+            // None 缺席),所以它们空 models 也算确证健康——否则恢复后无用量窗口的号会永远卡死。
+            let health_known = should_isolate
+                || !quota.models.is_empty()
+                || !provider_lists_blank_on_probe_failure(&provider_id);
+            if !health_known {
+                continue;
+            }
+            let path = dir.join(&file.file_name);
+            if should_isolate {
+                // 区分隔离原因:鉴权失效要提示用户重新登录;额度耗尽只需等窗口刷新自动恢复。
+                // 对已隔离的旧文件(reason 缺失)或原因变化也补写,保证 UI 标签始终正确。
+                let reason = if quota.is_auth_failure() { "auth" } else { "quota" };
+                let needs_write = !file.health_isolated
+                    || !file.disabled
+                    || file.health_isolated_reason.as_deref() != Some(reason);
+                if needs_write {
+                    changed |= set_health_isolated(&path, true, Some(reason)).is_ok();
+                }
+            } else if file.health_isolated {
+                changed |= set_health_isolated(&path, false, None).is_ok();
+            }
+        }
+    }
+    changed
+}
+
+/// 用户手动「启用」账号时,清掉所有 Quotio 临时禁用标记(调度待命 standby + 健康隔离
+/// health_isolated)并把账号放回池子(disabled=false),让启用立刻、彻底生效。
+///
+/// 关键:不能只清 health_isolated 再按残留的 standby 回填 disabled——否则一个同时被
+/// 「待命」+「健康隔离」的账号,用户点「启用」会被残留的 standby 又写回 disabled=true,
+/// 启用静默失效。绑定(bound)账号保持禁用;调度器下一轮会按需重新决策。
+pub fn clear_temp_disable_markers_for_file_in(dir: &Path, name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        return clear_temp_disable_markers(&entry.path()).is_ok();
+    }
+    false
+}
+
+fn clear_temp_disable_markers(path: &Path) -> Result<(), String> {
+    let mut value = codex_launch::read_proxy_account_from(path)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("账号文件不是 JSON 对象: {}", path.display()))?;
+    object.remove(STANDBY_FIELD);
+    object.remove(HEALTH_ISOLATED_FIELD);
+    object.remove(HEALTH_ISOLATED_REASON_FIELD);
+    // 绑定账号必须保持禁用;其余放回池子。
+    let bound = object.get(BOUND_FIELD).and_then(|v| v.as_bool()).unwrap_or(false);
+    object.insert("disabled".to_string(), Value::Bool(bound));
+    codex_launch::write_proxy_account_to(path, &value)
+}
+
 /// 写 standby 状态：true → `disabled=true` + 标记；false → `disabled=false` + 去标记。
 /// 只在调度器确认该文件可动（非 bound、非用户禁用）后调用。
 fn set_standby(path: &Path, standby: bool) -> Result<(), String> {
@@ -366,10 +539,193 @@ fn set_standby(path: &Path, standby: bool) -> Result<(), String> {
         object.insert("disabled".to_string(), Value::Bool(true));
         object.insert(STANDBY_FIELD.to_string(), Value::Bool(true));
     } else {
-        object.insert("disabled".to_string(), Value::Bool(false));
+        let health_isolated = object
+            .get(HEALTH_ISOLATED_FIELD)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        object.insert("disabled".to_string(), Value::Bool(health_isolated));
         object.remove(STANDBY_FIELD);
     }
     codex_launch::write_proxy_account_to(path, &value)
+}
+
+/// 写账号健康隔离状态：true → `disabled=true` + 标记 + 原因；false → 去标记/原因并按 standby 保持禁用。
+fn set_health_isolated(path: &Path, isolated: bool, reason: Option<&str>) -> Result<(), String> {
+    let mut value = codex_launch::read_proxy_account_from(path)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("账号文件不是 JSON 对象: {}", path.display()))?;
+    if isolated {
+        object.insert("disabled".to_string(), Value::Bool(true));
+        object.insert(HEALTH_ISOLATED_FIELD.to_string(), Value::Bool(true));
+        match reason {
+            Some(reason) => {
+                object.insert(
+                    HEALTH_ISOLATED_REASON_FIELD.to_string(),
+                    Value::String(reason.to_string()),
+                );
+            }
+            None => {
+                object.remove(HEALTH_ISOLATED_REASON_FIELD);
+            }
+        }
+    } else {
+        let standby = object
+            .get(STANDBY_FIELD)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        object.insert("disabled".to_string(), Value::Bool(standby));
+        object.remove(HEALTH_ISOLATED_FIELD);
+        object.remove(HEALTH_ISOLATED_REASON_FIELD);
+    }
+    codex_launch::write_proxy_account_to(path, &value)
+}
+
+/// 按给定文件名顺序把 `quotio_priority` 写成 1..N(用户手动请求顺序)。空列表 = 全部
+/// 清掉优先级(恢复自动顺序)。同时清掉该服务商里没在列表中的残留优先级。返回是否有改动。
+pub fn reorder_provider_in(dir: &Path, provider_id: &str, ordered_file_names: &[String]) -> bool {
+    let mut changed = false;
+    let listed: std::collections::HashSet<&str> =
+        ordered_file_names.iter().map(String::as_str).collect();
+    for (idx, file_name) in ordered_file_names.iter().enumerate() {
+        changed |= set_priority(&dir.join(file_name), Some((idx + 1) as u32)).is_ok();
+    }
+    // 列表外仍带优先级的(理论上只有 bound / 用户手动禁用,或刚被移出列表的)→ 清掉。
+    for file in read_pool_for_provider(dir, provider_id) {
+        if file.priority.is_some() && !listed.contains(file.file_name.as_str()) {
+            changed |= set_priority(&dir.join(&file.file_name), None).is_ok();
+        }
+    }
+    changed
+}
+
+/// 写 / 删单个账号的手动优先级,保留其它字段(原子写)。
+fn set_priority(path: &Path, priority: Option<u32>) -> Result<(), String> {
+    let mut value = codex_launch::read_proxy_account_from(path)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("账号文件不是 JSON 对象: {}", path.display()))?;
+    match priority {
+        Some(p) => {
+            object.insert(PRIORITY_FIELD.to_string(), Value::from(p));
+        }
+        None => {
+            object.remove(PRIORITY_FIELD);
+        }
+    }
+    codex_launch::write_proxy_account_to(path, &value)
+}
+
+/// 写 / 删账号【顶层】的 `priority` 字段(和 `disabled` 同级,CLIProxyAPI 据它排序、数字大=
+/// 先用)。值写成 JSON 数字(代理数字 / 纯数字字符串都认)。顺带清掉历史版本误写在
+/// `attributes.priority`(嵌套层级、代理 `synthesizer/file.go` 从来读不到)的旧值,迁移到对位置。
+fn set_proxy_priority(path: &Path, priority: Option<u32>) -> Result<(), String> {
+    let mut value = codex_launch::read_proxy_account_from(path)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| format!("账号文件不是 JSON 对象: {}", path.display()))?;
+    match priority {
+        Some(p) => {
+            object.insert(PROXY_PRIORITY_FIELD.to_string(), Value::from(p));
+        }
+        None => {
+            object.remove(PROXY_PRIORITY_FIELD);
+        }
+    }
+    remove_legacy_attributes_priority(object);
+    codex_launch::write_proxy_account_to(path, &value)
+}
+
+/// 清掉历史版本误写在 `attributes.priority`(嵌套、代理读不到)的旧值;attributes 因此空了就连
+/// 空对象一起删。返回是否真的删了东西(给清理函数判定有无改动用)。
+fn remove_legacy_attributes_priority(object: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(attrs) = object.get_mut("attributes").and_then(|a| a.as_object_mut()) else {
+        return false;
+    };
+    if attrs.remove("priority").is_none() {
+        return false;
+    }
+    if attrs.is_empty() {
+        object.remove("attributes");
+    }
+    true
+}
+
+/// 顺序故障转移:把手动优先级(quotio_priority,小=先)翻译成代理认的顶层 priority
+/// (大=先)写进各账号文件,仅在变化时写。绑定 / 用户禁用的号不碰。返回是否有改动。
+fn apply_failover_priorities(dir: &Path, pool: &[PoolFile]) -> bool {
+    let max_priority = pool.iter().filter_map(|file| file.priority).max().unwrap_or(0);
+    let mut changed = false;
+    for file in pool {
+        if file.bound || file.user_disabled() {
+            continue;
+        }
+        // quotio_priority p(1=最先)→ 顶层 priority = max-p+1(大=先);无优先级 → None(代理按默认 0)。
+        let desired = file.priority.map(|p| max_priority.saturating_sub(p) + 1);
+        if file.proxy_priority != desired {
+            changed |= set_proxy_priority(&dir.join(&file.file_name), desired).is_ok();
+        }
+    }
+    changed
+}
+
+/// 「顺序故障转移」模式一轮收敛:① 健康号全放回池子(清 standby,代理才能在它们间无感顺位);
+/// ② 把手动顺序写成代理的顶层 `priority`;③ 算徽章顺序(active = 优先级最高的可用号,
+/// 即代理 fill-first 会先用的那个)。返回 (是否有改动, 顺序列表, 激活号文件名)。
+pub fn apply_failover_in(
+    dir: &Path,
+    provider_id: &str,
+    pool: &[PoolFile],
+    candidates: &[Candidate],
+) -> (bool, Vec<SchedulerOrderItem>, Option<String>) {
+    let mut changed = release_provider_in(dir, provider_id);
+    changed |= apply_failover_priorities(dir, pool);
+    // active = 代理 fill-first 实际先用的号:轮换池(非绑定 / 非用户禁用)按 rank 排序后
+    // 第一个「仍启用」的号。按 `!disabled` 选,而不是按 `eligible`(配额是否健康)——代理
+    // 只看 disabled、不看配额,否则上游抖动让主号暂时查不到配额时,徽章会把 ① 误标到下一个
+    // 号。与 build_order 同序,故 ① 必落在列表中第一个启用号上(被隔离的高优先号显示为暗格)。
+    let mut rotation: Vec<(&PoolFile, &Candidate)> = pool
+        .iter()
+        .zip(candidates.iter())
+        .filter(|(file, _)| !file.bound && !file.user_disabled())
+        .collect();
+    rotation.sort_by(|(_, a), (_, b)| rank(a).cmp(&rank(b)));
+    let active = rotation
+        .iter()
+        .find(|(file, _)| !file.disabled)
+        .map(|(file, _)| file.file_name.clone());
+    let order = build_order(pool, candidates, active.as_deref());
+    (changed, order, active)
+}
+
+/// 离开顺序故障转移后:清掉所有账号文件里写给代理的优先级(顶层 `priority`,以及历史误写在
+/// `attributes.priority` 的旧值),避免残留让代理在 fill-first 下继续按旧手动顺序路由。不碰用户
+/// 的手动顺序 `quotio_priority`;仅在确有该键时才写,清干净后即为只读扫描、无副作用。返回是否有改动。
+pub fn clear_proxy_priorities_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut changed = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let has_priority = codex_launch::read_proxy_account_from(&path)
+            .ok()
+            .map(|value| {
+                value.get(PROXY_PRIORITY_FIELD).is_some()
+                    || value
+                        .get("attributes")
+                        .and_then(|attrs| attrs.get("priority"))
+                        .is_some()
+            })
+            .unwrap_or(false);
+        if has_priority {
+            changed |= set_proxy_priority(&path, None).is_ok();
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -394,6 +750,7 @@ mod tests {
             session_reset_at,
             weekly_remaining,
             eligible,
+            priority: None,
         }
     }
 
@@ -538,6 +895,254 @@ mod tests {
     }
 
     #[test]
+    fn manual_priority_orders_first_and_preempts_current_immediately() {
+        let prio = |key: &str, reset: Option<i64>, priority: Option<u32>| {
+            let mut c = candidate(key, reset, 50.0, true);
+            c.priority = priority;
+            c
+        };
+
+        // a 无优先级但窗口最早;b 设了优先级 1 → b 排第一(优先级优先于 reset-soonest)。
+        let candidates = vec![prio("a", Some(1_000), None), prio("b", Some(9_000), Some(1))];
+        assert_eq!(
+            pick_target(&candidates, None, HOLD, MARGIN).as_deref(),
+            Some("codex-b.json"),
+            "手动优先级 1 的号应优先于窗口更早的自动号"
+        );
+
+        // 当前在自动号 a、b 设了优先级 → 即使没到 min-hold 也立即切到 b(硬偏好)。
+        let held_short = Some(("codex-a.json", Duration::from_secs(1)));
+        assert_eq!(
+            pick_target(&candidates, held_short, HOLD, MARGIN).as_deref(),
+            Some("codex-b.json"),
+            "更高手动优先级应绕过 min-hold 立即切"
+        );
+
+        // 都设了优先级:数值小的在前。
+        let candidates = vec![prio("a", Some(1_000), Some(2)), prio("b", Some(9_000), Some(1))];
+        assert_eq!(
+            pick_target(&candidates, None, HOLD, MARGIN).as_deref(),
+            Some("codex-b.json")
+        );
+
+        // 最高优先级(b=1)不可用 → 跳过,激活下一个可用(a=2)。
+        let mut candidates =
+            vec![prio("a", Some(1_000), Some(2)), prio("b", Some(9_000), Some(1))];
+        candidates[1].eligible = false;
+        assert_eq!(
+            pick_target(&candidates, None, HOLD, MARGIN).as_deref(),
+            Some("codex-a.json"),
+            "最高优先级号不可用时跳过,激活下一个可用号"
+        );
+    }
+
+    #[test]
+    fn reorder_writes_priority_and_empty_list_resets() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_reorder_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        for name in ["codex-a.json", "codex-b.json", "codex-c.json"] {
+            std::fs::write(dir.join(name), format!("{{{base}}}")).unwrap();
+        }
+
+        // 顺序定为 b, a(c 不在列表 → 保持无优先级/自动档)。
+        assert!(reorder_provider_in(
+            &dir,
+            "codex",
+            &["codex-b.json".to_string(), "codex-a.json".to_string()],
+        ));
+        let by = |name: &str| {
+            read_pool(&dir)
+                .into_iter()
+                .find(|f| f.file_name == name)
+                .unwrap()
+        };
+        assert_eq!(by("codex-b.json").priority, Some(1));
+        assert_eq!(by("codex-a.json").priority, Some(2));
+        assert_eq!(by("codex-c.json").priority, None);
+
+        // 空列表 = 重置为自动:清掉全部优先级。
+        assert!(reorder_provider_in(&dir, "codex", &[]));
+        assert!(read_pool(&dir).iter().all(|f| f.priority.is_none()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failover_maps_priority_to_proxy_higher_first_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_failover_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        // a=手动第1(最先)、b=第2、c=自动档(无优先级)。
+        std::fs::write(
+            dir.join("codex-a.json"),
+            format!("{{{base},\"quotio_priority\":1}}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("codex-b.json"),
+            format!("{{{base},\"quotio_priority\":2}}"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("codex-c.json"), format!("{{{base}}}")).unwrap();
+
+        let pool = read_pool(&dir);
+        assert!(apply_failover_priorities(&dir, &pool));
+        let proxy_of = |name: &str| {
+            read_pool(&dir)
+                .into_iter()
+                .find(|f| f.file_name == name)
+                .unwrap()
+                .proxy_priority
+        };
+        // 手动 p(小=先)→ 代理顶层 priority(大=先):max(2)-p+1。
+        assert_eq!(proxy_of("codex-a.json"), Some(2)); // 1 → 2(最大,代理最先用)
+        assert_eq!(proxy_of("codex-b.json"), Some(1)); // 2 → 1
+        assert_eq!(proxy_of("codex-c.json"), None); // 自动档,不写
+
+        // 写在【顶层】priority(数字),不是嵌在 attributes 里(代理 synthesizer 读顶层)。
+        let raw = std::fs::read_to_string(dir.join("codex-a.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["priority"], serde_json::json!(2));
+        assert!(value.get("attributes").is_none(), "不应再写嵌套 attributes.priority");
+
+        // 幂等:再跑一轮无文件改动。
+        let pool2 = read_pool(&dir);
+        assert!(!apply_failover_priorities(&dir, &pool2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_proxy_priorities_removes_only_that_key_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_clearpri_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        // a:有 attributes.priority + 其它 attributes 键 + 手动顺序;b:干净。
+        std::fs::write(
+            dir.join("codex-a.json"),
+            format!("{{{base},\"quotio_priority\":1,\"attributes\":{{\"priority\":\"2\",\"label\":\"keep\"}}}}"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("codex-b.json"), format!("{{{base}}}")).unwrap();
+
+        assert!(clear_proxy_priorities_in(&dir));
+
+        let raw = std::fs::read_to_string(dir.join("codex-a.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // attributes.priority 清掉,但 attributes 里其它键 + 用户手动顺序 quotio_priority 保留。
+        assert!(value["attributes"].get("priority").is_none());
+        assert_eq!(value["attributes"]["label"], serde_json::json!("keep"));
+        assert_eq!(value["quotio_priority"], serde_json::json!(1));
+        // 幂等:已清干净再调无改动。
+        assert!(!clear_proxy_priorities_in(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_proxy_priority_writes_top_level_and_migrates_legacy_nested() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_pmigrate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        // 旧版本误写的:嵌套 attributes.priority(代理读不到)+ attributes 里其它键。
+        std::fs::write(
+            dir.join("codex-x.json"),
+            format!("{{{base},\"attributes\":{{\"priority\":\"9\",\"label\":\"keep\"}}}}"),
+        )
+        .unwrap();
+        let path = dir.join("codex-x.json");
+
+        set_proxy_priority(&path, Some(3)).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // 写到【顶层】priority(数字);旧的嵌套 attributes.priority 被迁移清掉,attributes 其它键保留。
+        assert_eq!(value["priority"], serde_json::json!(3));
+        assert!(value["attributes"].get("priority").is_none());
+        assert_eq!(value["attributes"]["label"], serde_json::json!("keep"));
+        // 读回:proxy_priority 从顶层读到 3。
+        let pp = read_pool(&dir)
+            .into_iter()
+            .find(|f| f.file_name == "codex-x.json")
+            .unwrap()
+            .proxy_priority;
+        assert_eq!(pp, Some(3));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_order_numbers_rotation_and_skips_bound_and_user_disabled() {
+        let pool_file = |key: &str, disabled: bool, bound: bool, priority: Option<u32>| PoolFile {
+            file_name: format!("codex-{key}.json"),
+            key: key.to_string(),
+            disabled,
+            standby: false,
+            health_isolated: false,
+            health_isolated_reason: None,
+            bound,
+            priority,
+            proxy_priority: None,
+        };
+        let cand = |key: &str, reset: Option<i64>, eligible: bool, priority: Option<u32>| {
+            let mut c = candidate(key, reset, 50.0, eligible);
+            c.priority = priority;
+            c
+        };
+        // a:自动可用;pinned:手动优先级 1;off:用户禁用;bound:绑定占用。pool 与 candidates 同序。
+        let pool = vec![
+            pool_file("a", false, false, None),
+            pool_file("pinned", false, false, Some(1)),
+            pool_file("off", true, false, None),
+            pool_file("bound", true, true, None),
+        ];
+        let candidates = vec![
+            cand("a", Some(2_000), true, None),
+            cand("pinned", Some(9_000), true, Some(1)),
+            cand("off", None, false, None),
+            cand("bound", None, false, None),
+        ];
+
+        let order = build_order(&pool, &candidates, Some("codex-pinned.json"));
+        let names: Vec<&str> = order.iter().map(|o| o.file_name.as_str()).collect();
+        // 只含轮换号;绑定 + 用户禁用被排除;优先级 1 的 pinned 排第一。
+        assert_eq!(names, vec!["codex-pinned.json", "codex-a.json"]);
+        assert_eq!(order[0].position, 1);
+        assert!(order[0].active, "激活号徽章应标 active");
+        assert_eq!(order[0].priority, Some(1));
+        assert_eq!(order[1].position, 2);
+        assert!(!order[1].active);
+    }
+
+    #[test]
     fn build_candidates_joins_quota_and_normalizes_expired_window() {
         let pool = vec![
             PoolFile {
@@ -545,14 +1150,22 @@ mod tests {
                 key: "a".into(),
                 disabled: false,
                 standby: false,
+                health_isolated: false,
+                health_isolated_reason: None,
                 bound: false,
+                priority: None,
+                proxy_priority: None,
             },
             PoolFile {
                 file_name: "codex-b.json".into(),
                 key: "b".into(),
                 disabled: true, // 用户手动禁用
                 standby: false,
+                health_isolated: false,
+                health_isolated_reason: None,
                 bound: false,
+                priority: None,
+                proxy_priority: None,
             },
         ];
         let quota = |key: &str, reset: Option<i64>, forbidden: bool| AccountQuota {
@@ -628,6 +1241,370 @@ mod tests {
         assert!(!by_name("codex-other.json").standby);
         assert!(by_name("codex-user-off.json").disabled);
         assert!(by_name("codex-bound.json").disabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_isolation_parks_forbidden_accounts_and_restores_recovered() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_health_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        std::fs::write(dir.join("codex-bad.json"), format!("{{{base}}}")).unwrap();
+        std::fs::write(dir.join("codex-good.json"), format!("{{{base}}}")).unwrap();
+        std::fs::write(
+            dir.join("codex-user-off.json"),
+            format!("{{{base},\"disabled\":true}}"),
+        )
+        .unwrap();
+
+        let quota = |key: &str, forbidden: bool, status_message: Option<&str>| AccountQuota {
+            provider_id: "codex".into(),
+            account_label: format!("{key}@x.com"),
+            account_key: key.into(),
+            is_forbidden: forbidden,
+            status_message: status_message.map(str::to_string),
+            models: vec![QuotaModelUsage {
+                model: "Session".into(),
+                used_percent: 10.0,
+                remaining_percent: 90.0,
+                reset_at: None,
+                reset_at_unix: Some(9_000),
+            }],
+        };
+
+        let changed = reconcile_health_isolation_in(
+            &dir,
+            &[
+                quota("bad", true, None),
+                quota("good", false, None),
+                quota("user-off", true, None),
+            ],
+        );
+        assert!(changed, "forbidden account should be isolated");
+
+        let pool = read_pool(&dir);
+        let by_name = |name: &str| pool.iter().find(|f| f.file_name == name).unwrap();
+        assert!(by_name("codex-bad.json").disabled);
+        assert!(by_name("codex-bad.json").health_isolated);
+        assert!(!by_name("codex-good.json").disabled);
+        assert!(!by_name("codex-good.json").health_isolated);
+        assert!(by_name("codex-user-off.json").disabled);
+        assert!(!by_name("codex-user-off.json").health_isolated);
+
+        let changed = reconcile_health_isolation_in(
+            &dir,
+            &[
+                quota("bad", false, None),
+                quota("good", false, None),
+                quota("user-off", true, None),
+            ],
+        );
+        assert!(changed, "recovered account should be restored");
+        let pool = read_pool(&dir);
+        let by_name = |name: &str| pool.iter().find(|f| f.file_name == name).unwrap();
+        assert!(!by_name("codex-bad.json").disabled);
+        assert!(!by_name("codex-bad.json").health_isolated);
+        assert!(by_name("codex-user-off.json").disabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_isolation_keeps_isolated_account_on_blank_probe() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_health_blank_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        std::fs::write(
+            dir.join("codex-bad.json"),
+            format!("{{{base},\"disabled\":true,\"quotio_health_isolated\":true}}"),
+        )
+        .unwrap();
+
+        let changed = reconcile_health_isolation_in(
+            &dir,
+            &[AccountQuota {
+                provider_id: "codex".into(),
+                account_label: "bad@x.com".into(),
+                account_key: "bad".into(),
+                is_forbidden: false,
+                status_message: None,
+                models: Vec::new(),
+            }],
+        );
+        assert!(!changed, "blank probe should not clear a health isolation marker");
+
+        let pool = read_pool(&dir);
+        let bad = pool.iter().find(|f| f.file_name == "codex-bad.json").unwrap();
+        assert!(bad.disabled);
+        assert!(bad.health_isolated);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_enable_clears_temp_markers_but_keeps_bound_disabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_manual_enable_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        // (1) 同时挂 standby + health_isolated(真实可发生:先被调度待命,后又因 403 被
+        //     健康隔离)。用户点「启用」必须一次清干净、disabled=false —— HIGH ① 回归点。
+        std::fs::write(
+            dir.join("codex-MixedCase.json"),
+            format!(
+                "{{{base},\"disabled\":true,\"quotio_scheduler_standby\":true,\"quotio_health_isolated\":true}}"
+            ),
+        )
+        .unwrap();
+        // (2) 绑定账号:启用调用不应把它放回(保持 disabled=true)。
+        std::fs::write(
+            dir.join("codex-bound.json"),
+            format!("{{{base},\"disabled\":true,\"quotio_bound_login_only\":true}}"),
+        )
+        .unwrap();
+
+        // 文件名大小写不敏感匹配。
+        assert!(clear_temp_disable_markers_for_file_in(&dir, "codex-mixedcase.json"));
+        assert!(clear_temp_disable_markers_for_file_in(&dir, "codex-bound.json"));
+
+        let pool = read_pool(&dir);
+        let account = pool
+            .iter()
+            .find(|file| file.file_name == "codex-MixedCase.json")
+            .unwrap();
+        assert!(!account.disabled, "手动启用必须真正生效(disabled=false)");
+        assert!(!account.standby, "standby 标记必须清掉");
+        assert!(!account.health_isolated, "health_isolated 标记必须清掉");
+
+        let bound = pool
+            .iter()
+            .find(|file| file.file_name == "codex-bound.json")
+            .unwrap();
+        assert!(bound.disabled, "绑定账号必须保持禁用");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_isolation_repairs_marker_with_disabled_cleared() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_health_repair_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        std::fs::write(
+            dir.join("codex-bad.json"),
+            format!("{{{base},\"disabled\":false,\"quotio_health_isolated\":true}}"),
+        )
+        .unwrap();
+
+        let changed = reconcile_health_isolation_in(
+            &dir,
+            &[AccountQuota {
+                provider_id: "codex".into(),
+                account_label: "bad@x.com".into(),
+                account_key: "bad".into(),
+                is_forbidden: true,
+                status_message: None,
+                models: vec![QuotaModelUsage {
+                    model: "Session".into(),
+                    used_percent: 100.0,
+                    remaining_percent: 0.0,
+                    reset_at: None,
+                    reset_at_unix: Some(9_000),
+                }],
+            }],
+        );
+        assert!(changed, "health marker with disabled=false should be repaired");
+
+        let pool = read_pool(&dir);
+        let bad = pool.iter().find(|f| f.file_name == "codex-bad.json").unwrap();
+        assert!(bad.disabled);
+        assert!(bad.health_isolated);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn health_isolation_records_auth_vs_quota_reason() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_reason_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = r#""type":"codex","access_token":"a","id_token":"i","refresh_token":"r""#;
+        std::fs::write(dir.join("codex-authbad.json"), format!("{{{base}}}")).unwrap();
+        std::fs::write(dir.join("codex-quotabad.json"), format!("{{{base}}}")).unwrap();
+
+        let q = |key: &str, forbidden: bool, msg: Option<&str>, models: Vec<QuotaModelUsage>| {
+            AccountQuota {
+                provider_id: "codex".into(),
+                account_label: format!("{key}@x.com"),
+                account_key: key.into(),
+                is_forbidden: forbidden,
+                status_message: msg.map(str::to_string),
+                models,
+            }
+        };
+        let model = || {
+            vec![QuotaModelUsage {
+                model: "Session".into(),
+                used_percent: 100.0,
+                remaining_percent: 0.0,
+                reset_at: None,
+                reset_at_unix: Some(9_000),
+            }]
+        };
+
+        // authbad: codex 401 不可恢复 → is_forbidden=false + "auth_failed" + 空 models。
+        // quotabad: 额度打满 → is_forbidden=true,无鉴权哨兵。
+        assert!(reconcile_health_isolation_in(
+            &dir,
+            &[
+                q("authbad", false, Some("auth_failed"), Vec::new()),
+                q("quotabad", true, None, model()),
+            ],
+        ));
+        let pool = read_pool(&dir);
+        let by = |name: &str| pool.iter().find(|f| f.file_name == name).unwrap().clone();
+        assert!(by("codex-authbad.json").health_isolated);
+        assert_eq!(
+            by("codex-authbad.json").health_isolated_reason.as_deref(),
+            Some("auth"),
+            "鉴权失效隔离原因应为 auth"
+        );
+        assert!(by("codex-quotabad.json").health_isolated);
+        assert_eq!(
+            by("codex-quotabad.json").health_isolated_reason.as_deref(),
+            Some("quota"),
+            "额度耗尽隔离原因应为 quota"
+        );
+
+        // 原因变化:quotabad 之后令牌也失效 → reason 应被改写为 auth。
+        assert!(reconcile_health_isolation_in(
+            &dir,
+            &[q("quotabad", false, Some("auth_failed"), Vec::new())],
+        ));
+        let pool = read_pool(&dir);
+        let quotabad = pool
+            .iter()
+            .find(|f| f.file_name == "codex-quotabad.json")
+            .unwrap();
+        assert_eq!(quotabad.health_isolated_reason.as_deref(), Some("auth"));
+
+        // 恢复:authbad 健康了 → 隔离标记与原因一并清掉。
+        assert!(reconcile_health_isolation_in(
+            &dir,
+            &[q("authbad", false, None, model())],
+        ));
+        let pool = read_pool(&dir);
+        let authbad = pool
+            .iter()
+            .find(|f| f.file_name == "codex-authbad.json")
+            .unwrap();
+        assert!(!authbad.health_isolated);
+        assert!(authbad.health_isolated_reason.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_auth_failure_matches_provider_sentinels() {
+        let q = |msg: Option<&str>, forbidden: bool| AccountQuota {
+            provider_id: "x".into(),
+            account_label: "x".into(),
+            account_key: "x".into(),
+            is_forbidden: forbidden,
+            status_message: msg.map(str::to_string),
+            models: Vec::new(),
+        };
+        assert!(q(Some("auth_failed"), false).is_auth_failure());
+        assert!(q(Some("需要重新授权"), true).is_auth_failure());
+        assert!(q(Some("需要重新登录"), true).is_auth_failure());
+        assert!(q(Some("密钥无效"), true).is_auth_failure());
+        // 额度耗尽 / 健康 / plan 串都不是鉴权失败。
+        assert!(!q(None, true).is_auth_failure());
+        assert!(!q(Some("plan: pro | resets: 3"), true).is_auth_failure());
+        assert!(!q(None, false).is_auth_failure());
+    }
+
+    #[test]
+    fn non_codex_recovers_on_blank_healthy_probe_but_codex_does_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "ql_scheduler_blank_recover_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 两个号当前都被健康隔离。
+        std::fs::write(
+            dir.join("claude-acc.json"),
+            r#"{"type":"claude","access_token":"a","disabled":true,"quotio_health_isolated":true,"quotio_health_isolated_reason":"auth"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("codex-acc.json"),
+            r#"{"type":"codex","access_token":"a","id_token":"i","refresh_token":"r","disabled":true,"quotio_health_isolated":true,"quotio_health_isolated_reason":"quota"}"#,
+        )
+        .unwrap();
+
+        // 两者都返回「健康但空 models」的探测结果(is_forbidden=false、非鉴权、无额度条)。
+        let blank = |provider: &str, key: &str| AccountQuota {
+            provider_id: provider.into(),
+            account_label: format!("{key}@x.com"),
+            account_key: key.into(),
+            is_forbidden: false,
+            status_message: None,
+            models: Vec::new(),
+        };
+        let changed =
+            reconcile_health_isolation_in(&dir, &[blank("claude", "acc"), blank("codex", "acc")]);
+        assert!(changed, "claude 应被解除隔离 → changed");
+
+        // claude:非-codex,出现在 quotas 即证明探测成功 → 空白也算健康 → 解除隔离。
+        let claude = read_pool_for_provider(&dir, "claude");
+        let c = claude.iter().find(|f| f.file_name == "claude-acc.json").unwrap();
+        assert!(!c.disabled, "claude 恢复后(空白健康)必须解除隔离,不再卡死");
+        assert!(!c.health_isolated);
+
+        // codex:空 models 可能只是软失败占位,不据此解除隔离 → 保持隔离。
+        let codex = read_pool(&dir);
+        let x = codex.iter().find(|f| f.file_name == "codex-acc.json").unwrap();
+        assert!(x.disabled, "codex 空白探测不解除隔离(可能只是软失败)");
+        assert!(x.health_isolated);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

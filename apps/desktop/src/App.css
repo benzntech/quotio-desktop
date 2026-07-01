@@ -2314,6 +2314,7 @@ h3 {
 .scheduler-head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -2329,8 +2330,70 @@ h3 {
   color: #4f46e5;
 }
 
-.scheduler-switch {
+/* 调度模式三选一(关闭 / 智能调度 / 顺序故障转移):分段控件。 */
+.scheduler-modes {
   margin-left: auto;
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: rgba(99, 102, 241, 0.1);
+}
+
+.scheduler-mode-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--quotio-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.scheduler-mode-btn:hover {
+  color: #4f46e5;
+}
+
+.scheduler-mode-btn.is-active {
+  background: #6366f1;
+  color: #fff;
+  box-shadow: 0 1px 3px rgba(79, 70, 229, 0.4);
+}
+
+.scheduler-mode-btn.is-active:hover {
+  color: #fff;
+}
+
+/* 切换中:被点的按钮转圈 + 全部禁用(非当前的淡一点提示不可点)。 */
+.scheduler-mode-btn:disabled {
+  cursor: default;
+}
+.scheduler-mode-btn:disabled:not(.is-active):not(.is-loading) {
+  opacity: 0.45;
+}
+.scheduler-mode-btn.is-loading {
+  display: inline-flex;
+  align-items: center;
+  color: #4f46e5;
+}
+.scheduler-mode-spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 5px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: scheduler-mode-spin 0.6s linear infinite;
+}
+@keyframes scheduler-mode-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .scheduler-desc {
@@ -2532,6 +2595,67 @@ h3 {
 .aam-close:hover {
   background: var(--quotio-bg-tertiary, rgba(100,116,139,0.1));
   color: var(--quotio-text);
+}
+
+/* 重新授权横幅:显示正在重授的账号(点击展开)+ 复制完整账号 */
+.aam-reauth-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 20px 0;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  background: rgba(99, 102, 241, 0.07);
+  color: #4f46e5;
+}
+.aam-reauth-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+.aam-reauth-caption {
+  font-size: 10.5px;
+  color: var(--quotio-muted);
+}
+.aam-reauth-email {
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--quotio-text);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-mono, monospace);
+  cursor: pointer;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aam-reauth-email:hover {
+  color: #4f46e5;
+}
+.aam-reauth-copy {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--quotio-border);
+  background: var(--quotio-bg);
+  color: var(--quotio-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s, color 0.15s;
+}
+.aam-reauth-copy:hover {
+  background: var(--quotio-bg-tertiary, rgba(100,116,139,0.1));
+  color: #4f46e5;
 }
 
 /* Tabs */
@@ -3589,6 +3713,144 @@ h3 {
   background: rgba(118, 118, 128, 0.05);
 }
 
+/* 请求顺序徽章:圆圈数字。激活=实心高亮(provider 色),候补=描边,不可用=虚线半透明。 */
+.account-order-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 19px;
+  height: 19px;
+  border-radius: 50%;
+  border: 1.5px solid;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.account-order-badge--active {
+  color: #fff;
+}
+
+.account-order-badge--skipped {
+  border-style: dashed;
+  opacity: 0.4;
+}
+
+/* 请求顺序调整:↑ ↓ 置顶 小按钮(悬停账号行时出现)。 */
+.account-reorder {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  /* 不悬停时收起宽度(max-width:0),把空间还给邮箱/状态列——否则即使透明也占着 ~56px、
+     会把状态文字挤成一字一行竖排。悬停才滑出。 */
+  transition: opacity 0.15s, max-width 0.15s;
+}
+
+.account-row:hover .account-reorder {
+  max-width: 64px;
+  opacity: 1;
+}
+
+.reorder-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  color: var(--quotio-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.reorder-btn:hover:not(:disabled) {
+  background: rgba(118, 118, 128, 0.12);
+  color: var(--quotio-text);
+}
+
+.reorder-btn:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+.pv-order-reset {
+  margin-top: 6px;
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  color: var(--quotio-muted);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 5px;
+}
+
+.pv-order-reset:hover {
+  background: rgba(118, 118, 128, 0.1);
+  color: var(--quotio-text);
+}
+
+.account-row-drag {
+  display: flex;
+  align-items: center;
+  transition: transform 0.16s ease, box-shadow 0.16s ease;
+}
+
+.account-row-drag > .account-row {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 拖拽手柄(⠿):悬停账号行时淡出现,抓住它才能拖。 */
+.account-drag-handle {
+  flex: 0 0 auto;
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--quotio-muted);
+  cursor: grab;
+  opacity: 0;
+  transition: opacity 0.15s;
+  touch-action: none;
+}
+
+.account-row-drag:hover .account-drag-handle {
+  opacity: 0.5;
+}
+
+.account-drag-handle:hover {
+  opacity: 1;
+}
+
+/* 拖拽中的行:浮起(实心底 + 阴影 + 抬到上层),跟着指针走。 */
+.account-row-drag--dragging {
+  background: var(--quotio-card-solid);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  border-radius: 8px;
+  position: relative;
+  z-index: 5;
+}
+
+.account-row-drag--dragging .account-drag-handle {
+  cursor: grabbing;
+  opacity: 1;
+}
+
 .account-row-info {
   display: grid;
   gap: 1px;
@@ -3616,6 +3878,9 @@ h3 {
 .account-row-status {
   color: var(--quotio-muted);
   font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .account-row-status--good {
   color: #16823a;
@@ -3726,7 +3991,7 @@ h3 {
 /* Card grid */
 .pv-card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
   gap: 14px;
 }
 

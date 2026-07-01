@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef, useMemo, memo, type ChangeEvent } from "react";
-import type { AccountAuthHealth, AppState, AuthFile, OAuthStatusResponse, OAuthUrlResponse, ProviderSummary } from "../../types";
-import { maskEmail, matchAuthFile } from "../../lib/format";
+import { useState, useEffect, useRef, useMemo, useCallback, memo, type ChangeEvent } from "react";
+import type { AccountAuthHealth, AppState, AuthFile, OAuthStatusResponse, OAuthUrlResponse, ProviderSummary, SchedulerOrderItem } from "../../types";
+import { maskEmail, matchAuthFile, servingFile } from "../../lib/format";
 import { EyeIcon, EyeOffIcon, PlusIcon, RefreshIcon, TrashIcon } from "../icons";
 import { useT } from "../../i18n";
 import { invoke } from "../../lib/tauri";
@@ -9,6 +9,12 @@ import { AddAccountModal } from "../AddAccountModal";
 
 type ProviderKey = { id: string; label: string; api_key: string; enabled: boolean; weight: number };
 type CustomProvider = { id: string; name: string; base_url: string; api_key: string; kind: string; prefix?: string; keys: ProviderKey[]; default_model?: string; models?: string[]; proxy_mode?: string };
+
+// 这两种调度模式都会算「请求顺序」并允许手动排序:reset_soonest(按额度刷新选号)、
+// priority_failover(按手动顺序故障转移)。徽章 + 排序控件在这两种模式下都显示。
+function schedulerOrdersAccounts(rule: string | undefined | null): boolean {
+  return rule === "reset_soonest" || rule === "priority_failover";
+}
 
 type ProvidersScreenProps = {
   appState: AppState;
@@ -53,14 +59,14 @@ function GlobalActionsMenu({
 
   return (
     <div className="pv-card-menu-anchor" ref={ref}>
-      <button className="pv-card-more pv-global-more" type="button" onClick={() => setOpen((v) => !v)} aria-label="Add unconnected provider">
+      <button className="pv-card-more pv-global-more" type="button" onClick={() => setOpen((v) => !v)} aria-label="添加未连接的服务商">
         <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><circle cx="3" cy="8" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="13" cy="8" r="1.3"/></svg>
       </button>
       {open ? (
         <div className="pv-card-dropdown pv-global-dropdown">
           {oauthProviders.map((p) => (
             <button key={p.id} type="button" onClick={() => { onSelectProvider(p); setOpen(false); }}>
-              Add {p.display_name} Account
+              添加 {p.display_name} 账号
             </button>
           ))}
         </div>
@@ -117,18 +123,18 @@ function CustomProviderCard({
         <span className="pv-card-title">{provider.name}</span>
         <span className="cp-kind-badge">{provider.kind}</span>
         {provider.proxy_mode === "direct" ? (
-          <span className="cp-kind-badge" title="This provider bypasses the global proxy" style={{ color: "var(--accent, #10a37f)", borderColor: "var(--accent, #10a37f)" }}>Direct</span>
+          <span className="cp-kind-badge" title="此接口绕过全局代理直连" style={{ color: "var(--accent, #10a37f)", borderColor: "var(--accent, #10a37f)" }}>直连</span>
         ) : null}
-        <button className="pv-card-more" type="button" onClick={() => setAddingKey(true)} aria-label="Add key" title="Add key">
+        <button className="pv-card-more" type="button" onClick={() => setAddingKey(true)} aria-label="添加密钥" title="添加密钥">
           <PlusIcon />
         </button>
         <div className="pv-card-menu-anchor" ref={menuRef}>
-          <button className="pv-card-more" type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="More">
+          <button className="pv-card-more" type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="更多">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><circle cx="8" cy="3" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="8" cy="13" r="1.3"/></svg>
           </button>
           {menuOpen ? (
             <div className="pv-card-dropdown">
-              <button type="button" onClick={() => { onEdit(); setMenuOpen(false); }}>Edit Provider</button>
+              <button type="button" onClick={() => { onEdit(); setMenuOpen(false); }}>编辑接口</button>
               <button
                 type="button"
                 className={confirmDelete ? "pv-dropdown-danger" : ""}
@@ -137,7 +143,7 @@ function CustomProviderCard({
                   else { setConfirmDelete(true); window.setTimeout(() => setConfirmDelete(false), 3000); }
                 }}
               >
-                {confirmDelete ? "Confirm delete?" : "Delete Provider"}
+                {confirmDelete ? "确认删除？" : "删除接口"}
               </button>
             </div>
           ) : null}
@@ -152,29 +158,29 @@ function CustomProviderCard({
             {provider.models.length > 4 ? <code className="cp-model-pill">+{provider.models.length - 4}</code> : null}
           </>
         ) : (
-          <code className="cp-model-pill" style={{ color: "var(--danger, #d9534f)", borderColor: "var(--danger, #d9534f)" }} title="No models configured, proxy cannot route to this provider (click edit to add models)">
-            ⚠ Unconfigured Models
+          <code className="cp-model-pill" style={{ color: "var(--danger, #d9534f)", borderColor: "var(--danger, #d9534f)" }} title="未配置模型，代理无法路由到此接口（请点编辑补充模型名）">
+            ⚠ 未配置模型
           </code>
         )}
       </div>
 
       <div className="cp-key-pool">
         <div className="cp-key-pool-header">
-          <span>Key Pool</span>
-          <span className="pv-count-badge">{enabledCount}/{provider.keys.length} Enabled</span>
+          <span>密钥池</span>
+          <span className="pv-count-badge">{enabledCount}/{provider.keys.length} 启用</span>
         </div>
         {provider.keys.length === 0 ? (
-          <p className="cp-key-empty">No keys. Click + to add.</p>
+          <p className="cp-key-empty">暂无密钥。点击 + 添加。</p>
         ) : (
           <div className="cp-key-list">
             {provider.keys.map((k) => (
               <div className={`cp-key-row${k.enabled ? "" : " cp-key-disabled"}`} key={k.id}>
-                <button className="cp-key-toggle" type="button" onClick={() => onToggleKey(k.id)} title={k.enabled ? "Disable" : "Enable"}>
+                <button className="cp-key-toggle" type="button" onClick={() => onToggleKey(k.id)} title={k.enabled ? "禁用" : "启用"}>
                   <span className={`cp-key-dot${k.enabled ? " cp-key-dot--on" : ""}`} />
                 </button>
-                <span className="cp-key-label">{k.label || "Unnamed"}</span>
+                <span className="cp-key-label">{k.label || "未命名"}</span>
                 <span className="cp-key-masked">{maskKey(k.api_key)}</span>
-                <button className="row-icon-btn row-icon-btn--danger cp-key-del" type="button" onClick={() => onRemoveKey(k.id)} title="Delete key" aria-label="Delete key">
+                <button className="row-icon-btn row-icon-btn--danger cp-key-del" type="button" onClick={() => onRemoveKey(k.id)} title="删除密钥" aria-label="删除密钥">
                   <TrashIcon />
                 </button>
               </div>
@@ -185,7 +191,7 @@ function CustomProviderCard({
 
       {boundKeys.length > 0 ? (
         <div className="cp-bound-keys">
-          <span className="cp-bound-keys-label">Bound Client Keys</span>
+          <span className="cp-bound-keys-label">绑定的客户端密钥</span>
           {boundKeys.map((bk, i) => (
             <code className="cp-bound-key-tag" key={i}>{bk.masked}</code>
           ))}
@@ -194,13 +200,13 @@ function CustomProviderCard({
 
       {addingKey ? (
         <div className="cp-add-key-form">
-          <input placeholder="Label (optional)" value={newKeyLabel} onChange={(e) => setNewKeyLabel(e.target.value)} />
+          <input placeholder="标签（可选）" value={newKeyLabel} onChange={(e) => setNewKeyLabel(e.target.value)} />
           <input placeholder="API Key" type="password" value={newKeyValue} onChange={(e) => setNewKeyValue(e.target.value)} />
           <div className="cp-add-key-actions">
             <button type="button" className="primary-action" disabled={!newKeyValue.trim()} onClick={() => { onAddKey(newKeyLabel, newKeyValue); setNewKeyLabel(""); setNewKeyValue(""); setAddingKey(false); }}>
-              Add
+              添加
             </button>
-            <button type="button" onClick={() => { setAddingKey(false); setNewKeyLabel(""); setNewKeyValue(""); }}>Cancel</button>
+            <button type="button" onClick={() => { setAddingKey(false); setNewKeyLabel(""); setNewKeyValue(""); }}>取消</button>
           </div>
         </div>
       ) : null}
@@ -244,13 +250,99 @@ export function ProvidersScreen({
     return extra.length > 0 ? [...proxyAuthFiles, ...extra] : proxyAuthFiles;
   }, [proxyAuthFiles, localAccounts]);
   const groups = useMemo(() => groupAccounts(authFiles, appState.providers), [authFiles, appState.providers]);
-  // Accounts whose quota fetch hit an unrecoverable 401 are flagged "auth_failed"
-  // by the backend. Unlike the proxy's recent-request health (which resets on
+  // 智能调度算出的「请求顺序」:file_name → 顺序项(全 provider 合并;file_name 全局唯一)。
+  // 仅排序型调度(智能调度 / 顺序故障转移)开启时有数据,关闭时为空 → 不显示徽章。
+  const orderByFile = useMemo(() => {
+    const map = new Map<string, SchedulerOrderItem>();
+    const sched = appState.scheduler;
+    if (sched && schedulerOrdersAccounts(sched.rule)) {
+      for (const entry of sched.providers ?? []) {
+        const order = entry.order ?? [];
+        // 「主用」高亮(active)跟着真正在服务的号走——后端 active 是优先级最高的启用号,
+        // 但它可能正被上游抖动临时绕过;无近期流量时保留后端 active。序号位置不变。
+        const serving = servingFile(order.map((i) => i.file_name), authFiles);
+        for (const item of order) {
+          map.set(item.file_name, serving ? { ...item, active: item.file_name === serving } : item);
+        }
+      }
+    }
+    return map;
+  }, [appState.scheduler, authFiles]);
+
+  // 调整某账号在请求顺序里的位置(上移/下移/置顶/重置为自动)。基于当前调度顺序算出
+  // 新的完整文件名顺序,交给后端写 quotio_priority=1..N(reset = 空列表清掉优先级)。
+  const onReorderAccount = useCallback(
+    (fileName: string, op: "up" | "down" | "top" | "reset") => {
+      const sched = appState.scheduler;
+      if (!sched || !schedulerOrdersAccounts(sched.rule)) return;
+      const entry = (sched.providers ?? []).find((e) =>
+        (e.order ?? []).some((i) => i.file_name === fileName),
+      );
+      if (!entry) return;
+      const ordered = [...(entry.order ?? [])]
+        .sort((a, b) => a.position - b.position)
+        .map((i) => i.file_name);
+      let next = ordered;
+      if (op === "reset") {
+        next = [];
+      } else {
+        const idx = ordered.indexOf(fileName);
+        if (idx < 0) return;
+        next = [...ordered];
+        if (op === "top") {
+          if (idx === 0) return;
+          next.splice(idx, 1);
+          next.unshift(fileName);
+        } else if (op === "up") {
+          if (idx === 0) return;
+          [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+        } else if (op === "down") {
+          if (idx >= next.length - 1) return;
+          [next[idx + 1], next[idx]] = [next[idx], next[idx + 1]];
+        }
+      }
+      onRunManagementStateAction("reorder_provider_accounts", {
+        providerId: entry.provider_id,
+        orderedFileNames: next,
+      });
+    },
+    [appState.scheduler, onRunManagementStateAction],
+  );
+
+  // 拖拽重排:把 dragged 号插到 target 号的位置。
+  const onReorderMove = useCallback(
+    (draggedFileName: string, targetFileName: string) => {
+      if (draggedFileName === targetFileName) return;
+      const sched = appState.scheduler;
+      if (!sched || !schedulerOrdersAccounts(sched.rule)) return;
+      const entry = (sched.providers ?? []).find((e) =>
+        (e.order ?? []).some((i) => i.file_name === draggedFileName),
+      );
+      if (!entry) return;
+      const ordered = [...(entry.order ?? [])]
+        .sort((a, b) => a.position - b.position)
+        .map((i) => i.file_name);
+      const from = ordered.indexOf(draggedFileName);
+      const to = ordered.indexOf(targetFileName);
+      if (from < 0 || to < 0) return;
+      const next = [...ordered];
+      next.splice(from, 1);
+      next.splice(to, 0, draggedFileName);
+      onRunManagementStateAction("reorder_provider_accounts", {
+        providerId: entry.provider_id,
+        orderedFileNames: next,
+      });
+    },
+    [appState.scheduler, onRunManagementStateAction],
+  );
+  // Accounts whose quota fetch hit a genuine auth failure (unrecoverable 401/403,
+  // refresh failed, invalid key) — flagged by the backend with a fixed sentinel in
+  // status_message. Unlike the proxy's recent-request health (which resets on
   // restart), this re-detects every refresh, so it's a durable "re-auth" signal.
   const authFailedNames = useMemo(() => {
     const names = new Set<string>();
     for (const quota of appState.quotas) {
-      if (quota.status_message === "auth_failed") {
+      if (isAuthFailureMessage(quota.status_message)) {
         const file = matchAuthFile(quota, authFiles);
         if (file) names.add(file.name);
       }
@@ -276,6 +368,8 @@ export function ProvidersScreen({
   const oauthProviders = appState.providers.filter((provider) => provider.native_oauth || provider.oauth_endpoint || provider.supports_manual_auth);
 
   const [addAccountProvider, setAddAccountProvider] = useState<ProviderSummary | null>(null);
+  // 正在「重新授权」的账号(为空 = 新增账号);供弹窗显示该账号、给用户复制。
+  const [reauthTarget, setReauthTarget] = useState<AuthFile | null>(null);
   const [projectId] = useState("");
   const [showAddCustom, setShowAddCustom] = useState(false);
   const [editingCustomId, setEditingCustomId] = useState<string | null>(null);
@@ -291,7 +385,10 @@ export function ProvidersScreen({
     const provider = appState.providers.find(
       (item) => item.id === account.provider || item.id.includes(account.provider) || account.provider.includes(item.id),
     );
-    if (provider) setAddAccountProvider(provider);
+    if (provider) {
+      setReauthTarget(account);
+      setAddAccountProvider(provider);
+    }
   }
 
   function resetCustomForm() {
@@ -341,7 +438,7 @@ export function ProvidersScreen({
       }
       resetCustomForm();
     } catch (error) {
-      setCustomFormError(typeof error === "string" ? error : "Add failed, please check Name/Base URL/Key and try again.");
+      setCustomFormError(typeof error === "string" ? error : "添加失败,请检查名称/Base URL/密钥后重试。");
     }
   }
 
@@ -442,8 +539,8 @@ export function ProvidersScreen({
             type="button"
             onClick={onRefreshQuotas}
             disabled={isManagementBusy}
-            title="Refresh accounts"
-            aria-label="Refresh accounts"
+            title="刷新账号(重新检测)"
+            aria-label="刷新账号"
           >
             <RefreshIcon />
           </button>
@@ -454,7 +551,12 @@ export function ProvidersScreen({
         <AddAccountModal
           provider={addAccountProvider}
           projectId={projectId}
-          onClose={() => setAddAccountProvider(null)}
+          reauthAccountLabel={
+            reauthTarget
+              ? reauthTarget.email || reauthTarget.account || reauthTarget.label || reauthTarget.name
+              : null
+          }
+          onClose={() => { setAddAccountProvider(null); setReauthTarget(null); }}
           onStartOAuth={onStartOAuth}
           onPollOAuth={onPollOAuth}
           onRefreshQuotas={() => { onRefreshQuotas(); onRefreshManagement(); }}
@@ -464,21 +566,21 @@ export function ProvidersScreen({
 
       {/* ── Connected providers: card grid ── */}
       <div className="pv-section-header">
-        <h2 className="pv-section-title">{t("providers.connected", "Connected Providers")}</h2>
+        <h2 className="pv-section-title">已连接服务商</h2>
         <span className="pv-section-actions">
-          <span className="pv-count-badge">{t("providers.count", `Total ${groups.length} providers`)}</span>
+          <span className="pv-count-badge">共 {groups.length} 个服务商</span>
           <GlobalActionsMenu
             oauthProviders={oauthProviders.filter(
               // 只列「还没连接」(没卡片)的服务商——加首个账号的唯一入口;已连接的卡片上有 +。
               (p) => !groups.some((g) => g.id === p.id || p.id.includes(g.id) || g.id.includes(p.id)),
             )}
-            onSelectProvider={setAddAccountProvider}
+            onSelectProvider={(provider) => { setReauthTarget(null); setAddAccountProvider(provider); }}
           />
         </span>
       </div>
 
       {groups.length === 0 ? (
-        <p className="empty-copy" style={{ padding: "24px 0" }}>{t("providers.empty", "No accounts yet. Click + on a card to authorize, or import via the ⋯ menu.")}</p>
+        <p className="empty-copy" style={{ padding: "24px 0" }}>暂无账号。点击卡片上的 + 授权或通过右上角 ⋯ 导入。</p>
       ) : (
         <div className="pv-card-grid">
           {groups.map((group) => (
@@ -488,11 +590,14 @@ export function ProvidersScreen({
               isBusy={isManagementBusy}
               authFailedNames={authFailedNames}
               authHealth={authHealth}
+              order={orderByFile}
+              onReorder={onReorderAccount}
+              onReorderMove={onReorderMove}
               onDelete={(account) => onRunManagementStateAction("delete_management_auth_file", { name: account.name })}
               onReauth={reauthAccount}
               onAddAccount={() => {
                 const provider = appState.providers.find((p) => p.id === group.id || p.id.includes(group.id) || group.id.includes(p.id));
-                if (provider) setAddAccountProvider(provider);
+                if (provider) { setReauthTarget(null); setAddAccountProvider(provider); }
               }}
               onExport={() => void onExportProvider(group)}
               onDeleteAll={() => {
@@ -517,9 +622,9 @@ export function ProvidersScreen({
 
       {/* ── Custom API management: table ── */}
       <div className="pv-section-header" style={{ marginTop: 28 }}>
-        <h2 className="pv-section-title">{t("providers.customApi", "Custom API Management")}</h2>
+        <h2 className="pv-section-title">自定义接口管理</h2>
         <button className="pv-add-btn" type="button" onClick={() => (showAddCustom ? resetCustomForm() : setShowAddCustom(true))}>
-          <PlusIcon /> {t("providers.addApi", "Add API")}
+          <PlusIcon /> 添加接口
         </button>
       </div>
 
@@ -535,19 +640,19 @@ export function ProvidersScreen({
               <input value={customForm.base_url} onChange={(e) => setCustomForm({ ...customForm, base_url: e.target.value })} placeholder="https://api.example.com/v1" />
             </label>
             {editingCustomId ? (
-              <p className="cp-form-hint">Keys are managed on the card. Keys are hidden in edit mode.</p>
+              <p className="cp-form-hint">密钥在卡片上管理，编辑模式不显示密钥字段。</p>
             ) : (
               <div className="cp-form-keys">
                 <div className="cp-form-keys-header">
-                  <span>API Key</span>
+                  <span>API 密钥</span>
                   <button type="button" className="cp-form-keys-add" onClick={() => setFormKeys([...formKeys, { label: "", api_key: "" }])}>
-                    <PlusIcon /> Add Key
+                    <PlusIcon /> 添加密钥
                   </button>
                 </div>
                 {formKeys.map((fk, i) => (
                   <div className="cp-form-key-row" key={i}>
                     <input
-                      placeholder="Label (optional)"
+                      placeholder="标签（可选）"
                       value={fk.label}
                       onChange={(e) => { const next = [...formKeys]; next[i] = { ...fk, label: e.target.value }; setFormKeys(next); }}
                     />
@@ -558,7 +663,7 @@ export function ProvidersScreen({
                       onChange={(e) => { const next = [...formKeys]; next[i] = { ...fk, api_key: e.target.value }; setFormKeys(next); }}
                     />
                     {formKeys.length > 1 ? (
-                      <button type="button" className="row-icon-btn row-icon-btn--danger" onClick={() => setFormKeys(formKeys.filter((_, j) => j !== i))} title="Remove" aria-label="Remove">
+                      <button type="button" className="row-icon-btn row-icon-btn--danger" onClick={() => setFormKeys(formKeys.filter((_, j) => j !== i))} title="移除" aria-label="移除">
                         <TrashIcon />
                       </button>
                     ) : null}
@@ -585,7 +690,7 @@ export function ProvidersScreen({
               </label>
             </div>
             <label>
-              Model List (one per line, required for routing)
+              模型列表（每行一个，路由必填）
               <textarea
                 value={customForm.models}
                 onChange={(e) => setCustomForm({ ...customForm, models: e.target.value })}
@@ -596,21 +701,21 @@ export function ProvidersScreen({
               />
             </label>
             <p className="cp-form-hint">
-              Required: The actual models provided by this API. Otherwise the proxy cannot route to it (will return quota/routing error). Separate with comma, space or newline.
+              必须填写此接口实际提供的模型名，否则代理无法路由到它（会返回额度/线路错误）。逗号、空格或换行分隔均可。
             </p>
             <label>
-              Connection Mode
+              连接方式
               <Select
                 value={customForm.proxy_mode}
                 options={[
-                  { value: "inherit", label: "Use Proxy (Follow global setting)" },
-                  { value: "direct", label: "Direct (Bypass proxy)" },
+                  { value: "inherit", label: "走代理（跟随全局设置）" },
+                  { value: "direct", label: "直连（绕过代理）" },
                 ]}
                 onChange={(value) => setCustomForm({ ...customForm, proxy_mode: value })}
               />
             </label>
             <p className="cp-form-hint">
-              "Direct" allows this provider to bypass the global proxy; "Use Proxy" uses the global proxy defined in Settings.
+              「直连」让此接口绕过全局代理直接访问（国内中转站常需直连）；「走代理」沿用设置里的全局代理（OpenAI/Anthropic 等被墙服务需要）。
             </p>
             {customFormError ? (
               <p className="cp-form-hint" style={{ color: "var(--danger, #d9534f)" }}>{customFormError}</p>
@@ -623,7 +728,7 @@ export function ProvidersScreen({
       ) : null}
 
       {customProviders.length === 0 ? (
-        <p className="empty-copy" style={{ padding: "16px 0" }}>{t("providers.noCustomApi", "No custom APIs yet. Click \"Add API\" to import OpenAI / Gemini / Claude compatible endpoints.")}</p>
+        <p className="empty-copy" style={{ padding: "16px 0" }}>暂无自定义接口。点击「添加接口」导入 OpenAI / Gemini / Claude 兼容端点。</p>
       ) : (
         <div className="pv-card-grid">
           {customProviders.map((cp) => {
@@ -674,6 +779,15 @@ function healthFor(
   return undefined;
 }
 
+// Fixed sentinels each provider writes into quota.status_message on a genuine auth
+// failure (keep in sync with the backend `AccountQuota::is_auth_failure`). Quota
+// exhaustion has NO sentinel (just is_forbidden + None/"plan:…"), so membership
+// here cleanly separates "needs re-login" from "wait for the window to reset".
+const AUTH_FAILURE_MESSAGES = new Set(["auth_failed", "需要重新授权", "需要重新登录", "密钥无效"]);
+function isAuthFailureMessage(message: string | null | undefined): boolean {
+  return message != null && AUTH_FAILURE_MESSAGES.has(message);
+}
+
 function accountState(
   account: AuthFile,
   authFailed: boolean,
@@ -685,31 +799,38 @@ function accountState(
   //      persisted status codes — how cpa-manager judges a "real 401").
   // A blanket recent-failure count or the proxy's vague "error" status no longer
   // triggers re-auth, since 500/429 failures are rate-limit/transient, not auth.
-  if (authFailed) return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "Needs Reauth", needsReauth: true };
-  if (health?.recommend_reauth) return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "Needs Reauth", needsReauth: true };
+  if (authFailed) return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "需重新授权", needsReauth: true };
+  if (health?.recommend_reauth) return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "需重新授权", needsReauth: true };
+  if (account.disabled && account.quotio_health_isolated) {
+    // 额度耗尽的隔离不必重新登录,等窗口刷新即可——只有鉴权失效才提示重新授权。
+    // reason 缺失(升级前隔离的旧文件,下一轮对账会补写)时按 auth 兜底:宁可多提示一次。
+    if (account.quotio_health_isolated_reason === "quota")
+      return { tone: "warn", key: "providers.stateQuotaExhausted", fallback: "额度耗尽 · 待刷新", needsReauth: false };
+    return { tone: "bad", key: "providers.stateNeedsReauth", fallback: "需重新授权", needsReauth: true };
+  }
   if (account.disabled && account.quotio_scheduler_standby)
-    return { tone: "muted", key: "providers.stateStandby", fallback: "Standby", needsReauth: false };
+    return { tone: "muted", key: "providers.stateStandby", fallback: "待命(调度)", needsReauth: false };
   if (account.disabled && account.quotio_bound_login_only)
-    return { tone: "muted", key: "providers.stateBoundLogin", fallback: "Bound Login", needsReauth: false };
-  if (account.disabled) return { tone: "muted", key: "providers.statusDisabled", fallback: "Disabled", needsReauth: false };
-  if (account.unavailable) return { tone: "bad", key: "providers.stateUnavailable", fallback: "Unavailable", needsReauth: true };
+    return { tone: "muted", key: "providers.stateBoundLogin", fallback: "绑定登录", needsReauth: false };
+  if (account.disabled) return { tone: "muted", key: "providers.statusDisabled", fallback: "已禁用", needsReauth: false };
+  if (account.unavailable) return { tone: "bad", key: "providers.stateUnavailable", fallback: "不可用", needsReauth: true };
   const status = (account.status ?? "").trim().toLowerCase();
-  if (status === "cooling") return { tone: "warn", key: "providers.stateCooling", fallback: "Cooling", needsReauth: false };
+  if (status === "cooling") return { tone: "warn", key: "providers.stateCooling", fallback: "冷却中", needsReauth: false };
 
   // Classify by REAL status codes when usage history exists (preferred).
   if (health && health.recent_total > 0) {
     const failures = health.auth_failures + health.rate_limited + health.server_errors;
-    if (failures === 0) return { tone: "good", key: "providers.stateActive", fallback: "Active", needsReauth: false };
+    if (failures === 0) return { tone: "good", key: "providers.stateActive", fallback: "正常", needsReauth: false };
     if (health.rate_limited > 0 && health.rate_limited >= health.server_errors && health.rate_limited >= health.auth_failures)
-      return { tone: "warn", key: "providers.stateRateLimited", fallback: "Rate Limited", needsReauth: false };
+      return { tone: "warn", key: "providers.stateRateLimited", fallback: "限流", needsReauth: false };
     // 5xx dominate the failures → upstream proxy / server congestion (the
     // "wsarecv: forcibly closed" resets), NOT a problem with this account. Flag it
     // as upstream-unstable (warn) rather than the alarming "失败偏多 / 异常".
     if (health.server_errors > 0 && health.server_errors >= health.auth_failures && health.server_errors >= health.rate_limited)
-      return { tone: "warn", key: "providers.stateUpstream", fallback: "Upstream Unstable (5xx)", needsReauth: false };
+      return { tone: "warn", key: "providers.stateUpstream", fallback: "上游不稳(5xx)", needsReauth: false };
     if (failures >= health.successes)
-      return { tone: "bad", key: "providers.stateFailing", fallback: "Failing (High Error Rate)", needsReauth: false };
-    return { tone: "warn", key: "providers.stateDegraded", fallback: "Degraded", needsReauth: false };
+      return { tone: "bad", key: "providers.stateFailing", fallback: "异常 · 失败偏多", needsReauth: false };
+    return { tone: "warn", key: "providers.stateDegraded", fallback: "部分失败", needsReauth: false };
   }
 
   // Fallback to the proxy's recent-request buckets when there's no usage history
@@ -717,10 +838,10 @@ function accountState(
   const recent = account.recent_requests ?? [];
   const ok = recent.reduce((sum, bucket) => sum + bucket.success, 0);
   const fail = recent.reduce((sum, bucket) => sum + bucket.failed, 0);
-  if (fail >= 3 && fail >= ok) return { tone: "bad", key: "providers.stateFailing", fallback: "Failing (High Error Rate)", needsReauth: false };
-  if (fail > 0) return { tone: "warn", key: "providers.stateDegraded", fallback: "Degraded", needsReauth: false };
-  if (status === "error") return { tone: "bad", key: "providers.stateAnomaly", fallback: "Anomaly", needsReauth: false };
-  return { tone: "good", key: "providers.stateActive", fallback: "Active", needsReauth: false };
+  if (fail >= 3 && fail >= ok) return { tone: "bad", key: "providers.stateFailing", fallback: "异常 · 失败偏多", needsReauth: false };
+  if (fail > 0) return { tone: "warn", key: "providers.stateDegraded", fallback: "部分失败", needsReauth: false };
+  if (status === "error") return { tone: "bad", key: "providers.stateAnomaly", fallback: "异常", needsReauth: false };
+  return { tone: "good", key: "providers.stateActive", fallback: "正常", needsReauth: false };
 }
 
 function ProviderCard({
@@ -728,36 +849,130 @@ function ProviderCard({
   isBusy,
   authFailedNames,
   authHealth,
+  order,
   onDelete,
   onReauth,
   onAddAccount,
   onExport,
   onDeleteAll,
   onToggleDisableAll,
+  onReorder,
+  onReorderMove,
 }: {
   group: AccountGroupData;
   isBusy: boolean;
   authFailedNames: Set<string>;
   authHealth: Map<string, AccountAuthHealth>;
+  order: Map<string, SchedulerOrderItem>;
   onDelete: (account: AuthFile) => void;
   onReauth: (account: AuthFile) => void;
   onAddAccount: () => void;
   onExport: () => void;
   onDeleteAll: () => void;
   onToggleDisableAll: () => void;
+  onReorder: (fileName: string, op: "up" | "down" | "top" | "reset") => void;
+  onReorderMove: (draggedFileName: string, targetFileName: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [draggingFile, setDraggingFile] = useState<string | null>(null);
+  const [dragOverFile, setDragOverFile] = useState<string | null>(null);
+  // 拖拽用 pointer 事件 + 专用手柄(⠿)实现:只有抓住手柄才拖,行的其它地方不参与,
+  // 既消除与 WebView2 窗体拖拽的冲突,也不会误拖。dragRef 记住被拖的行元素。
+  const dragRef = useRef<{
+    file: string;
+    startY: number;
+    dragging: boolean;
+    over: string | null;
+    rowEl: HTMLElement | null;
+  } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // 在手柄上按下:记录被拖的行(手柄最近的 [data-drag-file] 祖先),后续 pointer 事件
+  // 捕获到手柄;preventDefault 压掉 compatibility mousedown,彻底不触发窗体拖拽。
+  const beginRowDrag = (e: React.PointerEvent, file: string) => {
+    if (isBusy || !order.get(file)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragRef.current = {
+      file,
+      startY: e.clientY,
+      dragging: false,
+      over: null,
+      rowEl: (e.currentTarget as HTMLElement).closest<HTMLElement>("[data-drag-file]"),
+    };
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      /* 某些环境无 pointer capture,忽略即可 */
+    }
+  };
+  const moveRowDrag = (e: React.PointerEvent) => {
+    const d = dragRef.current;
+    if (!d || !d.rowEl) return;
+    if (!d.dragging) {
+      if (Math.abs(e.clientY - d.startY) < 4) return; // 越过阈值才算拖
+      d.dragging = true;
+      setDraggingFile(d.file);
+      d.rowEl.style.transition = "none"; // 拖拽中 1:1 跟手
+    }
+    // 被拖的整行跟着指针上下走(命令式改 transform,避免每次 move 触发 React 重渲染)。
+    d.rowEl.style.transform = `translateY(${e.clientY - d.startY}px)`;
+    // 落点:按各行静态矩形比对指针 Y(排除已 transform 的被拖行);在所有行之上/之下时
+    // 钳到首/尾行,方便拖到两端。
+    let over: string | null = null;
+    const container = d.rowEl.parentElement;
+    if (container) {
+      const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-drag-file]")).filter(
+        (c) => c.dataset.dragFile && c.dataset.dragFile !== d.file,
+      );
+      for (const child of rows) {
+        const r = child.getBoundingClientRect();
+        if (e.clientY >= r.top && e.clientY <= r.bottom) {
+          over = child.dataset.dragFile ?? null;
+          break;
+        }
+      }
+      if (!over && rows.length > 0) {
+        if (e.clientY < rows[0].getBoundingClientRect().top) over = rows[0].dataset.dragFile ?? null;
+        else if (e.clientY > rows[rows.length - 1].getBoundingClientRect().bottom)
+          over = rows[rows.length - 1].dataset.dragFile ?? null;
+      }
+    }
+    d.over = over;
+    setDragOverFile(over);
+  };
+  const endRowDrag = () => {
+    const d = dragRef.current;
+    dragRef.current = null;
+    if (d?.rowEl) {
+      d.rowEl.style.transition = ""; // 恢复 CSS 过渡 → 松手平滑归位
+      d.rowEl.style.transform = "";
+    }
+    if (d?.dragging && d.over) onReorderMove(d.file, d.over);
+    setDraggingFile(null);
+    setDragOverFile(null);
+  };
   const initial = group.label.trim().charAt(0).toUpperCase() || "?";
-  const accounts = group.accounts
-    .map((account) => ({
-      account,
-      needsReauth: accountState(account, authFailedNames.has(account.name), healthFor(account, authHealth)).needsReauth,
-    }))
-    .sort((a, b) => Number(b.needsReauth) - Number(a.needsReauth))
-    .map((entry) => entry.account);
+  const accounts =
+    order.size > 0
+      ? // 智能调度:按生效请求顺序排(无序号的绑定/用户禁用号垫后)。
+        [...group.accounts].sort(
+          (a, b) =>
+            (order.get(a.name)?.position ?? Number.MAX_SAFE_INTEGER) -
+            (order.get(b.name)?.position ?? Number.MAX_SAFE_INTEGER),
+        )
+      : group.accounts
+          .map((account) => ({
+            account,
+            needsReauth: accountState(account, authFailedNames.has(account.name), healthFor(account, authHealth)).needsReauth,
+          }))
+          .sort((a, b) => Number(b.needsReauth) - Number(a.needsReauth))
+          .map((entry) => entry.account);
+
+  const orderCount = accounts.filter((a) => order.get(a.name)).length;
+  const hasManualOrder = accounts.some((a) => order.get(a.name)?.priority != null);
 
   const goodCount = accounts.filter((a) => {
     const s = accountState(a, authFailedNames.has(a.name), healthFor(a, authHealth));
@@ -770,7 +985,7 @@ function ProviderCard({
   const allDisabled = accounts.length > 0 && accounts.every((a) => a.disabled);
 
   const cardStatus = badCount > 0 ? "warn" : accounts.length === 0 ? "muted" : "good";
-  const statusLabel = badCount > 0 ? `${badCount} Error(s)` : allDisabled ? "Disabled" : goodCount === accounts.length ? "Healthy" : "Idle";
+  const statusLabel = badCount > 0 ? `${badCount} 个异常` : allDisabled ? "已禁用" : goodCount === accounts.length ? "正常" : "多闲";
 
   const PREVIEW_COUNT = 3;
   const previewAccounts = expanded ? accounts : accounts.slice(0, PREVIEW_COUNT);
@@ -794,26 +1009,26 @@ function ProviderCard({
           <strong className="pv-card-name">{group.label}</strong>
           <span className={`pv-card-status pv-card-status--${cardStatus}`}>{statusLabel}</span>
         </div>
-        <button className="pv-card-add" type="button" onClick={onAddAccount} disabled={isBusy} title="Add Account" aria-label="Add Account">
+        <button className="pv-card-add" type="button" onClick={onAddAccount} disabled={isBusy} title="添加账号" aria-label="添加账号">
           <PlusIcon />
         </button>
         <div className="pv-card-menu-anchor" ref={menuRef}>
-          <button className="pv-card-more" type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="More Actions">
+          <button className="pv-card-more" type="button" onClick={() => setMenuOpen((v) => !v)} aria-label="更多操作">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><circle cx="8" cy="3" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="8" cy="13" r="1.3"/></svg>
           </button>
           {menuOpen ? (
             <div className="pv-card-dropdown">
               <button type="button" onClick={() => { onAddAccount(); setMenuOpen(false); }}>
-                <PlusIcon /> Add Account
+                <PlusIcon /> 添加账号
               </button>
               {accounts.length > 0 ? (
                 <button type="button" onClick={() => { onToggleDisableAll(); setMenuOpen(false); }}>
-                  {allDisabled ? "✦ Enable All" : "⏸ Disable All"}
+                  {allDisabled ? "✦ 全部启用" : "⏸ 全部禁用"}
                 </button>
               ) : null}
               {accounts.length > 0 ? (
                 <button type="button" onClick={() => { onExport(); setMenuOpen(false); }}>
-                  ⬇ Export Accounts
+                  ⬇ 导出账号
                 </button>
               ) : null}
               {accounts.length > 0 ? (
@@ -825,7 +1040,7 @@ function ProviderCard({
                     else { setConfirmDelete(true); window.setTimeout(() => setConfirmDelete(false), 3000); }
                   }}
                 >
-                  <TrashIcon /> {confirmDelete ? `Confirm delete ${accounts.length}?` : "Delete All Accounts"}
+                  <TrashIcon /> {confirmDelete ? `确认删除 ${accounts.length} 个？` : "删除所有账号"}
                 </button>
               ) : null}
             </div>
@@ -833,29 +1048,73 @@ function ProviderCard({
         </div>
       </div>
 
-      <span className="pv-card-meta">{group.accounts.length} {group.accounts.length === 1 ? "account" : "accounts"}</span>
+      <span className="pv-card-meta">{group.accounts.length} 个账户</span>
 
       <div className="pv-card-accounts">
-        {previewAccounts.map((account) => (
-          <AccountRow
-            key={account.id}
-            account={account}
-            colorHex={group.colorHex}
-            isBusy={isBusy}
-            authFailed={authFailedNames.has(account.name)}
-            health={healthFor(account, authHealth)}
-            onDelete={() => onDelete(account)}
-            onReauth={() => onReauth(account)}
-          />
-        ))}
+        {previewAccounts.map((account) => {
+          const canDrag = !isBusy && !!order.get(account.name);
+          const isOver = dragOverFile === account.name && !!draggingFile && draggingFile !== account.name;
+          return (
+            <div
+              key={account.id}
+              data-drag-file={account.name}
+              className={`account-row-drag${draggingFile === account.name ? " account-row-drag--dragging" : ""}`}
+              style={isOver ? { boxShadow: `inset 0 2.5px 0 0 #${group.colorHex}`, background: `#${group.colorHex}14`, borderRadius: "8px" } : undefined}
+            >
+              {canDrag ? (
+                <button
+                  type="button"
+                  className="account-drag-handle"
+                  aria-label="拖动排序"
+                  title="拖动排序"
+                  onPointerDown={(e) => beginRowDrag(e, account.name)}
+                  onPointerMove={moveRowDrag}
+                  onPointerUp={endRowDrag}
+                  onPointerCancel={endRowDrag}
+                >
+                  <svg viewBox="0 0 12 16" width="10" height="14" fill="currentColor" aria-hidden="true">
+                    <circle cx="4" cy="4" r="1" /><circle cx="8" cy="4" r="1" />
+                    <circle cx="4" cy="8" r="1" /><circle cx="8" cy="8" r="1" />
+                    <circle cx="4" cy="12" r="1" /><circle cx="8" cy="12" r="1" />
+                  </svg>
+                </button>
+              ) : null}
+              <AccountRow
+                account={account}
+                colorHex={group.colorHex}
+                isBusy={isBusy}
+                authFailed={authFailedNames.has(account.name)}
+                health={healthFor(account, authHealth)}
+                order={order.get(account.name)}
+                orderCount={orderCount}
+                onReorder={onReorder}
+                onDelete={() => onDelete(account)}
+                onReauth={() => onReauth(account)}
+              />
+            </div>
+          );
+        })}
       </div>
 
       {accounts.length > PREVIEW_COUNT ? (
         <button className="pv-card-toggle" type="button" onClick={() => setExpanded((v) => !v)}>
-          {expanded ? "Collapse" : `View all ${accounts.length}`}{" "}
+          {expanded ? "收起" : `查看全部 ${accounts.length} 个`}{" "}
             <svg viewBox="0 0 12 12" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ verticalAlign: "middle", transition: "transform 0.2s", transform: expanded ? "rotate(180deg)" : "rotate(0)" }}>
               <path d="M2.5 4.5 6 8l3.5-3.5" />
             </svg>
+        </button>
+      ) : null}
+      {hasManualOrder ? (
+        <button
+          className="pv-order-reset"
+          type="button"
+          title="清除手动顺序,恢复按额度自动排"
+          onClick={() => {
+            const first = accounts.find((a) => order.get(a.name));
+            if (first) onReorder(first.name, "reset");
+          }}
+        >
+          ↺ 重置为自动顺序
         </button>
       ) : null}
     </div>
@@ -868,6 +1127,9 @@ type AccountRowProps = {
   isBusy: boolean;
   authFailed: boolean;
   health: AccountAuthHealth | undefined;
+  order?: SchedulerOrderItem;
+  orderCount: number;
+  onReorder: (fileName: string, op: "up" | "down" | "top" | "reset") => void;
   onDelete: () => void;
   onReauth: () => void;
 };
@@ -899,6 +1161,14 @@ function areAccountRowPropsEqual(a: AccountRowProps, b: AccountRowProps): boolea
   if (a.colorHex !== b.colorHex || a.isBusy !== b.isBusy || a.authFailed !== b.authFailed) {
     return false;
   }
+  if (
+    a.order?.position !== b.order?.position ||
+    a.order?.active !== b.order?.active ||
+    a.order?.eligible !== b.order?.eligible ||
+    a.orderCount !== b.orderCount
+  ) {
+    return false;
+  }
   if (healthSignature(a.health) !== healthSignature(b.health)) {
     return false;
   }
@@ -910,6 +1180,10 @@ function areAccountRowPropsEqual(a: AccountRowProps, b: AccountRowProps): boolea
     x.account === y.account &&
     x.label === y.label &&
     x.disabled === y.disabled &&
+    x.quotio_health_isolated === y.quotio_health_isolated &&
+    x.quotio_health_isolated_reason === y.quotio_health_isolated_reason &&
+    x.quotio_scheduler_standby === y.quotio_scheduler_standby &&
+    x.quotio_bound_login_only === y.quotio_bound_login_only &&
     x.unavailable === y.unavailable &&
     x.status === y.status &&
     recentRequestsSignature(x.recent_requests) === recentRequestsSignature(y.recent_requests)
@@ -922,6 +1196,9 @@ const AccountRow = memo(function AccountRow({
   isBusy,
   authFailed,
   health,
+  order,
+  orderCount,
+  onReorder,
   onDelete,
   onReauth,
 }: AccountRowProps) {
@@ -933,6 +1210,16 @@ const AccountRow = memo(function AccountRow({
 
   return (
     <div className="account-row">
+      {order ? (
+        <span
+          className={`account-order-badge${order.active ? " account-order-badge--active" : order.eligible ? " account-order-badge--eligible" : " account-order-badge--skipped"}`}
+          style={order.active ? { background: `#${colorHex}`, borderColor: `#${colorHex}` } : { borderColor: `#${colorHex}`, color: `#${colorHex}` }}
+          title={order.active ? `当前激活 · 请求顺序 #${order.position}` : order.eligible ? `请求顺序 #${order.position}` : `请求顺序 #${order.position} · 暂不可用,本轮跳过`}
+          aria-label={`请求顺序 ${order.position}`}
+        >
+          {order.position}
+        </span>
+      ) : null}
       <span className="account-logo account-logo--sm" style={{ color: `#${colorHex}`, background: `#${colorHex}22` }} aria-hidden="true">
         {initial}
       </span>
@@ -943,6 +1230,19 @@ const AccountRow = memo(function AccountRow({
         <span className={`account-row-status account-row-status--${state.tone}`}>{t(state.key, state.fallback)}</span>
       </div>
       <div className="account-row-actions">
+        {order ? (
+          <div className="account-reorder">
+            <button className="reorder-btn" type="button" title="置顶" aria-label="置顶" disabled={isBusy || order.position <= 1} onClick={() => onReorder(account.name, "top")}>
+              <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 5.5l3-2.5 3 2.5M3 9l3-2.5 3 2.5" /></svg>
+            </button>
+            <button className="reorder-btn" type="button" title="上移" aria-label="上移" disabled={isBusy || order.position <= 1} onClick={() => onReorder(account.name, "up")}>
+              <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7.5l3-3 3 3" /></svg>
+            </button>
+            <button className="reorder-btn" type="button" title="下移" aria-label="下移" disabled={isBusy || order.position >= orderCount} onClick={() => onReorder(account.name, "down")}>
+              <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M3 4.5l3 3 3-3" /></svg>
+            </button>
+          </div>
+        ) : null}
         {state.needsReauth ? (
           <button className="account-reauth-btn" type="button" onClick={onReauth} disabled={isBusy}>
             {t("providers.reauth", "重新授权")}
@@ -952,12 +1252,12 @@ const AccountRow = memo(function AccountRow({
           className="row-icon-btn"
           type="button"
           onClick={() => setRevealed((v) => !v)}
-          title={revealed ? "Hide email" : "Show full email"}
-          aria-label={revealed ? "Hide email" : "Show full email"}
+          title={revealed ? "隐藏邮箱" : "显示完整邮箱"}
+          aria-label={revealed ? "隐藏邮箱" : "显示完整邮箱"}
         >
           {revealed ? <EyeOffIcon /> : <EyeIcon />}
         </button>
-        <button className="row-icon-btn row-icon-btn--danger" type="button" onClick={onDelete} disabled={isBusy} title="Delete Account" aria-label="Delete Account">
+        <button className="row-icon-btn row-icon-btn--danger" type="button" onClick={onDelete} disabled={isBusy} title="删除账号" aria-label="删除账号">
           <TrashIcon />
         </button>
       </div>
@@ -987,4 +1287,3 @@ function groupAccounts(authFiles: AuthFile[], providers: ProviderSummary[]): Acc
 
   return groups;
 }
-

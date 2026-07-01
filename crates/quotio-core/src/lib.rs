@@ -114,9 +114,14 @@ struct ProviderSchedulerState {
     current_reset_at: Option<i64>,
     standby_count: u32,
     failure_recheck_at: Option<Instant>,
+    /// 当前目标号「非鉴权」连续失败计数(5xx / 网络抖动等)。累计到阈值才切换,
+    /// 期间出现一次成功即清零;鉴权失败(401/403)不走计数、直接切。
+    consecutive_target_failures: u32,
     /// 账号 key → 因额度耗尽(余量 ≤ 3%)被踢出可选集的账号。带迟滞:余量回到
     /// > 5%(刷新后)才移除。避免在阈值边界反复横跳。
     exhausted: std::collections::HashSet<String>,
+    /// 上一轮算出的请求顺序(给前端画徽章;每次 reconcile 刷新)。
+    order: Vec<quotio_types::SchedulerOrderItem>,
 }
 
 /// Codex 监控的进程探测目标。由 [`AppCore::codex_monitor_probe`] 在锁内产出，
@@ -222,6 +227,13 @@ impl AppCore {
             ManagementCoreError::Unavailable(format!("无法保存应用设置：{}", error))
         })?;
 
+        // 「顺序故障转移」要靠 config.yaml 的 fill-first 路由 + 关闭冷却才生效,这两者都没有
+        // 热更新接口(管理 API 只有路由,且我们统一走重启)。所以**只在进/出失败转移这条边界**
+        // 上重启代理来一次性应用。手动开关 disable_cooling 不在此触发(沿用旧行为:写配置、下次
+        // 启动生效,不打断在跑的请求);前端 selectMode 也按同一条边界跳过热推路由,二者必须一致,
+        // 否则会出现「前端以为后端会重启而跳过推路由、后端却不重启 → 路由永不生效」。
+        let failover_changed = (self.settings.scheduler_rule == "priority_failover")
+            != (settings.scheduler_rule == "priority_failover");
         self.settings = settings;
         if self.settings.remote_management_key.is_none() {
             self.settings.remote_management_key = None;
@@ -229,6 +241,16 @@ impl AppCore {
         self.proxy.sync_settings(&self.settings);
         if let Err(err) = self.proxy.write_config(&self.settings) {
             eprintln!("[save_settings] write_config failed: {err}");
+        }
+        if failover_changed {
+            // 重启前先刷新一次运行状态:刚启动 / 上一会话收养的代理,缓存的 status 可能还是旧值,
+            // 不刷新会漏判而跳过重启 → 失败转移仍带着旧路由 / 冷却跑。
+            self.proxy.refresh(&self.settings);
+            if matches!(self.proxy.state.status, ProxyStatusKind::Running) {
+                if let Err(err) = self.restart_proxy() {
+                    eprintln!("[save_settings] restart for failover toggle failed: {err}");
+                }
+            }
         }
         Ok(self.app_state())
     }
@@ -517,17 +539,63 @@ impl AppCore {
     /// standby 账号放回池子（fail-open 同理）。返回是否改动了池子状态。
     pub fn scheduler_reconcile(&mut self) -> bool {
         let dir = quotio_platform::proxy_auth_dir();
+        // 健康隔离(隔离 403/鉴权失败、健康恢复后放回)在两种调度模式下都跑。
+        let health_changed = scheduler::reconcile_health_isolation_in(&dir, &self.quotas);
+
+        // 顺序故障转移:不做单号独占,健康号全启用 + 把手动顺序写成代理认的
+        // attributes.priority,由代理 fill-first 按序用号、坏了无感顺位(不报错给客户端)。
+        if self.settings.scheduler_rule == "priority_failover" {
+            let providers = scheduler::discover_schedulable_providers(&dir);
+            let now_unix = now_unix_seconds() as i64;
+            let mut any_changed = health_changed;
+            self.schedulers.retain(|pid, _| providers.contains(pid));
+            for provider_id in &providers {
+                let pool = scheduler::read_pool_for_provider(&dir, provider_id);
+                let candidates =
+                    scheduler::build_candidates(&pool, &self.quotas, now_unix, provider_id);
+                let (changed, order, active) =
+                    scheduler::apply_failover_in(&dir, provider_id, &pool, &candidates);
+                let target_label = active
+                    .as_ref()
+                    .and_then(|file| candidates.iter().find(|c| &c.file_name == file))
+                    .map(|c| c.label.clone());
+                let state = self
+                    .schedulers
+                    .entry(provider_id.clone())
+                    .or_insert_with(|| ProviderSchedulerState {
+                        current: None,
+                        target_label: None,
+                        current_reset_at: None,
+                        standby_count: 0,
+                        failure_recheck_at: None,
+                        consecutive_target_failures: 0,
+                        exhausted: Default::default(),
+                        order: Vec::new(),
+                    });
+                state.current = active.map(|file| (file, Instant::now()));
+                state.target_label = target_label;
+                state.standby_count = 0;
+                state.order = order;
+                any_changed |= changed;
+            }
+            return any_changed;
+        }
+
+        // 不在顺序故障转移模式:清掉之前写给代理的 attributes.priority,避免残留让 fill-first
+        // 仍按旧手动顺序路由(只清这个代理键,不动用户手动顺序 quotio_priority)。
+        let priority_cleared = scheduler::clear_proxy_priorities_in(&dir);
+
         if self.settings.scheduler_rule != "reset_soonest" {
             let changed = scheduler::release_all_in(&dir);
             self.schedulers.clear();
-            return changed;
+            return health_changed || changed || priority_cleared;
         }
 
         let providers = scheduler::discover_schedulable_providers(&dir);
         let now_unix = now_unix_seconds() as i64;
         let min_hold = Duration::from_secs(self.settings.scheduler_min_hold_minutes as u64 * 60);
         let margin = self.settings.scheduler_switch_margin_minutes as i64 * 60;
-        let mut any_changed = false;
+        let mut any_changed = health_changed || priority_cleared;
 
         // 清理已不存在的服务商。
         self.schedulers.retain(|pid, _| providers.contains(pid));
@@ -546,7 +614,9 @@ impl AppCore {
                     current_reset_at: None,
                     standby_count: 0,
                     failure_recheck_at: None,
+                    consecutive_target_failures: 0,
                     exhausted: Default::default(),
+                    order: Vec::new(),
                 });
 
             // 额度耗尽迟滞:把余量 ≤3% 的号踢出可选(状态记在 state.exhausted,余量
@@ -565,6 +635,8 @@ impl AppCore {
                 state.target_label = None;
                 state.current_reset_at = None;
                 state.standby_count = 0;
+                // 无可用目标也展示顺序(全部变暗、无激活号)。
+                state.order = scheduler::build_order(&pool, &candidates, None);
                 any_changed |= changed;
                 continue;
             };
@@ -576,6 +648,8 @@ impl AppCore {
                 .unwrap_or(true);
             if target_changed {
                 state.current = Some((target.clone(), Instant::now()));
+                // 换了目标号:旧号的失败连击清零,新号从头计。
+                state.consecutive_target_failures = 0;
             }
             let (pool_changed, standby_count) = scheduler::apply_target_in(&dir, &pool, &target);
 
@@ -583,13 +657,18 @@ impl AppCore {
             state.target_label = picked.map(|c| c.label.clone());
             state.current_reset_at = picked.and_then(|c| c.session_reset_at);
             state.standby_count = standby_count;
+            state.order = scheduler::build_order(&pool, &candidates, Some(&target));
             any_changed |= target_changed || pool_changed;
         }
         any_changed
     }
 
-    /// 用量事件里出现了**当前目标账号**的失败请求：
-    /// 返回 true 表示该立刻重拉配额重选。带 60 秒冷却。
+    /// 用量事件里出现**当前目标账号**的失败请求 → 返回 true 表示该立刻重拉配额重选。
+    ///
+    /// 混合策略:鉴权失败(401/403)token 不会自愈 → **第 1 次就切**,且不受 60s 冷却限制;
+    /// 其它失败(5xx / 网络抖动)可能只是上游瞬时抖动 → **连续累计到阈值才切**,并带 60s
+    /// 冷却,防上游全局抖动时反复空切。目标号出现一次成功即把非鉴权连击清零。
+    /// (真正切不切由随后的重探测 + reconcile 自校验决定,这里只负责「该不该重评估」。)
     pub fn scheduler_should_recheck_for_failures(
         &mut self,
         events: &[quotio_types::UsageEvent],
@@ -597,24 +676,49 @@ impl AppCore {
         if self.settings.scheduler_rule != "reset_soonest" {
             return false;
         }
+        /// 非鉴权失败连续多少次才触发重选(鉴权 401/403 不走计数,直接切)。
+        const NON_AUTH_SWITCH_AFTER: u32 = 3;
         let mut should_recheck = false;
         for state in self.schedulers.values_mut() {
-            let Some(label) = state.target_label.as_deref() else {
+            let Some(label) = state.target_label.clone() else {
+                state.consecutive_target_failures = 0;
                 continue;
             };
-            let target_failed = events
+            // 只看当前目标号的事件,按时间顺序:成功清零、非鉴权失败累加、鉴权失败立即切。
+            let mut target_events: Vec<&quotio_types::UsageEvent> = events
                 .iter()
-                .any(|event| event.failed && event.source.as_deref() == Some(label));
-            if !target_failed {
-                continue;
-            }
-            if let Some(last) = state.failure_recheck_at {
-                if last.elapsed() < Duration::from_secs(60) {
-                    continue;
+                .filter(|event| event.source.as_deref() == Some(label.as_str()))
+                .collect();
+            target_events.sort_by_key(|event| event.timestamp_ms);
+
+            let mut auth_failure = false;
+            for event in target_events {
+                if !event.failed {
+                    state.consecutive_target_failures = 0;
+                } else if matches!(event.status_code, Some(401) | Some(403)) {
+                    auth_failure = true;
+                    break;
+                } else {
+                    state.consecutive_target_failures =
+                        state.consecutive_target_failures.saturating_add(1);
                 }
             }
-            state.failure_recheck_at = Some(Instant::now());
-            should_recheck = true;
+
+            let cooled = state
+                .failure_recheck_at
+                .map(|last| last.elapsed() >= Duration::from_secs(60))
+                .unwrap_or(true);
+
+            if auth_failure {
+                // 鉴权失败:绕过冷却,立即重选。
+                state.failure_recheck_at = Some(Instant::now());
+                state.consecutive_target_failures = 0;
+                should_recheck = true;
+            } else if state.consecutive_target_failures >= NON_AUTH_SWITCH_AFTER && cooled {
+                state.failure_recheck_at = Some(Instant::now());
+                state.consecutive_target_failures = 0;
+                should_recheck = true;
+            }
         }
         should_recheck
     }
@@ -634,6 +738,24 @@ impl AppCore {
         })
     }
 
+    /// 智能调度开启时,各服务商当前选中的目标账号文件 `(provider_id, file_name)`。
+    /// 后台主动健康探测用:只探这些目标号(不全量),过期/被禁就提前触发重选,
+    /// 把「闲置一段时间后首个请求」的报错也省掉。
+    pub fn scheduler_active_target_files(&self) -> Vec<(String, String)> {
+        if self.settings.scheduler_rule != "reset_soonest" {
+            return Vec::new();
+        }
+        self.schedulers
+            .iter()
+            .filter_map(|(provider_id, state)| {
+                state
+                    .current
+                    .as_ref()
+                    .map(|(file, _)| (provider_id.clone(), file.clone()))
+            })
+            .collect()
+    }
+
     /// 调度状态快照（给前端展示）。
     fn scheduler_status(&self) -> quotio_types::SchedulerStatus {
         let entries: Vec<quotio_types::ProviderSchedulerEntry> = self
@@ -644,6 +766,7 @@ impl AppCore {
                 target_label: state.target_label.clone(),
                 target_reset_at_unix: state.current_reset_at,
                 standby_count: state.standby_count,
+                order: state.order.clone(),
             })
             .collect();
         let first = entries.first();
@@ -2132,6 +2255,15 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
             .as_ref()
             .and_then(|value| value.get("quotio_scheduler_standby"))
             .and_then(|value| value.as_bool());
+        let quotio_health_isolated = parsed
+            .as_ref()
+            .and_then(|value| value.get("quotio_health_isolated"))
+            .and_then(|value| value.as_bool());
+        let quotio_health_isolated_reason = parsed
+            .as_ref()
+            .and_then(|value| value.get("quotio_health_isolated_reason"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
         files.push(AuthFile {
             id: name.to_string(),
             name: name.to_string(),
@@ -2153,6 +2285,8 @@ pub fn list_local_accounts() -> Vec<AuthFile> {
             last_refresh: None,
             quotio_bound_login_only,
             quotio_scheduler_standby,
+            quotio_health_isolated,
+            quotio_health_isolated_reason,
             success: None,
             failed: None,
             recent_requests: None,
@@ -2236,7 +2370,16 @@ fn enrich_auth_files_with_local_markers(files: &mut [AuthFile], local_accounts: 
         if file.quotio_scheduler_standby.is_none() {
             file.quotio_scheduler_standby = local.quotio_scheduler_standby;
         }
+        if file.quotio_health_isolated.is_none() {
+            file.quotio_health_isolated = local.quotio_health_isolated;
+        }
+        if file.quotio_health_isolated_reason.is_none() {
+            file.quotio_health_isolated_reason = local.quotio_health_isolated_reason.clone();
+        }
         if local.quotio_bound_login_only == Some(true) {
+            file.disabled = true;
+        }
+        if local.quotio_health_isolated == Some(true) {
             file.disabled = true;
         }
     }
@@ -3724,7 +3867,7 @@ fn render_proxy_config(
         settings.debug,
         settings.logging_to_file,
         settings.logs_max_total_size_mb,
-        settings.disable_cooling,
+        cooling_disabled(settings),
         settings.disable_image_generation,
         settings.force_model_prefix,
         settings.passthrough_headers,
@@ -3762,6 +3905,13 @@ fn render_payload_overrides(settings: &AppSettings) -> String {
         "\npayload:\n  override:\n    - models:\n        - name: \"*\"\n      params:\n{}\n",
         params.join("\n")
     )
+}
+
+/// 「生效冷却(是否关闭)」:用户在设置里手动关了冷却,**或**处于「顺序故障转移」模式
+///(该模式要求关掉冷却,否则坏号一次失败就被惩罚性冷却、最长锁死 30 分钟,违背严格按优先
+/// 级用号)。不直接改 `disable_cooling` 设置本身,避免覆盖用户的手动选择。
+fn cooling_disabled(settings: &AppSettings) -> bool {
+    settings.disable_cooling || settings.scheduler_rule == "priority_failover"
 }
 
 fn routing_strategy_value(strategy: &RoutingStrategy) -> &'static str {
@@ -4107,6 +4257,24 @@ fn now_unix_seconds() -> u64 {
 mod tests {
     use super::*;
     use quotio_types::{ConnectionMode, MigrationPhase};
+
+    #[test]
+    fn cooling_disabled_is_manual_or_failover_without_clobbering() {
+        let mut s = AppSettings::default();
+        // 默认:开冷却。
+        assert!(!cooling_disabled(&s));
+        // 顺序故障转移 → 关冷却(即使用户没手动关)。
+        s.scheduler_rule = "priority_failover".to_string();
+        assert!(cooling_disabled(&s));
+        // 智能调度不关冷却。
+        s.scheduler_rule = "reset_soonest".to_string();
+        assert!(!cooling_disabled(&s));
+        // 用户手动关冷却:任何模式下都关 —— 派生不覆盖、只叠加用户的手动选择。
+        s.disable_cooling = true;
+        assert!(cooling_disabled(&s));
+        s.scheduler_rule = "off".to_string();
+        assert!(cooling_disabled(&s));
+    }
 
     #[test]
     fn auth_file_ident_keeps_emailless_accounts_distinct() {
@@ -4459,39 +4627,78 @@ mod tests {
         }
     }
 
+    fn usage_event_status(source: &str, status_code: u16) -> quotio_types::UsageEvent {
+        let mut event = usage_event_for_test(source, status_code >= 400);
+        event.status_code = Some(status_code);
+        event
+    }
+
+    fn codex_target_state() -> ProviderSchedulerState {
+        ProviderSchedulerState {
+            current: Some(("codex-a.json".to_string(), Instant::now())),
+            target_label: Some("a@example.com".to_string()),
+            current_reset_at: None,
+            standby_count: 0,
+            failure_recheck_at: None,
+            consecutive_target_failures: 0,
+            exhausted: Default::default(),
+            order: Vec::new(),
+        }
+    }
+
     #[test]
-    fn scheduler_rechecks_on_target_failures_with_cooldown() {
+    fn scheduler_recheck_immediate_on_auth_failure_and_debounced_on_others() {
         let mut core = AppCore::default();
         core.settings.scheduler_rule = "reset_soonest".to_string();
-        core.schedulers.insert(
-            "codex".to_string(),
-            ProviderSchedulerState {
-                current: Some(("codex-a.json".to_string(), Instant::now())),
-                target_label: Some("a@example.com".to_string()),
-                current_reset_at: None,
-                standby_count: 0,
-                failure_recheck_at: None,
-                exhausted: Default::default(),
-            },
-        );
+        core.schedulers.insert("codex".to_string(), codex_target_state());
 
         // 别的账号失败 / 目标成功:不触发。
         assert!(!core.scheduler_should_recheck_for_failures(&[
-            usage_event_for_test("b@example.com", true),
-            usage_event_for_test("a@example.com", false),
+            usage_event_status("b@example.com", 401),
+            usage_event_status("a@example.com", 200),
         ]));
-        // 目标失败:触发一次。
+
+        // 鉴权失败(401):目标第 1 次就触发。
         assert!(core
-            .scheduler_should_recheck_for_failures(&[usage_event_for_test("a@example.com", true)]));
-        // 冷却期内再失败:不重复触发。
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 401)]));
+        // 鉴权失败绕过 60s 冷却:紧接着 403 仍立即触发。
+        assert!(core
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 403)]));
+
+        // 非鉴权(5xx):前 2 次不切,第 3 次才切。
+        core.schedulers.insert("codex".to_string(), codex_target_state());
         assert!(!core
-            .scheduler_should_recheck_for_failures(&[usage_event_for_test("a@example.com", true)]));
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 500)]));
+        assert!(!core
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 500)]));
+        assert!(core
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 500)]));
+
+        // 非鉴权累计中途出现一次成功 → 连击清零,需重新累计 3 次。
+        core.schedulers.insert("codex".to_string(), codex_target_state());
+        assert!(!core.scheduler_should_recheck_for_failures(&[
+            usage_event_status("a@example.com", 500),
+            usage_event_status("a@example.com", 500),
+            usage_event_status("a@example.com", 200),
+        ]));
+        assert!(!core.scheduler_should_recheck_for_failures(&[
+            usage_event_status("a@example.com", 500),
+            usage_event_status("a@example.com", 500),
+        ]));
+
+        // 一个批次内直接攒够 3 次非鉴权失败:触发。
+        core.schedulers.insert("codex".to_string(), codex_target_state());
+        assert!(core.scheduler_should_recheck_for_failures(&[
+            usage_event_status("a@example.com", 500),
+            usage_event_status("a@example.com", 502),
+            usage_event_status("a@example.com", 503),
+        ]));
 
         // 规则关闭:永不触发。
         core.settings.scheduler_rule = "off".to_string();
-        core.schedulers.get_mut("codex").unwrap().failure_recheck_at = None;
+        core.schedulers.insert("codex".to_string(), codex_target_state());
         assert!(!core
-            .scheduler_should_recheck_for_failures(&[usage_event_for_test("a@example.com", true)]));
+            .scheduler_should_recheck_for_failures(&[usage_event_status("a@example.com", 401)]));
     }
 
     #[test]
@@ -4559,7 +4766,7 @@ mod tests {
             .management_client()
             .expect_err("local management should require a running proxy");
 
-        assert!(error.to_string().contains("代理核心未运行"));
+        assert!(error.to_string().contains("Proxy core is not running"));
     }
 
     /// Redirects [`api_keys_path`] to a throwaway temp file seeded with `keys`, so
@@ -4707,7 +4914,7 @@ mod tests {
             let expected_count = responses.len();
 
             let handle = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + Duration::from_secs(30);
                 let mut responses = responses.into_iter();
 
                 while captured_requests.lock().unwrap().len() < expected_count

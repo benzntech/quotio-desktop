@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
-import type { AccountQuota, AppSettings, AppState, AuthFile, ProviderSummary, QuotaModelUsage } from "../../types";
-import { maskEmail, quotaTone, parsePlan, parseResetCredits, planTier, matchAuthFile } from "../../lib/format";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { AccountQuota, AppSettings, AppState, AuthFile, ProviderSummary, QuotaModelUsage, SchedulerOrderItem } from "../../types";
+import { maskEmail, quotaTone, parsePlan, parseResetCredits, planTier, matchAuthFile, servingFile } from "../../lib/format";
 import { RefreshIcon } from "../icons";
 import { HealthDots } from "../HealthDots";
-import { Switch } from "../Switch";
 import { useT } from "../../i18n";
 import { invoke } from "../../lib/tauri";
 
@@ -32,7 +31,7 @@ type QuotaGroup = {
   accounts: AccountQuota[];
 };
 
-export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSettings }: QuotaScreenProps) {
+export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSettings, onRunManagementStateAction }: QuotaScreenProps) {
   const t = useT();
   const groups = useMemo(() => buildGroups(appState.quotas, appState.providers), [appState.quotas, appState.providers]);
   const authFiles = appState.management.auth_files ?? appState.auth_files ?? [];
@@ -44,14 +43,63 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
   const [activeId, setActiveId] = useState<string | null>(null);
   const active = groups.find((group) => group.id === activeId) ?? groups[0] ?? null;
   const activeCustom = customProviders.find((cp) => `cp:${cp.id}` === activeId) ?? null;
+
+  // 排序型调度(智能调度 / 顺序故障转移)算出的请求顺序:file_name → 顺序项。用来把额度
+  // 卡片按该顺序排 + 画圆圈序号徽章;关闭调度时为空,卡片保持原序、无徽章。
+  const orderByFile = useMemo(() => {
+    const map = new Map<string, SchedulerOrderItem>();
+    const sched = appState.scheduler;
+    if (sched && (sched.rule === "reset_soonest" || sched.rule === "priority_failover")) {
+      for (const entry of sched.providers ?? []) {
+        const order = entry.order ?? [];
+        // 「主用」高亮跟着真正在服务(近期成功最多)的号走;无近期流量时保留后端 active。
+        const serving = servingFile(order.map((i) => i.file_name), authFiles);
+        for (const item of order) {
+          map.set(item.file_name, serving ? { ...item, active: item.file_name === serving } : item);
+        }
+      }
+    }
+    return map;
+  }, [appState.scheduler, authFiles]);
+
+  const orderForAccount = useCallback(
+    (account: AccountQuota): SchedulerOrderItem | null => {
+      if (orderByFile.size === 0) return null;
+      const file = matchAuthFile(account, authFiles);
+      return (file && orderByFile.get(file.name)) || null;
+    },
+    [orderByFile, authFiles],
+  );
+
+  // 故障转移 / 智能调度开启时,额度卡片按请求顺序排(无序号的绑定号垫后)。每账号只匹配
+  // 一次、预存位置,避免在比较器里反复跑 matchAuthFile。
+  const sortedAccounts = useMemo(() => {
+    const accounts = active?.accounts ?? [];
+    if (orderByFile.size === 0) return accounts;
+    const positionByKey = new Map(
+      accounts.map((a) => [a.account_key, orderForAccount(a)?.position ?? Number.MAX_SAFE_INTEGER]),
+    );
+    return [...accounts].sort(
+      (a, b) =>
+        (positionByKey.get(a.account_key) ?? Number.MAX_SAFE_INTEGER) -
+        (positionByKey.get(b.account_key) ?? Number.MAX_SAFE_INTEGER),
+    );
+  }, [active, orderByFile, orderForAccount]);
   // Heuristic proxy-unreachable hint: a refresh finished but every account came
   // back blank (no quota, not exhausted, not auth-failed) — almost always the
   // upstream proxy being wrong/down rather than a real per-account state.
+  // Only codex lists a probe-failed account as a present blank (other providers
+  // return None → absent), so a non-codex blank now means "healthy, no usage
+  // data", NOT a dead proxy — it must not trip this hint.
   const proxyUnreachable =
     !isQuotaBusy &&
     appState.quotas.length > 0 &&
     appState.quotas.every(
-      (account) => account.models.length === 0 && !account.is_forbidden && account.status_message !== "auth_failed",
+      (account) =>
+        account.provider_id === "codex" &&
+        account.models.length === 0 &&
+        !account.is_forbidden &&
+        account.status_message !== "auth_failed",
     );
 
   return (
@@ -70,7 +118,7 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
         </button>
       </header>
 
-      <SchedulerCard appState={appState} onSaveSettings={onSaveSettings} activeProviderId={active?.id ?? null} />
+      <SchedulerCard appState={appState} onSaveSettings={onSaveSettings} onRunManagementStateAction={onRunManagementStateAction} activeProviderId={active?.id ?? null} />
 
       {proxyUnreachable ? (
         <div className="state-banner state-banner--warn">
@@ -132,11 +180,13 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
             <CustomProviderKeyPool provider={activeCustom} />
           ) : (
           <div className="quota-accounts">
-            {active?.accounts.map((account) => (
+            {sortedAccounts.map((account) => (
               <AccountQuotaCard
                 key={account.account_key}
                 account={account}
                 authFiles={authFiles}
+                order={orderForAccount(account)}
+                colorHex={active?.colorHex ?? "8a8a8e"}
                 onRefreshQuotas={onRefreshQuotas}
               />
             ))}
@@ -152,15 +202,18 @@ export function QuotaScreen({ appState, isQuotaBusy, onRefreshQuotas, onSaveSett
 function SchedulerCard({
   appState,
   onSaveSettings,
+  onRunManagementStateAction,
   activeProviderId,
 }: {
   appState: AppState;
   onSaveSettings: (settings: AppSettings) => void;
+  onRunManagementStateAction: (command: string, args?: Record<string, unknown>) => void;
   activeProviderId: string | null;
 }) {
   const t = useT();
   const scheduler = appState.scheduler;
-  const schedulerOn = (appState.settings.scheduler_rule || "off") !== "off";
+  const rule = appState.settings.scheduler_rule || "off";
+  const schedulerOn = rule !== "off";
 
   const providerEntry = useMemo(() => {
     if (!activeProviderId || !scheduler?.providers) return null;
@@ -173,12 +226,46 @@ function SchedulerCard({
     return p?.display_name ?? activeProviderId;
   }, [activeProviderId, appState.providers]);
 
-  function toggleScheduler() {
+  // 切换中的目标模式(为空 = 没在切)。切到 failover 要写 config + 重启代理 ~2-3 秒,
+  // saveSettings 非乐观更新(等后端跑完才刷 appState),这期间给被点的按钮转圈、其它禁用。
+  const [switchingTo, setSwitchingTo] = useState<string | null>(null);
+  useEffect(() => {
+    // 后端跑完、rule 已切到目标 → 清掉 loading。
+    if (switchingTo && rule === switchingTo) setSwitchingTo(null);
+  }, [rule, switchingTo]);
+  useEffect(() => {
+    // 兜底:后端异常没切过去也别让转圈卡死。
+    if (!switchingTo) return;
+    const timer = window.setTimeout(() => setSwitchingTo(null), 15000);
+    return () => window.clearTimeout(timer);
+  }, [switchingTo]);
+
+  function selectMode(mode: "off" | "reset_soonest" | "priority_failover") {
+    if (mode === rule || switchingTo) return;
+    setSwitchingTo(mode);
+    const isFailover = mode === "priority_failover";
+    // 顺序故障转移要让代理按 attributes.priority 顺位用号 → fill-first;其余模式回 round-robin。
+    // 同时该模式要关掉冷却(坏号只临时绕过、不被惩罚性冷落,否则一次 5xx 就把高优先级号锁死最长
+    // 30 分钟)——「生效冷却」由后端按 scheduler_rule 派生(failover 即关 = 用户手动 OR failover),
+    // 不在这里写 disable_cooling,免得覆盖用户在「设置」里的手动开关。
+    const nextRouting = isFailover ? "fill-first" : "round-robin";
+    // 进 / 出失败转移这条边界:fill-first 路由 + 关冷却都只能靠 config.yaml + 重启生效,save_settings
+    // 后端正是在这条边界上重启代理、一次性应用两者。所以这种切换把路由交给那次重启(别再单独热推、
+    // 免得和重启抢)。判定必须和后端**完全一致**(同为「是否跨 failover 边界」),否则会出现「前端
+    // 以为后端重启而跳过推路由、后端却不重启 → 路由永不生效」。
+    const failoverChanged = isFailover !== (rule === "priority_failover");
     onSaveSettings({
       ...appState.settings,
-      scheduler_rule: schedulerOn ? "off" : "reset_soonest",
+      scheduler_rule: mode,
+      routing_strategy: nextRouting,
       remote_management_key: null,
     });
+    // 只有不跨 failover 边界(off ↔ 智能调度,后端不会重启)时,才按需把路由热推给活代理。
+    // 代理没运行时不推、按活代理真实路由比对以免漏推。
+    const liveConfig = appState.management.config;
+    if (!failoverChanged && liveConfig && liveConfig.routing_strategy !== nextRouting) {
+      onRunManagementStateAction("set_management_routing_strategy", { strategy: nextRouting });
+    }
   }
 
   let resetText: string | null = null;
@@ -192,16 +279,49 @@ function SchedulerCard({
     }
   }
 
-  const activeLabel = providerEntry?.target_label ?? scheduler?.target_label;
+  // 「主用」跟着真正在服务(近期成功 √ 最多)的号:后端 target_label 是优先级最高的启用号,
+  // 但它可能正被上游抖动临时绕过。无近期流量时回退后端值。
+  const schedAuthFiles = appState.management.auth_files ?? appState.auth_files ?? [];
+  const servingName = providerEntry
+    ? servingFile((providerEntry.order ?? []).map((i) => i.file_name), schedAuthFiles)
+    : null;
+  const servingLabel = servingName
+    ? (providerEntry?.order ?? []).find((i) => i.file_name === servingName)?.label ?? null
+    : null;
+  const activeLabel = servingLabel ?? providerEntry?.target_label ?? scheduler?.target_label;
   const activeStandby = providerEntry?.standby_count ?? scheduler?.standby_count ?? 0;
   const totalScheduled = scheduler?.providers?.length ?? 0;
+
+  // 当前服务商有数据就只数它自己(order 缺失算 0);没有选中服务商时才退回汇总所有服务商,
+  // 避免「providerEntry 在、但 order 缺失」时 ?? 跳到跨服务商求和、报出虚高的数字。
+  const failoverChainCount = providerEntry
+    ? providerEntry.order?.filter((o) => o.eligible).length ?? 0
+    : (scheduler?.providers ?? []).reduce(
+        (n, p) => n + (p.order?.filter((o) => o.eligible).length ?? 0),
+        0,
+      );
 
   let statusText: string;
   if (!schedulerOn) {
     statusText = t(
       "quota.scheduler.descOff",
-      "When enabled, only accounts with the closest refresh time enter the proxy pool, while others wait; automatically switches accounts when time is up so quotas aren't wasted.",
+      "智能调度:只让「额度最快刷新」的号进池,余者待命、到点自动换号。顺序故障转移:按你排的顺序用号,坏一个无感切下一个(不报错)。",
     );
+  } else if (rule === "priority_failover") {
+    if (activeLabel) {
+      const chain = t(
+        "quota.scheduler.failoverChain",
+        "共 {count} 个按序待命,坏一个自动顺延(不返回错误)",
+      ).replace("{count}", String(failoverChainCount));
+      statusText = `${t("quota.scheduler.failoverPrimary", "主用")}:${activeLabel} · ${chain}`;
+    } else if (totalScheduled > 0) {
+      statusText = t("quota.scheduler.noProviderMatch", "此服务商账号不足 2 个,无需调度。");
+    } else {
+      statusText = t(
+        "quota.scheduler.failoverPending",
+        "已开启,按你设定的账号顺序请求,坏号自动顺延到下一个(在「服务商」页拖动排序)。",
+      );
+    }
   } else if (activeLabel) {
     const windowText = resetText
       ? t("quota.scheduler.resetIn", "{time} 后刷新").replace("{time}", resetText)
@@ -217,17 +337,45 @@ function SchedulerCard({
     statusText = t("quota.scheduler.pending", "已开启,等待下一次额度刷新后选号(可点右上角立即刷新)。");
   }
 
-  const tagText = schedulerOn && totalScheduled > 0
-    ? t("quota.scheduler.rule", "Refresh closest priority") + (providerEntry ? ` · ${providerLabel}` : ` · Total ${totalScheduled} providers`)
-    : t("quota.scheduler.ruleGeneric", "Refresh closest priority");
+  let tagText: string | null = null;
+  if (rule === "priority_failover") {
+    tagText =
+      t("quota.scheduler.ruleFailover", "按序故障转移") +
+      (providerEntry ? ` · ${providerLabel}` : totalScheduled > 0 ? ` · ${totalScheduled} 个服务商` : "");
+  } else if (rule === "reset_soonest") {
+    tagText =
+      t("quota.scheduler.rule", "临近刷新优先") +
+      (providerEntry ? ` · ${providerLabel}` : totalScheduled > 0 ? ` · ${totalScheduled} 个服务商` : "");
+  }
+
+  const modes: { id: "off" | "reset_soonest" | "priority_failover"; label: string }[] = [
+    { id: "off", label: t("quota.scheduler.modeOff", "关闭") },
+    { id: "reset_soonest", label: t("quota.scheduler.modeResetSoonest", "智能调度") },
+    { id: "priority_failover", label: t("quota.scheduler.modeFailover", "顺序故障转移") },
+  ];
 
   return (
     <div className="scheduler-block">
       <div className="scheduler-head">
-        <strong>{t("quota.scheduler.title", "智能调度")}</strong>
-        <span className="scheduler-tag">{tagText}</span>
-        <div className="scheduler-switch">
-          <Switch on={schedulerOn} onChange={toggleScheduler} label="scheduler" />
+        <strong>{t("quota.scheduler.cardTitle", "账号调度")}</strong>
+        {tagText && <span className="scheduler-tag">{tagText}</span>}
+        <div
+          className="scheduler-modes"
+          role="group"
+          aria-label={t("quota.scheduler.cardTitle", "账号调度")}
+        >
+          {modes.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              className={`scheduler-mode-btn${rule === m.id ? " is-active" : ""}${switchingTo === m.id ? " is-loading" : ""}`}
+              onClick={() => selectMode(m.id)}
+              disabled={switchingTo !== null}
+            >
+              {switchingTo === m.id ? <span className="scheduler-mode-spinner" aria-hidden="true" /> : null}
+              {m.label}
+            </button>
+          ))}
         </div>
       </div>
       <p className="scheduler-desc">{statusText}</p>
@@ -238,10 +386,14 @@ function SchedulerCard({
 function AccountQuotaCard({
   account,
   authFiles,
+  order,
+  colorHex,
   onRefreshQuotas,
 }: {
   account: AccountQuota;
   authFiles: AuthFile[];
+  order?: SchedulerOrderItem | null;
+  colorHex?: string;
   onRefreshQuotas: () => void;
 }) {
   const t = useT();
@@ -296,6 +448,16 @@ function AccountQuotaCard({
   return (
     <article className="panel quota-card">
       <div className="quota-card-head">
+        {order ? (
+          <span
+            className={`account-order-badge${order.active ? " account-order-badge--active" : order.eligible ? " account-order-badge--eligible" : " account-order-badge--skipped"}`}
+            style={order.active ? { background: `#${colorHex}`, borderColor: `#${colorHex}` } : { borderColor: `#${colorHex}`, color: `#${colorHex}` }}
+            title={order.active ? `当前主用 · 请求顺序 #${order.position}` : order.eligible ? `请求顺序 #${order.position}` : `请求顺序 #${order.position} · 暂不可用,本轮跳过`}
+            aria-label={`请求顺序 ${order.position}`}
+          >
+            {order.position}
+          </span>
+        ) : null}
         {plan ? (
           <span className={planClass}>{plan.toUpperCase()}</span>
         ) : account.account_type ? (
@@ -329,7 +491,7 @@ function AccountQuotaCard({
           {isSchedulerStandby ? (
             <span
               className="quota-pill quota-pill--blue"
-              title={t("quota.schedulerStandby.desc", "Temporarily removed from the proxy pool by the smart scheduler; automatically restored when its turn comes or scheduling is disabled.")}
+              title={t("quota.schedulerStandby.desc", "被智能调度临时移出代理池;轮到它或关闭调度时自动恢复。")}
             >
               {t("quota.schedulerStandby", "调度待命")}
             </span>
@@ -388,9 +550,11 @@ function AccountQuotaCard({
         </>
       ) : (
         <p className="quota-empty-note">
-          {authFailed
+          {authFailed || account.is_forbidden
             ? t("quota.needsReauthNote", "需重新授权,请到服务商页重新登录")
-            : t("quota.fetchFailed", "额度获取失败,仅显示健康状态")}
+            : account.provider_id === "codex"
+              ? t("quota.fetchFailed", "额度获取失败,仅显示健康状态")
+              : t("quota.noUsageData", "暂无额度数据,账号健康")}
         </p>
       )}
     </article>

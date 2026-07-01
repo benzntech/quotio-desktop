@@ -414,6 +414,13 @@ pub struct AuthFile {
     /// 智能调度临时禁用（待命）标记——本地文件富化得到，管理 API 不返回。
     #[serde(default)]
     pub quotio_scheduler_standby: Option<bool>,
+    /// 健康隔离临时禁用标记——403/auth_failed 时由 Quotio 自动写入本地文件。
+    #[serde(default)]
+    pub quotio_health_isolated: Option<bool>,
+    /// 健康隔离原因："auth"=鉴权失效需重新登录;"quota"=额度耗尽,等窗口刷新自动恢复。
+    /// 由 Quotio 隔离时写入本地文件,管理 API 不返回。缺省/未知按 auth 处理(宁可多提示)。
+    #[serde(default)]
+    pub quotio_health_isolated_reason: Option<String>,
     #[serde(default)]
     pub success: Option<u64>,
     #[serde(default)]
@@ -459,6 +466,20 @@ pub struct AccountQuota {
     pub is_forbidden: bool,
     pub status_message: Option<String>,
     pub models: Vec<QuotaModelUsage>,
+}
+
+impl AccountQuota {
+    /// 该账号「被禁」是否源于鉴权失效(需用户重新登录),而非额度耗尽 / 限流。
+    ///
+    /// 各 provider 鉴权失败时会把固定哨兵串写进 `status_message`(见 quota.rs);
+    /// 额度耗尽没有专属 status_message(仅 `is_forbidden=true` + None/"plan:…"),
+    /// 所以匹配这个闭集即可可靠区分 auth 与 quota。新增 provider 的鉴权哨兵要同步这里。
+    pub fn is_auth_failure(&self) -> bool {
+        matches!(
+            self.status_message.as_deref(),
+            Some("auth_failed") | Some("需要重新授权") | Some("需要重新登录") | Some("密钥无效")
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1372,6 +1393,26 @@ impl Default for ManagementSnapshot {
     }
 }
 
+/// 一个账号在某服务商「请求顺序」里的一项(给前端画圆圈数字徽章)。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct SchedulerOrderItem {
+    /// 账号文件名(与 `AuthFile.name` 对应,前端据此匹配)。
+    pub file_name: String,
+    /// 清洗名(去前缀/后缀)。
+    pub key: String,
+    /// 展示名(email)。
+    pub label: String,
+    /// 1 起的顺序位置(圆圈里的数字)。
+    pub position: u32,
+    /// 是否当前激活号(徽章高亮)。
+    pub active: bool,
+    /// 当前是否可用(false = 额度耗尽/需重登等 → 徽章变暗、本轮跳过)。
+    pub eligible: bool,
+    /// 手动优先级(设了的话);前端用来区分「手动定的」与「自动排的」。
+    pub priority: Option<u32>,
+}
+
 /// 单个服务商的调度状态。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
@@ -1383,6 +1424,8 @@ pub struct ProviderSchedulerEntry {
     pub target_reset_at_unix: Option<i64>,
     /// 被调度临时禁用（待命）的账号数。
     pub standby_count: u32,
+    /// 该服务商账号的请求顺序(已排好序;前端按 `file_name` 匹配画徽章)。
+    pub order: Vec<SchedulerOrderItem>,
 }
 
 /// 智能账号调度的当前状态（给前端展示）。
@@ -1949,6 +1992,8 @@ mod tests {
                 last_refresh: None,
                 quotio_bound_login_only: None,
                 quotio_scheduler_standby: None,
+                quotio_health_isolated: None,
+                quotio_health_isolated_reason: None,
                 success: None,
                 failed: None,
                 recent_requests: None,

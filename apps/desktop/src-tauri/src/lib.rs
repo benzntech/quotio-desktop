@@ -1216,10 +1216,38 @@ async fn set_management_auth_file_disabled(
 ) -> Result<AppState, String> {
     let client = management_client(&state, "无法更新账号状态")?;
     client
-        .set_auth_file_disabled(name, disabled)
+        .set_auth_file_disabled(name.clone(), disabled)
         .await
         .map_err(|error| error.to_string())?;
+    if !disabled {
+        // 用户手动启用:彻底清掉调度待命 + 健康隔离两个临时标记并放回池子,
+        // 否则残留的 standby 会把刚启用的账号又写回 disabled=true(启用静默失效)。
+        quotio_core::scheduler::clear_temp_disable_markers_for_file_in(
+            &quotio_platform::proxy_auth_dir(),
+            &name,
+        );
+    }
     refresh_snapshot_with_client(&state, client, "无法刷新账号状态更新后的状态").await
+}
+
+/// 调整某服务商账号的请求顺序:按 `ordered_file_names` 写 quotio_priority=1..N
+/// (空列表 = 重置为自动顺序),随即重跑一轮调度让激活号按新优先级更新。
+#[tauri::command]
+async fn reorder_provider_accounts(
+    provider_id: String,
+    ordered_file_names: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<AppState, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = quotio_platform::proxy_auth_dir();
+        let mut core = lock_core(&core);
+        quotio_core::scheduler::reorder_provider_in(&dir, &provider_id, &ordered_file_names);
+        core.scheduler_reconcile();
+        core.app_state()
+    })
+    .await
+    .map_err(|error| format!("调整账号顺序任务异常：{}", error))
 }
 
 #[tauri::command]
@@ -1536,20 +1564,29 @@ fn spawn_usage_collector(app: AppHandle) {
                 }
             }
 
-            // 智能调度（每 ~30s 查一次，纯内存判断）：当前账号的 5h 窗口到点
-            // 刷新后，提前重拉配额并重评估，不必干等前端的 5 分钟轮询。
+            // 智能调度（每 ~30s）：① 当前号 5h 窗口到点刷新（纯内存判断）→ 提前重评估;
+            // ② 主动探一次当前目标号的 token——过期/被禁就提前切,把「闲置一段时间后
+            // 首个请求」的报错也省掉(只探目标号、不全量,几乎不增上游负担)。
             if tick % 20 == 10 {
-                let due = app
+                let (due, targets, proxy_url) = app
                     .try_state::<DesktopState>()
                     .and_then(|state| {
-                        state
-                            .core
-                            .lock()
-                            .ok()
-                            .map(|core| core.scheduler_reset_due())
+                        state.core.lock().ok().map(|core| {
+                            (
+                                core.scheduler_reset_due(),
+                                core.scheduler_active_target_files(),
+                                core.proxy_upstream_url(),
+                            )
+                        })
                     })
-                    .unwrap_or(false);
-                if due {
+                    .unwrap_or((false, Vec::new(), None));
+                // 网络探测在锁外执行,不阻塞 UI 命令。None(网络抖动)不切,避免误判。
+                let target_unhealthy = targets.iter().any(|(provider_id, file)| {
+                    quotio_core::quota::fetch_quota_for_file(provider_id, file, proxy_url.as_deref())
+                        .map(|quota| quota.is_forbidden || quota.is_auth_failure())
+                        .unwrap_or(false)
+                });
+                if due || target_unhealthy {
                     refresh_quotas_and_reschedule(&app);
                 }
             }
@@ -1835,6 +1872,7 @@ pub fn run() {
             delete_management_api_key,
             delete_management_api_key_by_index,
             set_management_auth_file_disabled,
+            reorder_provider_accounts,
             delete_management_auth_file,
             delete_all_management_auth_files,
             start_management_oauth,
